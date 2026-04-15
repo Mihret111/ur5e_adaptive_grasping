@@ -1,4 +1,4 @@
-# ur5e_adaptive_grasping
+# B2b: Adaptive Grasping for Soft/Fragile Objects
 Develop adaptive grasping behaviors for soft, deformable, or fragile objects using force feedback control with sim-to-real validation.
 1) Set up UR5e + 2FG7 model in IsaacSim with ROS2 bridge for soft/fragile object manipulation
 2) Implement multiple grasp strategies for deformable or delicate objects based on compliance and fragility
