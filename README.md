@@ -12,3 +12,10 @@ Research needed: Soft grasping, impedance/force control, manipulation planning f
 
 Deliverables: IsaacSim setup for soft-object manipulation, adaptive grasping strategy library, sim-to-real validation report for soft/fragile objects
 
+## How to run
+1. Open Isaac Sim
+2. File -> Open -> usd -> robots -> mir250_cabinet_ur5e_2fg7_test.usd
+3. Window -> Script Editor
+4. Copy and paste the Main.py for run the simulation via (Ctrl+Enter)
+
+-> ADD in the modules folder your scripts and into config folder the configurations. 
