@@ -8,7 +8,7 @@ import traceback
 import shutil
 
 PROJECT_ROOT = os.path.expanduser(
-    "~/Documents/isaacsim_ws/mir_ur_station" # Follow this path or change with yours
+    "~/Desktop/SecondSem/COGAR/ur5e_adaptive_grasping" # Follow this path or change with yours
 )
 
 if PROJECT_ROOT not in sys.path:
