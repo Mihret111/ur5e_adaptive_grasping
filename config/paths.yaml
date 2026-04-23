@@ -1,0 +1,15 @@
+# ===============================
+# paths.yaml
+#  retrieved from internal prim hierarchy inside the stage
+
+# =============================
+
+robot:
+  ur5e_joints_base: "/mir/base_link_cabinet/cabinet/ur_mount/ur5e_physics/joints"  
+  flange_prim:    "/mir/base_link_cabinet/cabinet/ur_mount/ur5e_physics/wrist_3_link/flange"
+
+gripper:
+  joints_base: "/onrobot_2fg7/joints"
+  left_finger_link: "/onrobot_2fg7/left_finger_link"
+  right_finger_link: "/onrobot_2fg7/right_finger_link"
+
