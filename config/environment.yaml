@@ -1,0 +1,12 @@
+# =============================
+# environment.yaml
+# =============================
+
+num_trials: 1
+
+arm_min_reach: 0.30
+arm_max_reach: 0.85
+reach_safety_margin: 0.03
+
+ik_preference:
+  num_random_seeds: 24

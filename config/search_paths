@@ -1,0 +1,29 @@
+import omni.usd
+
+stage = omni.usd.get_context().get_stage()
+
+targets = [
+    "shoulder_pan_joint",
+    "shoulder_lift_joint",
+    "elbow_joint",
+    "wrist_1_joint",
+    "wrist_2_joint",
+    "wrist_3_joint",
+    "flange",
+    "tool0",
+    "left_finger_joint",
+    "right_finger_joint",
+    "left_finger_link",
+    "right_finger_link",
+]
+
+print("\n=== EXACT TARGET SEARCH ===")
+found = False
+for prim in stage.Traverse():
+    name = prim.GetName()
+    if name in targets:
+        found = True
+        print(f"{name:20s} -> {prim.GetPath()}   [{prim.GetTypeName()}]")
+
+if not found:
+    print("No exact target names found.")

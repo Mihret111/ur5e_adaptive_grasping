@@ -1,0 +1,28 @@
+# ===============================
+# objects.yaml
+# =============================
+
+
+shapes:
+  - name: cube
+    size: [0.04, 0.04, 0.04]
+
+colors:
+  - name: red
+    rgb: [1.0, 0.0, 0.0]
+
+grip_range_mm:
+  min: 35
+  max: 73
+
+object_mass:
+  min: 0.05
+  max: 0.20
+
+object_physics_materials:
+  - name: default_soft
+    static_friction: 0.8
+    dynamic_friction: 0.6
+    restitution: 0.0
+
+num_objects_range: [1, 1]

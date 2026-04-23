@@ -67,9 +67,13 @@ from modules.trial_runner import TrialRunner
 
 CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
 
-(
-    CONFIG,
-) = load_all_configs(config_dir=CONFIG_DIR)
+# (
+#     CONFIG,
+# ) = load_all_configs(config_dir=CONFIG_DIR)
+CONFIG, TABLE_MATERIALS, TABLE_SEAT_SLOTS = load_all_configs(
+    config_dir=CONFIG_DIR
+)
+
 
 # ═══════════════════════════════════════════════════════════════
 # 3. MAIN
