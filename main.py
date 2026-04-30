@@ -59,20 +59,20 @@ from modules.sim_utils     import (
 from modules.preflight    import preflight_check
 from modules.event_bus    import bus         
 from modules.trial_runner import TrialRunner
-
+from modules.primitive_library import init_motion
 
 # ═══════════════════════════════════════════════════════════════
 # 2. CONFIGURATION
 # ═══════════════════════════════════════════════════════════════
-
 CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
-
 # (
 #     CONFIG,
 # ) = load_all_configs(config_dir=CONFIG_DIR)
 CONFIG, TABLE_MATERIALS, TABLE_SEAT_SLOTS = load_all_configs(
     config_dir=CONFIG_DIR
 )
+flange_path = CONFIG["paths"]["robot"]["flange_prim"]
+init_motion(flange_path)
 
 
 # ═══════════════════════════════════════════════════════════════
