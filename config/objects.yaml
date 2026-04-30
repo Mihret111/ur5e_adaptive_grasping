@@ -1,28 +1,179 @@
-# ===============================
+# ===================================================================
 # objects.yaml
-# =============================
+#
+# Owns:
+#   - Object spawn constraints (count, spacing, margin)
+#   - Object physics materials (randomly assigned per object)
+#   - Object mass range (randomized per object at spawn time)
+#   - Object catalogue (shapes, sizes, colors)
+#
+# 2FG7 gripper — Outwards-facing grip range:
+#                       -> external grip range: 35–73 mm
+#                       -> internal grip range: 45–83 mm
+#                maximum payload:     5 kg
+# 2FG7 gripper - Inwards-facing grip range: 
+#                       -> external grip range: 1–39 mm
+#                       -> internal grip range: 11-49 mm
+#
+# Graspable dimension per shape:
+#   Cube:     side length           → 35–73 mm
+#   Box:      min(sx, sy)           → 35–73 mm
+#   Cylinder: diameter (2 × radius) → 35–73 mm
+#   Sphere:   diameter (2 × radius) → 35–73 mm
+# ===================================================================
 
+
+# ═══════════════════════════════════════════════════════════════════
+# 1. SPAWN CONSTRAINTS
+# ═══════════════════════════════════════════════════════════════════
+
+num_objects_range:  [3, 3]   # [min, max] objects per trial
+object_margin:      0.04     # metres — clearance from table edge
+object_spacing_padding: 0.025   # metres of extra air gap between object footprints
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 2. OBJECT MASS RANGE
+#    Each object gets a mass randomly sampled from [min_kg, max_kg].
+#    Max capped at 5 kg (2FG7 payload limit).
+# ═══════════════════════════════════════════════════════════════════
+
+object_mass:
+  min_kg: 0.050    # 50 g
+  max_kg: 0.950    # 950 g
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 3. GRIP DIMENSION RANGE
+#    All objects' gripped dimension must fall within the gripper's
+#    external grip range. Shared across all shapes.
+# ═══════════════════════════════════════════════════════════════════
+
+grip_range_mm:
+  min: 36 # slightly above 35 mm to avoid edge cases
+  max: 72 # slightly below 73 mm to avoid edge cases
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 4. SHAPES
+#    Each shape defines:
+#      - weight:  relative spawn probability (higher = more common)
+#      - dimension rules specific to that shape
+#
+#    Gripped dimension (the one constrained to grip_range_mm):
+#      Cube:      side
+#      Rectangle: width (short side)
+#      Cylinder:  diameter
+#      Disc:      diameter
+#      Sphere:    diameter
+# ═══════════════════════════════════════════════════════════════════
 
 shapes:
-  - name: cube
-    size: [0.04, 0.04, 0.04]
+
+  - name: Cube
+    weight: 1.0
+    # side = grip dimension 
+    # No other parameters needed — all sides equal
+
+  #- name: Rectangle
+  #  weight: 2.0
+  #  # width = grip dimension 
+  #  length_ratio:  [1.3, 2.0]    # length = width × ratio
+  #  height_range:  [0.018, 0.040] # metres
+
+  - name: Cylinder
+    weight: 1.0
+    # diameter = grip dimension 
+    height_range:  [0.035, 0.095] # metres
+
+  - name: Disc
+    weight: 1.0
+    # diameter = grip dimension 
+    height_range:  [0.008, 0.022] # metres (thin!)
+
+  - name: Sphere
+    weight: 1.0
+    # diameter = grip dimension 
+    # No other parameters — fully defined by radius
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 5. COLOR PALETTE
+#    One color randomly assigned per object.
+#    name: used in auto-generated label
+#    rgb:  display color [r, g, b] in 0–1 range
+# ═══════════════════════════════════════════════════════════════════
 
 colors:
   - name: red
-    rgb: [1.0, 0.0, 0.0]
+    rgb:  [0.88, 0.12, 0.12]
+  - name: blue
+    rgb:  [0.12, 0.15, 0.88]
+  - name: green
+    rgb:  [0.12, 0.78, 0.12]
+  - name: yellow
+    rgb:  [0.95, 0.85, 0.10]
+  - name: orange
+    rgb:  [1.00, 0.50, 0.00]
+  - name: purple
+    rgb:  [0.60, 0.12, 0.88]
+  - name: cyan
+    rgb:  [0.12, 0.85, 0.85]
+  - name: white
+    rgb:  [0.94, 0.94, 0.92]
+  - name: grey
+    rgb:  [0.55, 0.55, 0.55]
+  - name: brown
+    rgb:  [0.55, 0.30, 0.12]
+  - name: pink
+    rgb:  [1.00, 0.42, 0.70]
+  - name: black
+    rgb:  [0.12, 0.12, 0.12]
 
-grip_range_mm:
-  min: 35
-  max: 73
 
-object_mass:
-  min: 0.05
-  max: 0.20
+# ═══════════════════════════════════════════════════════════════════
+# 6. PHYSICS MATERIALS
+#    One material randomly assigned per object at spawn time.
+# ═══════════════════════════════════════════════════════════════════
 
 object_physics_materials:
-  - name: default_soft
-    static_friction: 0.8
-    dynamic_friction: 0.6
-    restitution: 0.0
 
-num_objects_range: [1, 1]
+  - name:             wood
+    static_friction:  0.50
+    dynamic_friction: 0.40
+    restitution:      0.10
+
+  - name:             plastic
+    static_friction:  0.40
+    dynamic_friction: 0.30
+    restitution:      0.20
+
+  - name:             rubber
+    static_friction:  0.90
+    dynamic_friction: 0.80
+    restitution:      0.50
+
+  - name:             metal
+    static_friction:  0.25
+    dynamic_friction: 0.20
+    restitution:      0.15
+
+  - name:             ceramic
+    static_friction:  0.45
+    dynamic_friction: 0.35
+    restitution:      0.05
+
+  - name:             copper
+    static_friction:  0.30
+    dynamic_friction: 0.25
+    restitution:      0.10
+
+  - name:             cardboard
+    static_friction:  0.60
+    dynamic_friction: 0.50
+    restitution:      0.05
+
+  - name:             glass
+    static_friction:  0.20
+    dynamic_friction: 0.15
+    restitution:      0.05
