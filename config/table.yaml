@@ -1,7 +1,31 @@
 # ===============================
 # table.yaml
 # =============================
+materials:
+  - name: oak_light
+    category: wood
+    color: [0.7, 0.5, 0.3]
+    roughness: 0.6
+    metallic: 0.0
+    specular: 0.5
 
+  - name: brushed_steel
+    category: metal
+    color: [0.7, 0.7, 0.7]
+    roughness: 0.2
+    metallic: 1.0
+    specular: 0.9
 
-materials: []
-seat_slots: []
+# ===============================
+# table_slots.yaml
+# =============================
+seat_slots:
+  - name: front
+    facing: long
+    approach_deg: 0
+    seat_offset: 0.0
+
+  - name: side
+    facing: short
+    approach_deg: 90
+    seat_offset: 0.0

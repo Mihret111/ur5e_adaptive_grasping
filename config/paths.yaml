@@ -13,3 +13,5 @@ gripper:
   left_finger_link: "/onrobot_2fg7/left_finger_link"
   right_finger_link: "/onrobot_2fg7/right_finger_link"
 
+scene_spawn:
+  root: "/World/Trial"

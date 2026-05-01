@@ -1,15 +1,11 @@
 # store object info
-def get_object_profile():
-    """
-    now return a fixed object
-    maybe later to be changed to load from config or perception
-    """
+
+def build_object_profile(target):
     return {
-        "name": "banana",
-        "fragility": "high",
-        "stiffness": "low",
-        "deformable": True
-        # "shape": "cylindrical",
-        # "size": "medium",
-        # "weight": "light"
+        "name": target["label"],
+        # "fragility": infer_fragility(target),
+        # "stiffness": infer_stiffness(target),
+        "mass": target["mass"],
+        "material": target["material_name"],
+        "fragility": "high" if target["mass"] < 0.2 else "low"
     }

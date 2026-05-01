@@ -68,9 +68,7 @@ CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
 # (
 #     CONFIG,
 # ) = load_all_configs(config_dir=CONFIG_DIR)
-CONFIG, TABLE_MATERIALS, TABLE_SEAT_SLOTS = load_all_configs(
-    config_dir=CONFIG_DIR
-)
+CONFIG, TABLE_MATERIALS, TABLE_SEAT_SLOTS = load_all_configs(config_dir=CONFIG_DIR)
 flange_path = CONFIG["paths"]["robot"]["flange_prim"]
 init_motion(flange_path)
 
@@ -95,6 +93,8 @@ async def main():
 
         runner = TrialRunner(  # You have to create your TrialRunner
             config          = CONFIG,
+            table_materials = TABLE_MATERIALS,
+            table_slots     = TABLE_SEAT_SLOTS,
             step_fn         = step_simulation,
             step_seconds_fn = step_simulation_seconds,
         )
