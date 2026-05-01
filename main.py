@@ -48,6 +48,8 @@ for mod_name in MODULE_NAMES:
 
 import asyncio
 import omni.usd
+import omni.kit.commands  # needed for loading omni commands
+
 
 from modules.config_loader import load_all_configs
 from modules.sim_utils     import (
@@ -73,6 +75,20 @@ flange_path = CONFIG["paths"]["robot"]["flange_prim"]
 init_motion(flange_path)
 
 
+def focus_view_on_trial_root():
+    """
+    Focus the Isaac Sim viewport on the generated trial scene.
+    (equivalent to selecting /World/Trial and pressing F in the UI)
+    """
+    try:
+        omni.kit.commands.execute(
+            "FramePrimsCommand",
+            prim_paths=["/World/Trial"]
+        )
+        print("  [camera] Focused viewport on /World/Trial")
+    except Exception as e:
+        print(f"  [camera] Warning: could not focus viewport: {e}")
+
 # ═══════════════════════════════════════════════════════════════
 # 3. MAIN
 # ═══════════════════════════════════════════════════════════════
@@ -91,7 +107,7 @@ async def main():
         print("  [main] Initial settle: stepping 60 frames...")
         await step_simulation(60)
 
-        runner = TrialRunner(  # You have to create your TrialRunner
+        runner = TrialRunner(                                                                     # You have to create your TrialRunner
             config          = CONFIG,
             table_materials = TABLE_MATERIALS,
             table_slots     = TABLE_SEAT_SLOTS,
@@ -99,6 +115,13 @@ async def main():
             step_seconds_fn = step_simulation_seconds,
         )
         await runner.run_all()
+
+        # After SceneBuilder has created /World/Trial, focus the viewport there
+        focus_view_on_trial_root()
+
+        # Keep the scene visible for a few seconds before stopping
+        print("  [main] Holding scene for inspection...")
+        await step_simulation_seconds(5.0)
 
     except Exception as e:
         print(f"\n  ❌ FATAL: {e}")
