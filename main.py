@@ -35,7 +35,16 @@ MODULE_NAMES = [
     "modules",
     "modules.config_loader",
     "modules.sim_utils",
-    "modules.preflight",  
+    "modules.preflight",
+    "modules.event_bus",
+    "modules.scene_builder",
+    "modules.trial_runner",
+    "modules.object_context",
+    "modules.strategy_selector",
+    "modules.execution_manager",
+    "modules.primitive_library",
+    "modules.motion_interface",
+    "modules.config_validator",
 ]
 for mod_name in MODULE_NAMES:
     if mod_name in sys.modules:
@@ -62,7 +71,7 @@ from modules.preflight    import preflight_check
 from modules.event_bus    import bus         
 from modules.trial_runner import TrialRunner
 from modules.primitive_library import init_motion
-
+from modules.config_validator import validate_config
 # ═══════════════════════════════════════════════════════════════
 # 2. CONFIGURATION
 # ═══════════════════════════════════════════════════════════════
@@ -71,6 +80,8 @@ CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
 #     CONFIG,
 # ) = load_all_configs(config_dir=CONFIG_DIR)
 CONFIG, TABLE_MATERIALS, TABLE_SEAT_SLOTS = load_all_configs(config_dir=CONFIG_DIR)
+validate_config(CONFIG, TABLE_MATERIALS, TABLE_SEAT_SLOTS)
+
 flange_path = CONFIG["paths"]["robot"]["flange_prim"]
 init_motion(flange_path)
 

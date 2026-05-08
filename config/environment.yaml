@@ -16,77 +16,11 @@ build_table: true
 table_size: [1.0, 0.6, 0.75]
 table_leg_radius: 0.02
 
-# ───────────── OBJECT COUNT ─────────────
-num_objects_range: [3, 6]
+# ───────────── TABLE PLACEMENT ─────────────
 
-# ───────────── OBJECT PLACEMENT ─────────────
-object_margin: 0.04
-object_spacing_padding: 0.02
 near_edge_padding: 0.03
 
 # ───────────── REACH ─────────────
 arm_min_reach: 0.30
 arm_max_reach: 0.85
 reach_safety_margin: 0.05
-
-# ───────────── GRIPPER / PHYSICS ─────────────
-gripper_friction:
-  static_friction: 2.0
-  dynamic_friction: 2.0
-  restitution: 0.0
-
-gripper_solver_position_iterations: 32
-gripper_solver_velocity_iterations: 8
-
-# ───────────── SHAPES ─────────────
-shapes:
-  - name: Cube
-    weight: 1.0
-  - name: Rectangle
-    weight: 1.0
-    length_ratio: [1.3, 2.0]
-    height_range: [0.018, 0.040]
-  - name: Cylinder
-    weight: 1.0
-    height_range: [0.035, 0.095]
-  - name: Disc
-    weight: 1.0
-    height_range: [0.008, 0.022]
-  - name: Sphere
-    weight: 1.0
-
-# ───────────── COLORS ─────────────
-colors:
-  - name: red
-    rgb: [1.0, 0.0, 0.0]
-  - name: green
-    rgb: [0.0, 1.0, 0.0]
-  - name: blue
-    rgb: [0.0, 0.0, 1.0]
-  - name: yellow
-    rgb: [1.0, 1.0, 0.0]
-
-# ───────────── MATERIALS ─────────────
-object_physics_materials:
-  - name: rubber
-    static_friction: 1.0
-    dynamic_friction: 0.8
-    restitution: 0.1
-  - name: plastic
-    static_friction: 0.5
-    dynamic_friction: 0.4
-    restitution: 0.2
-  - name: metal
-    static_friction: 0.3
-    dynamic_friction: 0.2
-    restitution: 0.3
-
-# ───────────── MASS ─────────────
-object_mass:
-  min_kg: 0.05
-  max_kg: 0.5
-
-# ───────────── GRIP RANGE ─────────────
-grip_range_mm:
-  min: 35
-  max: 73
