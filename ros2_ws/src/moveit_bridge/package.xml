@@ -10,6 +10,8 @@
   <depend>rclpy</depend>
   <depend>geometry_msgs</depend>
   <depend>std_srvs</depend>
+  <depend>moveit_interfaces</depend>
+  <depend>moveit_py</depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'move_to_pose_server = moveit_bridge.move_to_pose_server:main',
         ],
     },
 )

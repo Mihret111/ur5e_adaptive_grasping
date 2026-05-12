@@ -1,0 +1,11 @@
+geometry_msgs/PoseStamped target_pose
+string planning_group
+string end_effector_link
+float64 velocity_scaling
+float64 acceleration_scaling
+---
+bool success
+string message
+---
+string phase
+float32 progress
