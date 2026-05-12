@@ -4,6 +4,7 @@ from modules.object_context import build_object_profile
 from modules.strategy_selector import select_strategy
 from modules.execution_manager import ExecutionManager
 from modules.scene_builder import SceneBuilder
+from modules.target_exporter import export_moveit_target_command
 
 class TrialRunner:
     def __init__(self, config, table_materials, table_slots, step_fn, step_seconds_fn):
@@ -33,6 +34,42 @@ class TrialRunner:
             print(f"[TrialRunner] Trial {i+1}/{num_trials}")
 
             scene_info = self.scene_builder.build_trial(i)
+
+            ## Target selection 
+            target = scene_info["pick_target"]
+            target_local_base = scene_info["target_local_base"]
+
+            export_moveit_target_command(
+                output_path="/tmp/cogar_b2b/target_command.json",
+                target=target,
+                target_local_base=target_local_base,
+                hover_height=0.40,
+            )
+
+            ## -------------------------------------------------------------
+            ## Export the first target as a MoveIt command JSON file.
+            ## -------------------------------------------------------------
+            target = scene_info["pick_target"]
+
+            # Construct a path under the run outputs directory.
+            run_dir = self.config.get("paths", {}).get(
+                "run_outputs_dir",
+                "runs/isaac_run",
+            )
+
+            target_path = os.path.join(
+                run_dir,
+                f"trial_{trial_index}",
+                "target.json",
+            )
+
+            _ = export_moveit_target_command(
+                output_path=target_path,
+                target=target,
+                target_local_base=scene_info["target_local_base"],
+                hover_height=0.25,   # you can tune this
+            )
+            # -------------------------------------------------------------
             target = scene_info["pick_target"]
             print(f"[TrialRunner] Target: {target['label']}")
 

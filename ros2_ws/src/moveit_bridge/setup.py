@@ -23,6 +23,7 @@ setup(
     entry_points={
         "console_scripts": [
             "move_to_pose_server = moveit_bridge.move_to_pose_server:main",
+            "send_target_from_json = moveit_bridge.send_target_from_json:main",
         ],
     },
 )
