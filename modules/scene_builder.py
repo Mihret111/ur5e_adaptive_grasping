@@ -17,7 +17,6 @@ Does NOT own:
   - Pick sequencing
   - Config loading
 """
-
 import math
 import random
 from typing import Optional
@@ -79,8 +78,62 @@ class SceneBuilder:
         self._pick_target = random.choice(objects)
         self._pick_target["is_target"] = True
 
+        # --- FRAME CHECK ---
         ur5e_base_pos = self._get_ur5e_base_world_pos()
         obj_pos       = self._pick_target["world_pos"]
+        # Get flange prim
+        flange_path = (
+            self.config
+            .get("paths", {})
+            .get("robot", {})
+            .get(
+                "flange_prim",
+                "/mir/base_link_cabinet/cabinet/ur_mount/ur5e_physics/wrist_3_link/flange"
+            )
+        )
+
+        flange_pos = self._get_prim_world_pos(flange_path)
+
+        rel_obj_pos = [
+            obj_pos[0] - ur5e_base_pos[0],
+            obj_pos[1] - ur5e_base_pos[1],
+            obj_pos[2] - ur5e_base_pos[2],
+        ]
+
+        print("\n  [FrameCheck]")
+        print(f"    UR5e base world:  ({ur5e_base_pos[0]:.3f}, {ur5e_base_pos[1]:.3f}, {ur5e_base_pos[2]:.3f})")
+        print(f"    Flange world:     ({flange_pos[0]:.3f}, {flange_pos[1]:.3f}, {flange_pos[2]:.3f})")
+        print(f"    Target world:     ({obj_pos[0]:.3f}, {obj_pos[1]:.3f}, {obj_pos[2]:.3f})")
+        print(f"    Target rel base:  ({rel_obj_pos[0]:.3f}, {rel_obj_pos[1]:.3f}, {rel_obj_pos[2]:.3f})")
+
+        ## Adding more detailed frame check - start
+        robot_paths = self.config.get("paths", {}).get("robot", {})
+
+        base_path = robot_paths.get(
+            "ur5e_base_link",
+            "/mir/base_link_cabinet/cabinet/ur_mount/ur5e_physics/base_link",
+        )
+
+        target_local_base = self._world_point_to_prim_local(
+            reference_prim_path=base_path,
+            world_point=obj_pos,
+        )
+
+        flange_local_base = self._world_point_to_prim_local(
+            reference_prim_path=base_path,
+            world_point=flange_pos,
+        )
+
+        print("\n  [FrameCheck - full transform]")
+        print(
+            f"    Target in UR5e base frame: "
+            f"({target_local_base[0]:.3f}, {target_local_base[1]:.3f}, {target_local_base[2]:.3f})"
+        )
+        print(
+            f"    Flange in UR5e base frame: "
+            f"({flange_local_base[0]:.3f}, {flange_local_base[1]:.3f}, {flange_local_base[2]:.3f})"
+        )
+        ##
         dx = obj_pos[0] - ur5e_base_pos[0]
         dy = obj_pos[1] - ur5e_base_pos[1]
         pan_to_object = math.degrees(math.atan2(dy, dx))
@@ -107,6 +160,10 @@ class SceneBuilder:
             "table_height":     table_info["table_size"][2],
             "pan_to_table_deg": pan_to_object,
             "ur5e_base_pos":    ur5e_base_pos,
+            "flange_world_pos": flange_pos,
+            "target_relative_to_ur5e_base": rel_obj_pos,
+            "target_local_base": target_local_base,
+            "flange_local_base": flange_local_base,
         }
 
     def get_pick_target(self) -> Optional[dict]:
@@ -308,6 +365,7 @@ class SceneBuilder:
             print(f"  [Friction] ⚠️  Could not set solver iterations: {e}")
             print(f"             Explosion risk from gripper contacts remains")
 
+    ## A helper to retrieve the world position of the ur5e base link
     def _get_ur5e_base_world_pos(self) -> list:
         """Return UR5E base_link world position as [x, y, z]."""
         robot_paths = self.config.get("paths", {}).get("robot", {})
@@ -326,6 +384,49 @@ class SceneBuilder:
 
         print("  ⚠️  UR5E base_link not found — using fallback position")
         return [0.0, 0.0, self.config.get("ur5e_base_height", 0.8593)]
+    
+    ## A helper to retrieve the world position of any prim
+    def _get_prim_world_pos(self, prim_path: str) -> list:
+        """Return world position of a USD prim as [x, y, z]."""
+        prim = self.stage.GetPrimAtPath(Sdf.Path(prim_path))
+
+        if not prim.IsValid():
+            print(f"  ⚠️  Prim not found: {prim_path}")
+            return [0.0, 0.0, 0.0]
+
+        xform = UsdGeom.Xformable(prim)
+        mtx = xform.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+        pos = mtx.ExtractTranslation()
+
+        return [pos[0], pos[1], pos[2]]
+
+    ## A helper to convert a world-space point into the local frame of a given USD prim
+    def _world_point_to_prim_local(self, reference_prim_path: str, world_point: tuple) -> list:
+        """
+        Convert a world-space point into the local coordinate frame of a USD prim.
+
+        This is better than simple subtraction because it also accounts for
+        the base prim's rotation.
+        """
+        prim = self.stage.GetPrimAtPath(Sdf.Path(reference_prim_path))
+
+        if not prim.IsValid():
+            print(f"  ⚠️  Reference prim not found: {reference_prim_path}")
+            return [0.0, 0.0, 0.0]
+
+        xform = UsdGeom.Xformable(prim)
+        world_from_local = xform.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+        local_from_world = world_from_local.GetInverse()
+
+        p_world = Gf.Vec3d(
+            float(world_point[0]),
+            float(world_point[1]),
+            float(world_point[2]),
+        )
+
+        p_local = local_from_world.Transform(p_world)
+
+        return [p_local[0], p_local[1], p_local[2]]
 
     # ══════════════════════════════════════════════════════════════════
     # ROOM
