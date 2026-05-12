@@ -1,4 +1,9 @@
+from launch.actions import reset_launch_configurations
+from launch.actions import reset_launch_configurations
 import traceback
+
+from pathlib import Path
+from moveit_configs_utils import MoveItConfigsBuilder
 
 import rclpy
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
@@ -21,14 +26,105 @@ class MoveToPoseServer(Node):
     """
 
     def __init__(self):
-        super().__init__("move_to_pose_server")
+        super().__init__("moveit_py")
 
         self.get_logger().info("Initializing MoveItPy...")
 
         # This creates a MoveItPy interface inside this node/process.
         # It reads the robot description/planning configuration from the
         # running ROS/MoveIt environment.
-        self.moveit = MoveItPy(node_name="b2b_moveit_py")
+        moveit_config = (
+            MoveItConfigsBuilder(robot_name="ur", package_name="ur_moveit_config")
+            .robot_description_semantic(
+                Path("srdf") / "ur.srdf.xacro",
+                {"name": "ur5e"},
+            )
+            .planning_pipelines(
+                default_planning_pipeline="ompl",
+                pipelines=["ompl", "pilz_industrial_motion_planner", "chomp"],
+            )
+            .to_moveit_configs()
+        )
+
+        moveit_config = (
+            MoveItConfigsBuilder(robot_name="ur", package_name="ur_moveit_config")
+            .robot_description_semantic(
+                Path("srdf") / "ur.srdf.xacro",
+                {"name": "ur5e"},
+            )
+            .planning_pipelines(
+                default_planning_pipeline="ompl",
+                pipelines=["ompl", "pilz_industrial_motion_planner", "chomp"],
+            )
+            .to_moveit_configs()
+        )
+
+        config_dict = moveit_config.to_dict()
+
+        # ------------------------------------------------------------------
+        # MoveItPy expects planning_pipelines.pipeline_names, while the UR
+        # MoveIt config builder gives planning_pipelines as a plain list.
+        # This adapter makes the UR config compatible with MoveItPy.
+        # ------------------------------------------------------------------
+        pipeline_names = config_dict.get(
+            "planning_pipelines",
+            ["ompl", "pilz_industrial_motion_planner", "chomp"],
+        )
+
+        if isinstance(pipeline_names, list):
+            config_dict["planning_pipelines"] = {
+                "pipeline_names": pipeline_names
+            }
+
+        # Default single-pipeline planning parameters for MoveItPy.
+        # These are used when planning_component.plan() is called without
+        # explicit request parameters.
+        config_dict["plan_request_params"] = {
+            "planning_attempts": 1,
+            "planning_pipeline": "ompl",
+            "planner_id": "RRTConnectkConfigDefault",
+            "max_velocity_scaling_factor": 0.2,
+            "max_acceleration_scaling_factor": 0.2,
+            "planning_time": 5.0,
+        }
+
+        # Optional named planner configs for later use.
+        config_dict["ompl_rrtc"] = {
+            "plan_request_params": {
+                "planning_attempts": 1,
+                "planning_pipeline": "ompl",
+                "planner_id": "RRTConnectkConfigDefault",
+                "max_velocity_scaling_factor": 0.2,
+                "max_acceleration_scaling_factor": 0.2,
+                "planning_time": 5.0,
+            }
+        }
+
+        config_dict["pilz_ptp"] = {
+            "plan_request_params": {
+                "planning_attempts": 1,
+                "planning_pipeline": "pilz_industrial_motion_planner",
+                "planner_id": "PTP",
+                "max_velocity_scaling_factor": 0.2,
+                "max_acceleration_scaling_factor": 0.2,
+                "planning_time": 5.0,
+            }
+        }
+
+        config_dict["chomp_default"] = {
+            "plan_request_params": {
+                "planning_attempts": 1,
+                "planning_pipeline": "chomp",
+                "max_velocity_scaling_factor": 0.2,
+                "max_acceleration_scaling_factor": 0.2,
+                "planning_time": 5.0,
+            }
+        }
+
+        self.moveit = MoveItPy(
+            node_name="moveit_py",
+            config_dict=config_dict,
+        )
 
         # Default planning group for Universal Robots MoveIt config.
         self.default_planning_group = "ur_manipulator"
