@@ -33,18 +33,7 @@ class MoveToPoseServer(Node):
         # This creates a MoveItPy interface inside this node/process.
         # It reads the robot description/planning configuration from the
         # running ROS/MoveIt environment.
-        moveit_config = (
-            MoveItConfigsBuilder(robot_name="ur", package_name="ur_moveit_config")
-            .robot_description_semantic(
-                Path("srdf") / "ur.srdf.xacro",
-                {"name": "ur5e"},
-            )
-            .planning_pipelines(
-                default_planning_pipeline="ompl",
-                pipelines=["ompl", "pilz_industrial_motion_planner", "chomp"],
-            )
-            .to_moveit_configs()
-        )
+
 
         moveit_config = (
             MoveItConfigsBuilder(robot_name="ur", package_name="ur_moveit_config")
@@ -58,10 +47,10 @@ class MoveToPoseServer(Node):
             )
             .to_moveit_configs()
         )
-
+        # This line MUST come before using config_dict
         config_dict = moveit_config.to_dict()
 
-        # ------------------------------------------------------------------
+        ## ------------------------------------------------------------------
         # MoveItPy expects planning_pipelines.pipeline_names, while the UR
         # MoveIt config builder gives planning_pipelines as a plain list.
         # This adapter makes the UR config compatible with MoveItPy.
@@ -126,7 +115,7 @@ class MoveToPoseServer(Node):
             config_dict=config_dict,
         )
 
-        # Default planning group for Universal Robots MoveIt config.
+        ## Default planning group for Universal Robots MoveIt config.
         self.default_planning_group = "ur_manipulator"
 
         self.planning_component = self.moveit.get_planning_component(
