@@ -126,133 +126,124 @@ class PickAndPlaceExecutor:
         await self.open_gripper()
 
         print("\n[Executor] Computing pick joints...")
+
+        #-------------------------
         # implemented a simple pick_result using compute pick joints for now 
         # TODO:  (if possible)need to improve for robust picking using ML based model later
-        pick_result = self.arm.compute_pick_joints(
-            object_world_pos=object_world_pos,
-            pan_to_object_deg=pan_to_object_deg,
-            table_height=table_height,
-            object_metadata=target,
-            prim_path=target.get("prim_path"),
-        )
+        max_attempts = int(self.config.get("max_grasp_attempts", 2))
 
-        print("\n[Executor] Pick planning result:")
-        print(f"  target_force_n: {pick_result.get('target_force_n')}")
-        print(f"  grasp_strategy: {pick_result.get('grasp_strategy')}")
-        print(f"  object_height: {pick_result.get('object_height')}")
-        print(f"  IK meta: {pick_result.get('ik_meta')}")
-        print(f"  waypoints: {list(pick_result.get('joints', {}).keys())}")
+        for attempt in range(max_attempts):
+            print(f"\n[Executor] Grasp attempt {attempt + 1}/{max_attempts}")
 
-        # check if the pick_result has joints and the joints are not empty
-        if "joints" not in pick_result or not pick_result["joints"]:
-            print("[Executor] ❌ No pick joints computed.")
-            return False
+            # Recompute each attempt because the arm controller may select
+            # a different valid grasp orientation candidate.
+            pick_result = self.arm.compute_pick_joints(
+                object_world_pos=object_world_pos,
+                pan_to_object_deg=pan_to_object_deg,
+                table_height=table_height,
+                object_metadata=target,
+                prim_path=target.get("prim_path"),
+            )
 
-        # First milestone:
-        # move only to safe_above before attempting full grasp
-        safe_above = pick_result["joints"].get("safe_above")
-        if safe_above is None:
-            print("[Executor] ❌ No safe_above waypoint.")
-            return False
+            print("\n[Executor] Pick planning result:")
+            print(f"  target_force_n: {pick_result.get('target_force_n')}")
+            print(f"  grasp_strategy: {pick_result.get('grasp_strategy')}")
+            print(f"  object_height: {pick_result.get('object_height')}")
+            print(f"  IK meta: {pick_result.get('ik_meta')}")
+            print(f"  waypoints: {list(pick_result.get('joints', {}).keys())}")
 
-        print("\n[Executor] Moving to safe_above only...")
-        # using move_via_safe_height to move to safe_above, 
-        ok = await self.arm.move_via_safe_height(
-            safe_above,
-            duration=3.0,
-            steps=150,
-        )
+            joints = pick_result.get("joints", {})
+            safe_above = joints.get("safe_above")
+            pre_grasp = joints.get("pre_grasp")
+            grasp = joints.get("grasp")
 
-        if not ok:
-            print("[Executor] ❌ Failed to reach safe_above.")
-            return False
 
-        # 
-        print("[Executor] ✅ Reached safe_above.")
-        
-        #TODO enable the full pick sequence
+            if safe_above is None or pre_grasp is None or grasp is None:
+                print("[Executor] ❌ Missing one or more required waypoints.")
+                return False
 
-        # ------------------------------------------------------------
-        # Second milestone: move from safe_above to pre_grasp
-        # No gripper close yet. No object contact yet
-        # ------------------------------------------------------------
-        if not self.config.get("enable_pre_grasp_test", True):
-            print("[Executor] Stopping after safe_above by config.")
-            await self._hold_for_inspection(seconds=10.0)
-            return True
+            print("\n[Executor] Moving to safe_above...")
+            ok = await self.arm.move_via_safe_height(
+                safe_above,
+                duration=3.0,
+                steps=150,
+            )
+            if not ok:
+                print("[Executor] ❌ Failed to reach safe_above.")
+                return False
 
-        pre_grasp = pick_result["joints"].get("pre_grasp")
-        if pre_grasp is None:
-            print("[Executor] ❌ No pre_grasp waypoint.")
-            await self._hold_for_inspection(seconds=10.0)
-            return False
+            print("[Executor] ✅ Reached safe_above.")
 
-        print("\n[Executor] Moving to pre_grasp...")
-        ok = await self.arm.move_to(
-            pre_grasp,
-            duration=3.0,
-            steps=150,
-            check_table_collision=True,
-        )
+            print("\n[Executor] Moving to pre_grasp...")
+            ok = await self.arm.move_to(
+                pre_grasp,
+                duration=3.0,
+                steps=150,
+                check_table_collision=True,
+            )
+            if not ok:
+                print("[Executor] ❌ Failed to reach pre_grasp.")
+                await self.arm.move_via_safe_height(safe_above, duration=3.0, steps=150)
+                return False
 
-        if not ok:
-            print("[Executor] ❌ Failed to reach pre_grasp.")
-            await self._hold_for_inspection(seconds=10.0)
-            return False
+            print("[Executor] ✅ Reached pre_grasp.")
 
-        print("[Executor] ✅ Reached pre_grasp.")
-        
-        # ------------------------------------------------------------
-        # Third milestone: move from pre_grasp to grasp
-        # trigger gripper close after reaching grasp pose and check whether it detects/holds an object
-        # but do not lift it up yet
-        # ------------------------------------------------------------
-        if not self.config.get("enable_grasp_pose_test", True):
-            print("[Executor] Stopping after pre_grasp by config.")
-            await self._hold_for_inspection(seconds=10.0)
-            return True
+            print("\n[Executor] Moving to grasp pose...")
+            ok = await self.arm.move_to(
+                grasp,
+                duration=3.0,
+                steps=150,
+                check_table_collision=True,
+            )
+            if not ok:
+                print("[Executor] ❌ Failed to reach grasp pose.")
+                await self.arm.move_to(pre_grasp, duration=2.0, steps=100)
+                await self.arm.move_via_safe_height(safe_above, duration=3.0, steps=150)
+                return False
 
-        grasp = pick_result["joints"].get("grasp")
-        if grasp is None:
-            print("[Executor] ❌ No grasp waypoint.")
-            await self._hold_for_inspection(seconds=10.0)
-            return False
+            print("[Executor] ✅ Reached grasp pose.")
 
-        print("\n[Executor] Moving to grasp pose...")
-        ok = await self.arm.move_to(
-            grasp,
-            duration=3.0,
-            steps=150,
-            check_table_collision=True,
-        )
+            print("\n[Executor] Closing gripper at grasp pose...")
+            target_force = pick_result.get("target_force_n", None)
+            await self.close_gripper(force_n=target_force)
 
-        if not ok:
-            print("[Executor] ❌ Failed to reach grasp pose.")
-            await self._hold_for_inspection(seconds=10.0)
-            return False
+            diag = self.gripper.get_diagnostics()
+            print("\n[Executor] Gripper diagnostics after close:")
+            print(diag)
 
-        print("[Executor] ✅ Reached grasp pose.")
+            if self.gripper.has_object():
+                print("[Executor] ✅ Object detected in gripper.")
 
-        # ------------------------------------------------------------
-        # Fourth milestone: close gripper at grasp pose and check whether it detects/holds the object
-        # ------------------------------------------------------------
-        if not self.config.get("enable_gripper_close_test", True):
-            print("[Executor] Stopping at grasp pose by config.")
-            await self._hold_for_inspection(seconds=10.0)
-            return True
+                if not self.config.get("enable_lift_test", False):
+                    print("[Executor] Lift disabled for now. Holding for inspection.")
+                    await self._hold_for_inspection(seconds=10.0)
+                    return True
 
-        print("\n[Executor] Closing gripper at grasp pose...")
+                # TODO Safe lift 
+                return True
 
-        target_force = pick_result.get("target_force_n", None)
-        await self.close_gripper(force_n=target_force)
+            print("[Executor] ❌ No object detected after close.")
 
-        print("\n[Executor] Gripper diagnostics after close:")
-        print(self.gripper.get_diagnostics())
+            if attempt < max_attempts - 1:
+                print("[Executor] Retrying safely: open → pre_grasp → safe_above")
 
-        print("[Executor] Holding closed gripper for inspection...")
-        await self._hold_for_inspection(seconds=10.0)
+                self.gripper.open()
+                await self._step_gripper_for_seconds(1.0)
 
-        has_obj = self.gripper.has_object()
-        print(f"[Executor] Has object after close: {has_obj}")
+                await self.arm.move_to(
+                    pre_grasp,
+                    duration=2.0,
+                    steps=100,
+                    check_table_collision=True,
+                )
 
-        return has_obj
+                await self.arm.move_via_safe_height(
+                    safe_above,
+                    duration=3.0,
+                    steps=150,
+                )
+
+            else:
+                print("[Executor] ❌ All grasp attempts failed.")
+                await self._hold_for_inspection(seconds=10.0)
+                return False

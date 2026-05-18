@@ -905,15 +905,37 @@ class UR5EController:
     def _solve_ik_for_world_pos(
         self, world_pos, orient=None, seed_deg=None,
     ):
+        # """Convenience: world position → IK solve in robot base frame."""
+        # if self._lula_solver is None:
+        #     return None
+        # local  = self._world_to_robot_base(world_pos)
+        # orient = (
+        #     orient if orient is not None
+        #     else np.array([0.0, 1.0, 0.0, 0.0])
+        # )
+        # return self._solve_ik_retries(local, orient, seed_deg=seed_deg)
         """Convenience: world position → IK solve in robot base frame."""
         if self._lula_solver is None:
             return None
-        local  = self._world_to_robot_base(world_pos)
+
+        local = self._world_to_robot_base(world_pos)
+
         orient = (
             orient if orient is not None
             else np.array([0.0, 1.0, 0.0, 0.0])
         )
-        return self._solve_ik_retries(local, orient, seed_deg=seed_deg)
+
+        joints, meta = self._solve_ik_retries(
+            local,
+            orient,
+            seed_deg=seed_deg,
+        )
+
+        if joints is None:
+            self._log(f"  [IK] _solve_ik_for_world_pos failed: {meta}")
+            return None
+
+        return joints
 
     async def _emergency_retreat(self):
         """Last-resort return to home, ignoring collision checks."""
