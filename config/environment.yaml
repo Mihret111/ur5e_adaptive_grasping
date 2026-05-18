@@ -37,6 +37,7 @@ safe_approach_height: 0.15
 
 enable_pre_grasp_test: true
 move_home_before_pick: true
+enable_grasp_pose_test: true
 
 # arm home pose
 arm_home_deg: [0.0, 90.0, 90.0, 0.0, 0.0, 0.0]

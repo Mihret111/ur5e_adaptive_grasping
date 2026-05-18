@@ -1,5 +1,6 @@
 # modules/pick_and_place_executor.py
 from launch.actions import reset_launch_configurations
+from launch.actions import reset_launch_configurations
 import os
 import asyncio
 
@@ -200,7 +201,38 @@ class PickAndPlaceExecutor:
             return False
 
         print("[Executor] ✅ Reached pre_grasp.")
-        print("[Executor] Holding at pre_grasp for inspection...")
-        await self._hold_for_inspection(seconds=10.0)
+        
+        # ------------------------------------------------------------
+        # Third milestone: move from pre_grasp to grasp
+        # trigger gripper close after reaching grasp pose and check whether it detects/holds an object
+        # but do not lift it up yet
+        # ------------------------------------------------------------
+        if not self.config.get("enable_grasp_pose_test", True):
+            print("[Executor] Stopping after pre_grasp by config.")
+            await self._hold_for_inspection(seconds=10.0)
+            return True
+
+        grasp = pick_result["joints"].get("grasp")
+        if grasp is None:
+            print("[Executor] ❌ No grasp waypoint.")
+            await self._hold_for_inspection(seconds=10.0)
+            return False
+
+        print("\n[Executor] Moving to grasp pose...")
+        ok = await self.arm.move_to(
+            grasp,
+            duration=3.0,
+            steps=150,
+            check_table_collision=True,
+        )
+
+        if not ok:
+            print("[Executor] ❌ Failed to reach grasp pose.")
+            await self._hold_for_inspection(seconds=10.0)
+            return False
+
+        print("[Executor] ✅ Reached grasp pose.")
+        print("[Executor] Holding at grasp pose for inspection...")
+        await self._hold_for_inspection(seconds=5.0)
 
         return True

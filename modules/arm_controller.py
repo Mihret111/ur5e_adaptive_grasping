@@ -1962,9 +1962,19 @@ class UR5EController:
 
     def go_home(self) -> list:
         """Return home joint configuration (degrees)."""
-        return list(self.config.get(
-            "arm_home_deg", [0.0, 90.0, 90.0, 0.0, 0.0, 0.0]))
+        home = self.config.get(
+            "arm_home_deg",
+            [0.0, 90.0, 90.0, 0.0, 0.0, 0.0],
+        )
 
+        # Handle accidental nested YAML list: [[...]]
+        if isinstance(home, list) and len(home) == 1 and isinstance(home[0], list):
+            home = home[0]
+
+        if len(home) != 6:
+            raise ValueError(f"arm_home_deg must contain exactly 6 values, got: {home}")
+
+        return [float(v) for v in home]
     async def move_home(
         self,
         duration: float = 4.0,
