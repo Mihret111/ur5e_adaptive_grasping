@@ -483,14 +483,38 @@ class SceneBuilder:
             th = random.uniform(*size_range["height"])
         else:
             tw, td, th = self.config["table_size"]
+            
+        ## ── Fixed debug table override ─────────────────────────────────
+        debug_fixed_table = self.config.get("debug_fixed_table", False)
 
-        # ── Material + seat slot ───────────────────────────────────────
-        table_mat    = random.choice(self.table_materials)
-        slot         = random.choice(self.table_seat_slots)
-        approach_deg = slot["approach_deg"]
-        approach_rad = math.radians(approach_deg)
-        facing       = slot["facing"]
-        seat_offset  = slot["seat_offset"]
+        if debug_fixed_table:
+            fixed_size = self.config.get("debug_fixed_table_size", [1.00, 0.60, 0.75])
+            tw, td, th = fixed_size
+
+            # IMPORTANT:
+            # "long" means the long table edge is the facing/sideways edge,
+            # and the short table dimension becomes the approach depth.
+            facing = "long"
+            approach_deg = float(self.config.get("debug_fixed_table_approach_deg", 0.0))
+            approach_rad = math.radians(approach_deg)
+            seat_offset = 0.0
+            slot = {
+                "name": "debug_fixed_front_short_depth",
+                "approach_deg": approach_deg,
+                "facing": facing,
+                "seat_offset": seat_offset,
+            }
+
+            table_mat = random.choice(self.table_materials)
+
+        else:
+            # ── Material + seat slot ───────────────────────────────────────
+            table_mat = random.choice(self.table_materials)
+            slot = random.choice(self.table_seat_slots)
+            approach_deg = slot["approach_deg"]
+            approach_rad = math.radians(approach_deg)
+            facing = slot["facing"]
+            seat_offset = slot["seat_offset"]
 
         # ── Geometry based on facing direction ─────────────────────────
         if facing == "long":
@@ -541,10 +565,43 @@ class SceneBuilder:
         px = -math.sin(approach_rad)
         py = math.cos(approach_rad)
 
+
+        # previous random table generation logic has been replaced with a fixed table generation logic
+        # tcx = ur5e_pos[0] + centre_dist * ax + seat_offset * px
+        # tcy = ur5e_pos[1] + centre_dist * ay + seat_offset * py
+        # table_center  = (tcx, tcy, 0.0)
+        # table_rot_deg = approach_deg
+        # top_thickness = 0.04
         tcx = ur5e_pos[0] + centre_dist * ax + seat_offset * px
         tcy = ur5e_pos[1] + centre_dist * ay + seat_offset * py
-        table_center  = (tcx, tcy, 0.0)
+        table_center = (tcx, tcy, 0.0)
         table_rot_deg = approach_deg
+
+        if self.config.get("debug_fixed_table", False):
+            fixed_center = self.config.get("debug_fixed_table_center", [1.10, 0.0, 0.0])
+            fixed_approach_deg = self.config.get("debug_fixed_table_approach_deg", 0.0)
+            fixed_facing = self.config.get("debug_fixed_table_facing", "long")
+
+            tcx = float(fixed_center[0])
+            tcy = float(fixed_center[1])
+            table_center = (tcx, tcy, 0.0)
+
+            approach_deg = float(fixed_approach_deg)
+            approach_rad = math.radians(approach_deg)
+            table_rot_deg = approach_deg
+            facing = fixed_facing
+
+            ax = math.cos(approach_rad)
+            ay = math.sin(approach_rad)
+            px = -math.sin(approach_rad)
+            py = math.cos(approach_rad)
+
+            print(
+                f"  [Table] DEBUG fixed table enabled: "
+                f"center=({tcx:.2f}, {tcy:.2f}) "
+                f"approach={approach_deg:.1f}° facing={facing}"
+            )
+
         top_thickness = 0.04
 
         # ── Tabletop ───────────────────────────────────────────────────
