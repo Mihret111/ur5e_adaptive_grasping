@@ -134,7 +134,7 @@ class PickAndPlaceExecutor:
         #-------------------------
         # implemented a simple pick_result using compute pick joints for now 
         # TODO:  (if possible)need to improve for robust picking using ML based model later
-        max_attempts = int(self.config.get("max_grasp_attempts", 2))
+        max_attempts = int(self.config.get("max_grasp_attempts"))
 
         for attempt in range(max_attempts):
             print(f"\n[Executor] Grasp attempt {attempt + 1}/{max_attempts}")
@@ -215,19 +215,53 @@ class PickAndPlaceExecutor:
             print("\n[Executor] Gripper diagnostics after close:")
             print(diag)
 
+            # ──── Test if object is held ────
             if self.gripper.has_object():
                 print("[Executor] ✅ Object detected in gripper.")
 
                 if not self.config.get("enable_lift_test", False):
-                    print("[Executor] Lift disabled for now. Holding for inspection.")
-                    await self._hold_for_inspection()
+                    print("[Executor] Lift disabled for now. Ending after successful grasp.")
                     return True
 
-                # TODO Safe lift 
-                return True
+            # ──── Perform the lift ────
+                lift = joints.get("lift")
+                if lift is None:
+                    print("[Executor] ❌ No lift waypoint available.")
+                    return False
 
-            print("[Executor] ❌ No object detected after close.")
+                print("\n[Executor] Lifting object...")
 
+                ok = await self.arm.move_to(
+                    lift,
+                    duration=3.0,
+                    steps=150,
+                    check_table_collision=True,
+                    step_callback=self.gripper.update,    # reinforces the gripper hold
+                )
+
+                if not ok:
+                    print("[Executor] ❌ Lift motion failed.")
+                    return False
+
+                # Let the gripper hold stabilize briefly
+                await self._step_gripper_for_seconds(0.5)
+
+                still_holding = self.gripper.has_object()
+
+                print("\n[Executor] Gripper diagnostics after lift:")
+                print(self.gripper.get_diagnostics())
+
+                if still_holding:
+                    print("[Executor] ✅ Object still held after lift.")
+                    return True
+
+                print("[Executor] ❌ Object lost during lift.")
+                return False
+
+            # ──── No object detected ────
+            # print("[Executor] ❌ No object detected after close.")
+            
+            # ──── retry or give up ────
             if attempt < max_attempts - 1:
                 print("[Executor] Retrying safely: open → pre_grasp → safe_above")
 

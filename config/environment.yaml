@@ -40,6 +40,12 @@ enable_pre_grasp_test: true
 enable_grasp_pose_test: true
 enable_gripper_close_test: true
 
+# ── Number of attempts before declaring failure ──
+max_grasp_attempts: 2
+
+# ── Enable lift-off test after successful grasp ──
+enable_lift_test: true
+
 # arm home pose
 arm_home_deg: [0.0, 90.0, 90.0, 0.0, 0.0, 0.0]
 
