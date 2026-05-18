@@ -20,17 +20,17 @@ from pxr import UsdPhysics, Sdf, PhysxSchema
 class Gripper2FG7:
 
     # ── Joint travel limits ────────────────────────────────────────
-    OPEN_POS   = 0.0
+    OPEN_POS   = 0.0     #TODO  do this actually apply to the actual hardware
     CLOSED_POS = 0.019
 
     # ── State constants ────────────────────────────────────────────
-    IDLE    = "IDLE"
+    IDLE    = "IDLE"     #TODO are only these states enough for my case? 
     OPENING = "OPENING"
     CLOSING = "CLOSING"
-    HOLDING = "HOLDING"
+    HOLDING = "HOLDING"  #TODO  can holding be represented as just one state? safe holding, slipped kind of... don't know check
 
     # ── Version marker ─────────────────────────────────────────────
-    VERSION = "v3-hold-fix"
+    VERSION = "v3-hold-fix" #??
 
     def __init__(
         self,

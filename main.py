@@ -7,10 +7,24 @@ import os
 import traceback
 import shutil
 
+import random
+import numpy as np
+
+
 PROJECT_ROOT = os.path.expanduser(
     "~/Desktop/SecondSem/COGAR/ur5e_adaptive_grasping" # Follow this path or change with yours
 )
+# ═══════════════════════════════════════════════════════════════
+# make same random choices repeat in the simulaition
+# ═══════════════════════════════════════════════════════════════
+DEBUG_SEED = 7
+seed = CONFIG.get("debug_seed", None)
+if seed is not None:
+    random.seed(seed)
+    np.random.seed(seed)
+    print(f"[main] Debug random seed = {seed}")
 
+# insert project root into sys.path
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
     print(f"  [path] Injected {PROJECT_ROOT} into sys.path")
@@ -45,6 +59,8 @@ MODULE_NAMES = [
     "modules.primitive_library",
     "modules.motion_interface",
     "modules.config_validator",
+    "modules.gripper_controller",
+    "modules.arm_controller",
 ]
 for mod_name in MODULE_NAMES:
     if mod_name in sys.modules:
@@ -85,6 +101,12 @@ validate_config(CONFIG, TABLE_MATERIALS, TABLE_SEAT_SLOTS)
 flange_path = CONFIG["paths"]["robot"]["flange_prim"]
 init_motion(flange_path)
 
+##
+seed = CONFIG.get("debug_seed", None)
+if seed is not None:
+    random.seed(seed)
+    np.random.seed(seed)
+    print(f"[main] Debug random seed = {seed}")
 
 def focus_view_on_trial_root():
     """
@@ -139,7 +161,14 @@ async def main():
         traceback.print_exc()
 
     finally:
-        stop_simulation()
+        # stop_simulation()
+        DEBUG_LEAVE_RUNNING = True
+
+        if DEBUG_LEAVE_RUNNING:
+            print("[main] Debug mode: leaving simulation running.")
+        else:
+            stop_simulation()
+        
         print(
             f"  [main] Done.  "
             f"Attempts: {runner._total_attempts}  "

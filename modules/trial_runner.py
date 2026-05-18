@@ -1,10 +1,14 @@
 
 
+from ament_index_python import constants
+from launch.actions import reset_launch_configurations
 from modules.object_context import build_object_profile
 from modules.strategy_selector import select_strategy
 from modules.execution_manager import ExecutionManager
 from modules.scene_builder import SceneBuilder
 from modules.target_exporter import export_moveit_target_command
+from modules.pick_and_place_executor import PickAndPlaceExecutor
+
 
 class TrialRunner:
     def __init__(self, config, table_materials, table_slots, step_fn, step_seconds_fn):
@@ -16,6 +20,8 @@ class TrialRunner:
         self.step_seconds_fn = step_seconds_fn
         self._total_attempts = 0
         self._total_successes = 0
+
+        self.pick_executor = PickAndPlaceExecutor(self.config)
 
         print(len(table_materials))
         # builds scene 
@@ -34,6 +40,15 @@ class TrialRunner:
             print(f"[TrialRunner] Trial {i+1}/{num_trials}")
 
             scene_info = self.scene_builder.build_trial(i)
+
+            ## pick 
+            ok = await self.pick_executor.run_generic_pick(scene_info)
+
+            if ok:
+                self._total_successes += 1
+                print(f"[TrialRunner] Trial {i} safe_above success")
+            else:
+                print(f"[TrialRunner] Trial {i} safe_above failed")
 
             ## Target selection 
             target = scene_info["pick_target"]
@@ -59,7 +74,7 @@ class TrialRunner:
 
             target_path = os.path.join(
                 run_dir,
-                f"trial_{trial_index}",
+                f"trial_{i}",
                 "target.json",
             )
 

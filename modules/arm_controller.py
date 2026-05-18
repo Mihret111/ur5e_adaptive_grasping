@@ -314,7 +314,7 @@ class UR5EController:
             self._flange_to_fingertips - self._flange_to_finger_base
         )
 
-        # ── Force + grasp tuning ──────────────────────────────
+        # TODO(tunable param) ── Force + grasp tuning ──────────────────────────────
         self._max_insertion_depth = config.get("max_insertion_depth", 0.040)
         self._grasp_clearance_mm = config.get("grasp_clearance_mm", 2.0)
         self._force_safety       = config.get("force_safety_factor", 2.5)
