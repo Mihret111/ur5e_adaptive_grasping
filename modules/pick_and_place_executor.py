@@ -232,7 +232,27 @@ class PickAndPlaceExecutor:
             return False
 
         print("[Executor] ✅ Reached grasp pose.")
-        print("[Executor] Holding at grasp pose for inspection...")
-        await self._hold_for_inspection(seconds=5.0)
 
-        return True
+        # ------------------------------------------------------------
+        # Fourth milestone: close gripper at grasp pose and check whether it detects/holds the object
+        # ------------------------------------------------------------
+        if not self.config.get("enable_gripper_close_test", True):
+            print("[Executor] Stopping at grasp pose by config.")
+            await self._hold_for_inspection(seconds=10.0)
+            return True
+
+        print("\n[Executor] Closing gripper at grasp pose...")
+
+        target_force = pick_result.get("target_force_n", None)
+        await self.close_gripper(force_n=target_force)
+
+        print("\n[Executor] Gripper diagnostics after close:")
+        print(self.gripper.get_diagnostics())
+
+        print("[Executor] Holding closed gripper for inspection...")
+        await self._hold_for_inspection(seconds=10.0)
+
+        has_obj = self.gripper.has_object()
+        print(f"[Executor] Has object after close: {has_obj}")
+
+        return has_obj

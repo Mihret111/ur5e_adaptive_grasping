@@ -8,7 +8,7 @@ from modules.execution_manager import ExecutionManager
 from modules.scene_builder import SceneBuilder
 from modules.target_exporter import export_moveit_target_command
 from modules.pick_and_place_executor import PickAndPlaceExecutor
-
+import os
 
 class TrialRunner:
     def __init__(self, config, table_materials, table_slots, step_fn, step_seconds_fn):

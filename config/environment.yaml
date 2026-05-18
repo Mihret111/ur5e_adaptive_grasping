@@ -35,9 +35,10 @@ safe_approach_height: 0.15
 
 # ───────────── PICK-AND-PLACE SETTINGS ─────────────
 
-enable_pre_grasp_test: true
 move_home_before_pick: true
+enable_pre_grasp_test: true
 enable_grasp_pose_test: true
+enable_gripper_close_test: true
 
 # arm home pose
 arm_home_deg: [0.0, 90.0, 90.0, 0.0, 0.0, 0.0]
