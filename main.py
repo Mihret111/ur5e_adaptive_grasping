@@ -2,6 +2,7 @@
 # 0. MAKE PROJECT IMPORTABLE
 # ═══════════════════════════════════════════════════════════════
 
+from asyncio import runners
 import sys
 import os
 import traceback
@@ -160,14 +161,14 @@ async def main():
         traceback.print_exc()
 
     finally:
-        # stop_simulation()
-        DEBUG_LEAVE_RUNNING = True
+        debug_leave_running = CONFIG.get("leave_sim_running_after_trial", False)
 
-        if DEBUG_LEAVE_RUNNING:
+        if debug_leave_running:
             print("[main] Debug mode: leaving simulation running.")
         else:
             stop_simulation()
-        
+            print("[main] Simulation stopped.")
+
         print(
             f"  [main] Done.  "
             f"Attempts: {runner._total_attempts}  "

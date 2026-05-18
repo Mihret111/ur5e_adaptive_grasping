@@ -74,10 +74,14 @@ class PickAndPlaceExecutor:
         print(f"[Executor] Has object: {self.gripper.has_object()}")
 
     # helper to just pause and hold the gripper open or close for inspection 
-    async def _hold_for_inspection(self, seconds: float = 10.0):
-        """
-        Pause execution and hold the gripper in its current state for inspection.
-        """
+    async def _hold_for_inspection(self, seconds: float = None):
+        if not self.config.get("debug_hold_after_stage", False):
+            return
+
+        import omni.kit.app
+
+        if seconds is None:
+            seconds = float(self.config.get("inspection_hold_seconds", 2.0))
 
         app = omni.kit.app.get_app()
         frames = max(1, int(seconds * 60))
@@ -216,7 +220,7 @@ class PickAndPlaceExecutor:
 
                 if not self.config.get("enable_lift_test", False):
                     print("[Executor] Lift disabled for now. Holding for inspection.")
-                    await self._hold_for_inspection(seconds=10.0)
+                    await self._hold_for_inspection()
                     return True
 
                 # TODO Safe lift 
@@ -245,5 +249,5 @@ class PickAndPlaceExecutor:
 
             else:
                 print("[Executor] ❌ All grasp attempts failed.")
-                await self._hold_for_inspection(seconds=10.0)
+                await self._hold_for_inspection()
                 return False

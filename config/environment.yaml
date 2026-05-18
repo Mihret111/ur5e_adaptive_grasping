@@ -45,9 +45,10 @@ arm_home_deg: [0.0, 90.0, 90.0, 0.0, 0.0, 0.0]
 
 # ───────────── INSPECTION ─────────────
 
-# how many seconds to hold before opening in inspection
-inspection_hold_duration: 10.0
-
+# turn off
+debug_hold_after_stage: false
+inspection_hold_seconds: 2.0 # how many seconds to hold before opening in inspection
+leave_sim_running_after_trial: false
 
 
 # ───────────── DEBUG TABLE POSITION ─────────────
