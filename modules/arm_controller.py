@@ -1972,6 +1972,8 @@ class UR5EController:
     ) -> bool:
         """Move arm to home position, via safe height if over table."""
         home = self.go_home()
+        print(f"  [UR5E] Home target deg: {home}")
+
         ok = await self.move_via_safe_height(
             home, duration=duration, steps=steps, step_callback=None
         )

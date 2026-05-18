@@ -1,10 +1,11 @@
 # modules/pick_and_place_executor.py
+from launch.actions import reset_launch_configurations
 import os
 import asyncio
 
 from modules.arm_controller import UR5EController
 from modules.gripper_controller import Gripper2FG7
-
+import omni.kit.app
 
 class PickAndPlaceExecutor:
     """
@@ -14,10 +15,9 @@ class PickAndPlaceExecutor:
       - initialize arm controller
       - initialize 2FG7 controller
       - compute pick waypoints
-      - execute a cautious generic pick sequence
+      - execute a generic pick sequence
 
-    This is NOT yet object-aware adaptive grasping.
-    This is the generic baseline behavior.
+    TODO object-aware adaptive grasping. This is a generic baseline behavior
     """
 
     def __init__(self, config: dict):
@@ -43,7 +43,7 @@ class PickAndPlaceExecutor:
             right_joint_path=right_joint,
             config=config,
         )
-        self.move_home_before_pick = config.get("move_home_before_pick", True)   #
+        # self.move_home_before_pick = config.get("move_home_before_pick", True)   #
         print("[PickAndPlaceExecutor] Ready.")
 
     async def _step_gripper_for_seconds(self, seconds: float):
@@ -72,13 +72,25 @@ class PickAndPlaceExecutor:
         print(f"[Executor] Gripper state: {self.gripper.get_state()}")
         print(f"[Executor] Has object: {self.gripper.has_object()}")
 
-    # implement move to pregrasp_approach position( a point above target pos with constant height of pregrasp_height)
+    # helper to just pause and hold the gripper open or close for inspection 
+    async def _hold_for_inspection(self, seconds: float = 10.0):
+        """
+        Pause execution and hold the gripper in its current state for inspection.
+        """
+
+        app = omni.kit.app.get_app()
+        frames = max(1, int(seconds * 60))
+
+        for _ in range(frames):
+            self.gripper.update()
+            await app.next_update_async()
+            
+    # implement move to pregrasp_approach position (a point above target pos with constant height of pregrasp_height)
     async def run_generic_pick(self, scene_info: dict) -> bool:
         """
-        Run a first generic pick attempt using the professor's Isaac-native
+        Run a first generic pick attempt using the Isaac-native
         arm and gripper controllers.
 
-        This is intentionally conservative.
         """
         # Get the pick target and table info from the scene_info, but first i need to know the structure of scene_info
         target = scene_info["pick_target"]
@@ -154,7 +166,41 @@ class PickAndPlaceExecutor:
             print("[Executor] ❌ Failed to reach safe_above.")
             return False
 
-        print("[Executor] ✅ Reached safe_above.")     # implement move to pregrasp_approach position( a point above target pos with constant height of pregrasp_height)
+        # 
+        print("[Executor] ✅ Reached safe_above.")
+        
+        #TODO enable the full pick sequence
 
-        #TODO Once safe_above is reliable, I will enable the full pick sequence
+        # ------------------------------------------------------------
+        # Second milestone: move from safe_above to pre_grasp
+        # No gripper close yet. No object contact yet
+        # ------------------------------------------------------------
+        if not self.config.get("enable_pre_grasp_test", True):
+            print("[Executor] Stopping after safe_above by config.")
+            await self._hold_for_inspection(seconds=10.0)
+            return True
+
+        pre_grasp = pick_result["joints"].get("pre_grasp")
+        if pre_grasp is None:
+            print("[Executor] ❌ No pre_grasp waypoint.")
+            await self._hold_for_inspection(seconds=10.0)
+            return False
+
+        print("\n[Executor] Moving to pre_grasp...")
+        ok = await self.arm.move_to(
+            pre_grasp,
+            duration=3.0,
+            steps=150,
+            check_table_collision=True,
+        )
+
+        if not ok:
+            print("[Executor] ❌ Failed to reach pre_grasp.")
+            await self._hold_for_inspection(seconds=10.0)
+            return False
+
+        print("[Executor] ✅ Reached pre_grasp.")
+        print("[Executor] Holding at pre_grasp for inspection...")
+        await self._hold_for_inspection(seconds=10.0)
+
         return True

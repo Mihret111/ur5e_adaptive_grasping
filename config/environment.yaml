@@ -24,3 +24,24 @@ near_edge_padding: 0.03
 arm_min_reach: 0.30
 arm_max_reach: 0.85
 reach_safety_margin: 0.05
+
+# ───────────── GRASP HEIGHTS ─────────────
+
+# height of approach above the object
+pregrasp_height: 0.08 
+
+# height used by the generic safe_above waypoint
+safe_approach_height: 0.15
+
+# ───────────── PICK-AND-PLACE SETTINGS ─────────────
+
+enable_pre_grasp_test: true
+move_home_before_pick: true
+
+# arm home pose
+arm_home_deg: [0.0, 90.0, 90.0, 0.0, 0.0, 0.0]
+
+# ───────────── INSPECTION ─────────────
+
+# how many seconds to hold before opening in inspection
+inspection_hold_duration: 10.0

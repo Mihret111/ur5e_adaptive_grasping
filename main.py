@@ -14,15 +14,7 @@ import numpy as np
 PROJECT_ROOT = os.path.expanduser(
     "~/Desktop/SecondSem/COGAR/ur5e_adaptive_grasping" # Follow this path or change with yours
 )
-# ═══════════════════════════════════════════════════════════════
-# make same random choices repeat in the simulaition
-# ═══════════════════════════════════════════════════════════════
-DEBUG_SEED = 7
-seed = CONFIG.get("debug_seed", None)
-if seed is not None:
-    random.seed(seed)
-    np.random.seed(seed)
-    print(f"[main] Debug random seed = {seed}")
+import omni.kit.app
 
 # insert project root into sys.path
 if PROJECT_ROOT not in sys.path:
@@ -61,6 +53,7 @@ MODULE_NAMES = [
     "modules.config_validator",
     "modules.gripper_controller",
     "modules.arm_controller",
+    "modules.pick_and_place_executor"
 ]
 for mod_name in MODULE_NAMES:
     if mod_name in sys.modules:
@@ -92,16 +85,22 @@ from modules.config_validator import validate_config
 # 2. CONFIGURATION
 # ═══════════════════════════════════════════════════════════════
 CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
-# (
-#     CONFIG,
-# ) = load_all_configs(config_dir=CONFIG_DIR)
+
 CONFIG, TABLE_MATERIALS, TABLE_SEAT_SLOTS = load_all_configs(config_dir=CONFIG_DIR)
+
+print("[config] enable_pre_grasp_test =", CONFIG.get("enable_pre_grasp_test"))
+print("[config] move_home_before_pick =", CONFIG.get("move_home_before_pick"))
+
 validate_config(CONFIG, TABLE_MATERIALS, TABLE_SEAT_SLOTS)
 
 flange_path = CONFIG["paths"]["robot"]["flange_prim"]
 init_motion(flange_path)
 
 ##
+# ═══════════════════════════════════════════════════════════════
+# make same random choices repeat in the simulaition
+# ═══════════════════════════════════════════════════════════════
+DEBUG_SEED = 7
 seed = CONFIG.get("debug_seed", None)
 if seed is not None:
     random.seed(seed)
