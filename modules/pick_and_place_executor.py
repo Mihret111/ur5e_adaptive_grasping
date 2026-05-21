@@ -1,4 +1,6 @@
 # modules/pick_and_place_executor.py
+from asyncio import exceptions
+from modules import target_exporter
 from launch.actions import reset_launch_configurations
 from launch.actions import reset_launch_configurations
 import os
@@ -90,6 +92,24 @@ class PickAndPlaceExecutor:
             self.gripper.update()
             await app.next_update_async()
             
+    # helper to get object position from prim path
+    def _get_prim_world_pos(self, prim_path: str):
+        import omni.usd                      # import modules just for one time when first called  
+        from pxr import UsdGeom, Sdf, Usd    # import required usd modules
+
+        stage = omni.usd.get_context().get_stage()    # get the stage 
+        prim = stage.GetPrimAtPath(Sdf.Path(prim_path)) # get the prim from prim path
+
+        if not prim.IsValid(): # if the prim is not valid, print an error message and return None
+            print(f"[Executor] ⚠️ Prim not found: {prim_path}")
+            return None
+        
+        xf = UsdGeom.Xformable(prim) # get the xformable interface from the prim
+        mtx = xf.ComputeLocalToWorldTransform(Usd.TimeCode.Default()) # compute the local to world transform
+        p = mtx.ExtractTranslation() # extract the translation from the transform
+
+        return [float(p[0]), float(p[1]), float(p[2])]
+
     # implement move to pregrasp_approach position (a point above target pos with constant height of pregrasp_height)
     async def run_generic_pick(self, scene_info: dict) -> bool:
         """
@@ -139,10 +159,23 @@ class PickAndPlaceExecutor:
         for attempt in range(max_attempts):
             print(f"\n[Executor] Grasp attempt {attempt + 1}/{max_attempts}")
 
+            actual_object_pos = self._get_prim_world_pos(target.get("prim_path"))
+
+            if actual_object_pos is None:
+                actual_object_pos = target["world_pos"]
+
+            print("[Executor] Stored object pos:", target["world_pos"])
+            print("[Executor] Actual object pos:", actual_object_pos)
+
+            # TODO(mihret): make this smarter. 
+            # Instead of always computing a new grasp for every attempt, 
+            # we could cache the first result and try it multiple times, 
+            # only recomputing if the first attempt fails (e.g. after a failed pick or after moving home). TO BE IMPROVED LATER
+
             # Recompute each attempt because the arm controller may select
             # a different valid grasp orientation candidate.
             pick_result = self.arm.compute_pick_joints(
-                object_world_pos=object_world_pos,
+                object_world_pos=actual_object_pos,    # pass actual_object_pos instead of the stale object_world_pos in target to make it robust to small errors in target position during runtime    
                 pan_to_object_deg=pan_to_object_deg,
                 table_height=table_height,
                 object_metadata=target,

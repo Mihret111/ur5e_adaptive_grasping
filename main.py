@@ -150,7 +150,7 @@ async def main():
         await runner.run_all()
 
         # After SceneBuilder has created /World/Trial, focus the viewport there
-        focus_view_on_trial_root()
+        # focus_view_on_trial_root()
 
         # Keep the scene visible for a few seconds before stopping
         print("  [main] Holding scene for inspection...")
