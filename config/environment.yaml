@@ -49,6 +49,23 @@ enable_lift_test: true
 # arm home pose
 arm_home_deg: [0.0, 90.0, 90.0, 0.0, 0.0, 0.0]
 
+# ───────────── GRASP VALIDATION ─────────────
+max_object_shift_during_close_m: 0.03
+max_object_flange_distance_after_close_m: 0.25
+
+min_success_lift_delta_m: 0.04
+min_object_above_table_m: 0.03
+max_object_flange_distance_after_lift_m: 0.25
+
+post_failed_close_pause_seconds: 0.5
+post_open_settle_seconds: 0.8
+retry_to_pregrasp_duration: 3.0
+retry_to_pregrasp_steps: 180
+retry_mid_settle_seconds: 0.3
+retry_to_safe_duration: 4.0
+retry_to_safe_steps: 240
+
+
 # ───────────── INSPECTION ─────────────
 
 # turn off

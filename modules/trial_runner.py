@@ -1,12 +1,11 @@
 
 
-from ament_index_python import constants
-from launch.actions import reset_launch_configurations
+# from ament_index_python import constants
+# from launch.actions import reset_launch_configurations
 from modules.object_context import build_object_profile
 from modules.strategy_selector import select_strategy
-from modules.execution_manager import ExecutionManager
 from modules.scene_builder import SceneBuilder
-from modules.target_exporter import export_moveit_target_command
+# from modules.target_exporter import export_moveit_target_command
 from modules.pick_and_place_executor import PickAndPlaceExecutor
 import os
 
@@ -23,18 +22,17 @@ class TrialRunner:
 
         self.pick_executor = PickAndPlaceExecutor(self.config)
 
-        print(len(table_materials))
         # builds scene 
         self.scene_builder = SceneBuilder(
             config=self.config,
             table_materials=self.table_materials,
             table_seat_slots=self.table_slots,
         )
-        print(self.scene_builder)
+    
+    ## run all trials
+    # trial here refers to one instance of pick and place (which includes as many attempts as set for pick and place)
     async def run_all(self):
         num_trials = self.config.get("num_trials", 1)
-
-        manager = ExecutionManager()
 
         for i in range(num_trials):
             print(f"[TrialRunner] Trial {i+1}/{num_trials}")

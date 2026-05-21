@@ -1,10 +1,4 @@
 # modules/pick_and_place_executor.py
-from asyncio import exceptions
-from modules import target_exporter
-from launch.actions import reset_launch_configurations
-from launch.actions import reset_launch_configurations
-import os
-import asyncio
 
 from modules.arm_controller import UR5EController
 from modules.gripper_controller import Gripper2FG7
@@ -110,6 +104,115 @@ class PickAndPlaceExecutor:
 
         return [float(p[0]), float(p[1]), float(p[2])]
 
+
+    # helpers to check grasp success:-
+    # 1. calculate distance between two points
+    def _distance(self, a, b):
+        import math
+        return math.sqrt(
+            (a[0] - b[0]) ** 2 +
+            (a[1] - b[1]) ** 2 +
+            (a[2] - b[2]) ** 2
+        )
+
+    # 2. helper to validate grasp just after closing gripper
+    def validate_after_close(self, target, object_pos_before_close):
+        object_pos_after = self._get_prim_world_pos(target.get("prim_path"))
+        flange_pos = self.arm.get_flange_world_pos()
+
+        result = {
+            "stage": "after_close",
+            "gripper_has_object": self.gripper.has_object(),
+            "object_pos_before": object_pos_before_close,
+            "object_pos_after": object_pos_after,
+            "flange_pos": flange_pos,
+            "object_shift": None,
+            "flange_object_distance": None,
+            "success": False,
+            "reasons": [],
+        }
+
+        if object_pos_before_close is None or object_pos_after is None:
+            result["reasons"].append("missing object pose")
+            return result
+
+        shift = self._distance(object_pos_before_close, object_pos_after)
+        dist = self._distance(object_pos_after, flange_pos)
+
+        result["object_shift"] = shift
+        result["flange_object_distance"] = dist
+
+        max_shift = float(self.config.get("max_object_shift_during_close_m", 0.03))
+        max_dist = float(self.config.get("max_object_flange_distance_after_close_m", 0.25))
+
+        if not result["gripper_has_object"]:
+            result["reasons"].append("gripper_has_object false")
+
+        if shift > max_shift:
+            result["reasons"].append(
+                f"object shifted too much during close: {shift:.3f} > {max_shift:.3f}"
+            )
+
+        if dist > max_dist:
+            result["reasons"].append(
+                f"object too far from flange after close: {dist:.3f} > {max_dist:.3f}"
+            )
+
+        result["success"] = len(result["reasons"]) == 0
+        return result
+
+    # 3. helper to validate grasp after lift
+    def validate_after_lift(self, target, object_pos_before_lift, table_height):
+        object_pos_after = self._get_prim_world_pos(target.get("prim_path"))
+        flange_pos = self.arm.get_flange_world_pos()
+
+        result = {
+            "stage": "after_lift",
+            "gripper_has_object": self.gripper.has_object(),
+            "object_pos_before_lift": object_pos_before_lift,
+            "object_pos_after_lift": object_pos_after,
+            "flange_pos": flange_pos,
+            "object_lift_delta_z": None,
+            "flange_object_distance": None,
+            "success": False,
+            "reasons": [],
+        }
+
+        if object_pos_before_lift is None or object_pos_after is None:
+            result["reasons"].append("missing object pose")
+            return result
+
+        dz = object_pos_after[2] - object_pos_before_lift[2]
+        dist = self._distance(object_pos_after, flange_pos)
+
+        result["object_lift_delta_z"] = dz
+        result["flange_object_distance"] = dist
+
+        min_lift_delta = float(self.config.get("min_success_lift_delta_m", 0.04))
+        min_above_table = float(self.config.get("min_object_above_table_m", 0.03))
+        max_dist = float(self.config.get("max_object_flange_distance_after_lift_m", 0.25))
+
+        if not result["gripper_has_object"]:
+            result["reasons"].append("gripper_has_object false")
+
+        if dz < min_lift_delta:
+            result["reasons"].append(
+                f"object did not lift enough: dz={dz:.3f} < {min_lift_delta:.3f}"
+            )
+
+        if object_pos_after[2] < table_height + min_above_table:
+            result["reasons"].append(
+                f"object not above table enough: z={object_pos_after[2]:.3f}"
+            )
+
+        if dist > max_dist:
+            result["reasons"].append(
+                f"object too far from flange after lift: {dist:.3f} > {max_dist:.3f}"
+            )
+
+        result["success"] = len(result["reasons"]) == 0
+        return result
+
     # implement move to pregrasp_approach position (a point above target pos with constant height of pregrasp_height)
     async def run_generic_pick(self, scene_info: dict) -> bool:
         """
@@ -126,6 +229,7 @@ class PickAndPlaceExecutor:
         table_height = scene_info.get("table_height", table_info["table_size"][2])
         pan_to_object_deg = scene_info.get("pan_to_table_deg", 0.0)
 
+        # print information about the pick target
         print("\n[Executor] Generic pick target:")
         print(f"  label: {target.get('label')}")
         print(f"  shape: {target.get('shape')}")
@@ -154,7 +258,7 @@ class PickAndPlaceExecutor:
         #-------------------------
         # implemented a simple pick_result using compute pick joints for now 
         # TODO:  (if possible)need to improve for robust picking using ML based model later
-        max_attempts = int(self.config.get("max_grasp_attempts"))
+        max_attempts = int(self.config.get("max_grasp_attempts", 2))
 
         for attempt in range(max_attempts):
             print(f"\n[Executor] Grasp attempt {attempt + 1}/{max_attempts}")
@@ -211,6 +315,28 @@ class PickAndPlaceExecutor:
 
             print("[Executor] ✅ Reached safe_above.")
 
+            ## read actual object pose again 
+            actual_object_pos = self._get_prim_world_pos(target.get("prim_path"))
+            if actual_object_pos is None:
+                actual_object_pos = target["world_pos"]
+            pick_result = self.arm.compute_pick_joints(
+                object_world_pos=actual_object_pos,    # pass actual_object_pos instead of the stale object_world_pos in target to make it robust to small errors in target position during runtime    
+                pan_to_object_deg=pan_to_object_deg,
+                table_height=table_height,
+                object_metadata=target,
+                prim_path=target.get("prim_path"),
+            )
+            ## get the computed joints again
+            joints = pick_result.get("joints", {})
+            # safe_above = joints.get("safe_above")
+            pre_grasp = joints.get("pre_grasp")
+            grasp = joints.get("grasp")
+
+            ## if pre grasp is None, then recompute pick joints
+            if pre_grasp is None:
+                print("[Executor] ❌ Missing pre_grasp. Recomputing pick joints...")
+                continue
+
             print("\n[Executor] Moving to pre_grasp...")
             ok = await self.arm.move_to(
                 pre_grasp,
@@ -240,7 +366,12 @@ class PickAndPlaceExecutor:
 
             print("[Executor] ✅ Reached grasp pose.")
 
+            # ──── Now try to close the gripper and validate the grasp. ────
             print("\n[Executor] Closing gripper at grasp pose...")
+
+            # Object pose just before closing; used for close/contact validation, NOT lift validation.
+            object_pos_before_close = self._get_prim_world_pos(target.get("prim_path"))
+
             target_force = pick_result.get("target_force_n", None)
             await self.close_gripper(force_n=target_force)
 
@@ -248,19 +379,36 @@ class PickAndPlaceExecutor:
             print("\n[Executor] Gripper diagnostics after close:")
             print(diag)
 
-            # ──── Test if object is held ────
-            if self.gripper.has_object():
-                print("[Executor] ✅ Object detected in gripper.")
+            # ──── Validate grasp/contact after closing ────
+            close_validation = self.validate_after_close(
+                target=target,
+                object_pos_before_close=object_pos_before_close,
+            )
+
+            print("\n[Executor] Close validation:")
+            print(close_validation)
+
+            if not close_validation["success"]:
+                print("[Executor] ❌ Close validation failed. Will retry if attempts remain.")
+                for reason in close_validation["reasons"]:
+                    print(f"  - {reason}")
+
+            else:
+                print("[Executor] ✅ Close validation passed.")
 
                 if not self.config.get("enable_lift_test", False):
-                    print("[Executor] Lift disabled for now. Ending after successful grasp.")
+                    print("[Executor] Lift disabled for now. Ending after successful close validation.")
                     return True
 
-            # ──── Perform the lift ────
+                # ──── Perform the lift ────
                 lift = joints.get("lift")
                 if lift is None:
                     print("[Executor] ❌ No lift waypoint available.")
                     return False
+
+                # Object pose immediately before lift.
+                # This is the reference for lift delta.
+                object_pos_before_lift = self._get_prim_world_pos(target.get("prim_path"))
 
                 print("\n[Executor] Lifting object...")
 
@@ -269,49 +417,72 @@ class PickAndPlaceExecutor:
                     duration=3.0,
                     steps=150,
                     check_table_collision=True,
-                    step_callback=self.gripper.update,    # reinforces the gripper hold
+                    step_callback=self.gripper.update,  # reinforces the gripper hold
                 )
 
                 if not ok:
                     print("[Executor] ❌ Lift motion failed.")
                     return False
 
-                # Let the gripper hold stabilize briefly
+                # Let the gripper/object settle briefly after lift.
                 await self._step_gripper_for_seconds(0.5)
-
-                still_holding = self.gripper.has_object()
 
                 print("\n[Executor] Gripper diagnostics after lift:")
                 print(self.gripper.get_diagnostics())
 
-                if still_holding:
-                    print("[Executor] ✅ Object still held after lift.")
+                # ──── Validate actual object lift ────
+                lift_validation = self.validate_after_lift(
+                    target=target,
+                    object_pos_before_lift=object_pos_before_lift,
+                    table_height=table_height,
+                )
+
+                print("\n[Executor] Lift validation:")
+                print(lift_validation)
+
+                if lift_validation["success"]:
+                    print("[Executor] ✅ Validated lift: object moved with gripper.")
                     return True
 
-                print("[Executor] ❌ Object lost during lift.")
-                return False
+                print("[Executor] ❌ Lift validation failed.")
+                for reason in lift_validation["reasons"]:
+                    print(f"  - {reason}")
 
-            # ──── No object detected ────
-            # print("[Executor] ❌ No object detected after close.")
+                return False
+ 
+                ###
+
+            # ──── No object detected? RETRY with NEW GRASP pose?  ────
+            print("[Executor] ❌ No object detected after close.")
             
-            # ──── retry or give up ────
+            # retry or give up 
             if attempt < max_attempts - 1:
-                print("[Executor] Retrying safely: open → pre_grasp → safe_above")
+                print("[Executor] Retrying safely: pause → open → pre_grasp → safe_above")
+
+                await self._step_gripper_for_seconds(
+                    float(self.config.get("post_failed_close_pause_seconds", 0.5))
+                )
 
                 self.gripper.open()
-                await self._step_gripper_for_seconds(1.0)
+                await self._step_gripper_for_seconds(
+                    float(self.config.get("post_open_settle_seconds", 0.8))
+                )
 
                 await self.arm.move_to(
                     pre_grasp,
-                    duration=2.0,
-                    steps=100,
+                    duration=float(self.config.get("retry_to_pregrasp_duration", 3.0)),
+                    steps=int(self.config.get("retry_to_pregrasp_steps", 180)),
                     check_table_collision=True,
+                )
+
+                await self._step_gripper_for_seconds(
+                    float(self.config.get("retry_mid_settle_seconds", 0.3))
                 )
 
                 await self.arm.move_via_safe_height(
                     safe_above,
-                    duration=3.0,
-                    steps=150,
+                    duration=float(self.config.get("retry_to_safe_duration", 4.0)),
+                    steps=int(self.config.get("retry_to_safe_steps", 240)),
                 )
 
             else:
