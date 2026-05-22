@@ -33,7 +33,7 @@ pregrasp_height: 0.08
 # height used by the generic safe_above waypoint
 safe_approach_height: 0.15
 
-# ───────────── PICK-AND-PLACE SETTINGS ─────────────
+# ───────────── PICK-LIFT-PLACE SETTINGS ─────────────
 
 move_home_before_pick: true
 enable_pre_grasp_test: true
@@ -46,12 +46,11 @@ max_grasp_attempts: 2
 # ── Enable lift-off test after successful grasp ──
 enable_lift_test: true
 
-# arm home pose
-arm_home_deg: [0.0, 90.0, 90.0, 0.0, 0.0, 0.0]
-
 # ───────────── GRASP VALIDATION ─────────────
 max_object_shift_during_close_m: 0.03
-max_object_flange_distance_after_close_m: 0.25
+# The ff may be too strict or too loose depending on where flange
+# is relative to the real gripper center.
+max_object_flange_distance_after_close_m: 0.25  
 
 min_success_lift_delta_m: 0.04
 min_object_above_table_m: 0.03
@@ -65,14 +64,38 @@ retry_mid_settle_seconds: 0.3
 retry_to_safe_duration: 4.0
 retry_to_safe_steps: 240
 
-
+# ───────────── LIFT-OFF SETTINGS ─────────────
+lift_duration: 5.0
+lift_steps: 300
+post_close_hold_seconds: 1.0
 # ───────────── INSPECTION ─────────────
 
-# turn off
+# turned off, Recheck and delete the unused configs
 debug_hold_after_stage: false
 inspection_hold_seconds: 2.0 # how many seconds to hold before opening in inspection
 leave_sim_running_after_trial: false
 
+startup_home_duration: 6.0
+startup_home_steps: 360
+post_home_settle_seconds: 0.8
+
+reset_robot_before_trial: true
+park_robot_after_trial: true
+
+startup_home_duration: 4.0
+startup_home_steps: 240
+post_home_settle_seconds: 0.8
+
+park_gripper_open_seconds: 0.8
+park_home_duration: 3.0
+park_home_steps: 180
+park_settle_seconds: 0.5
+
+# seconds to keep scene visible after trial ends (before next reset)
+# useful for recording videos
+post_spawn_settle_seconds: 0.5
+post_run_hold_seconds: 0.0
+leave_sim_running_after_trial: false
 
 # ───────────── DEBUG TABLE POSITION ─────────────
 

@@ -877,6 +877,8 @@ class UR5EController:
         current_joints = self.get_joint_targets_deg()
         safe_z         = self._safe_z_above_table()
 
+        # Insert an intermediate lift before moving to the requested target
+        #  if it thinks the flange is over the table and below safe height
         if (self._is_over_table(current_flange)
                 and current_flange[2] < safe_z - 0.02):
             lifted_pos    = np.array(current_flange)
@@ -966,10 +968,10 @@ class UR5EController:
         """
         joints   = pick_result["joints"]
         sequence = [
-            ("safe_above",   3.0, 150, True,  None),
+            ("safe_above",   3.0, 150, True,  None),  # (safe_above, 3 = duration in seconds, 150 = number of steps, True = use IK, None = no gripper action)
             ("pre_grasp",    3.0, 150, False, "open_gripper"),
             ("grasp",        4.0, 200, False, "close_gripper"),
-            ("lift",         3.0, 150, False, None),
+            ("lift",         3.0, 150, False, None),  
             ("safe_retreat", 3.0, 150, False, None),
             ("retract",      3.0, 150, True,  None),
         ]

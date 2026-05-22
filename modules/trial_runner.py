@@ -1,13 +1,7 @@
-
-
-# from ament_index_python import constants
-# from launch.actions import reset_launch_configurations
-from modules.object_context import build_object_profile
-from modules.strategy_selector import select_strategy
 from modules.scene_builder import SceneBuilder
-# from modules.target_exporter import export_moveit_target_command
 from modules.pick_and_place_executor import PickAndPlaceExecutor
 import os
+import json
 
 class TrialRunner:
     def __init__(self, config, table_materials, table_slots, step_fn, step_seconds_fn):
@@ -17,81 +11,105 @@ class TrialRunner:
 
         self.step_fn = step_fn
         self.step_seconds_fn = step_seconds_fn
+
         self._total_attempts = 0
         self._total_successes = 0
 
+        print("[TRACE] TrialRunner: before PickAndPlaceExecutor")
         self.pick_executor = PickAndPlaceExecutor(self.config)
+        print("[TRACE] TrialRunner: after PickAndPlaceExecutor")
 
-        # builds scene 
+        print("[TRACE] TrialRunner: before SceneBuilder")
         self.scene_builder = SceneBuilder(
             config=self.config,
             table_materials=self.table_materials,
             table_seat_slots=self.table_slots,
         )
-    
-    ## run all trials
-    # trial here refers to one instance of pick and place (which includes as many attempts as set for pick and place)
+        print("[TRACE] TrialRunner: after SceneBuilder")
+        print("[TrialRunner] Ready.")
+
     async def run_all(self):
-        num_trials = self.config.get("num_trials", 1)
+        num_trials = int(self.config.get("num_trials", 1))
 
         for i in range(num_trials):
-            print(f"[TrialRunner] Trial {i+1}/{num_trials}")
+            print(f"\n[TrialRunner] Trial {i + 1}/{num_trials}")
+            self._total_attempts += 1
 
+            # 1. Reset robot before spawning a new trial
+            # This prevents the arm/gripper from colliding with newly spawned objects
+            # and removes stale drive states from previous runs.
+            if self.config.get("reset_robot_before_trial", True):
+                # resetting the arm before spawning new objects to reduce accidental contacts with newly spawned objects
+                await self.pick_executor.reset_robot_for_trial()
+            else:
+                print("\n[TrialRunner] Skipping home reset; starting from current pose.")
+                await self.pick_executor.open_gripper()
+
+            # 2. Build randomized trial scene
             scene_info = self.scene_builder.build_trial(i)
 
-            ## pick 
+            # Check if any objects were spawned successfully
+            if not scene_info["all_objects"]:
+                print("❌ No objects spawned in this trial. Moving to next trial.")
+                continue
+
+            # 3. Let spawned objects settle before reading actual prim poses
+            settle_seconds = float(self.config.get("post_spawn_settle_seconds", 1.0))
+            print(f"[TrialRunner] Settling spawned objects for {settle_seconds:.2f}s...")
+            await self.step_seconds_fn(settle_seconds)
+
+            # 4. Run pick and place for the current trial
             ok = await self.pick_executor.run_generic_pick(scene_info)
 
+            ## Update trial statistics and print
             if ok:
                 self._total_successes += 1
-                print(f"[TrialRunner] Trial {i} safe_above success")
+                print(f"[TrialRunner] Trial {i + 1} pick success")
             else:
-                print(f"[TrialRunner] Trial {i} safe_above failed")
+                print(f"[TrialRunner] Trial {i + 1} pick failed")
 
-            ## Target selection 
-            target = scene_info["pick_target"]
-            target_local_base = scene_info["target_local_base"]
+            # 5. Save validation log if available.
+            trial_log = self.pick_executor.get_last_trial_log()
+            if trial_log is not None:
+                trial_log["trial_index"] = i
+                trial_log["ok_returned"] = ok
 
-            export_moveit_target_command(
-                output_path="/tmp/cogar_b2b/target_command.json",
-                target=target,
-                target_local_base=target_local_base,
-                hover_height=0.40,
-            )
+                run_dir = self.config.get("paths", {}).get(
+                    "run_outputs_dir",
+                    "runs/isaac_run",
+                )
 
-            ## -------------------------------------------------------------
-            ## Export the first target as a MoveIt command JSON file.
-            ## -------------------------------------------------------------
-            target = scene_info["pick_target"]
+                trial_dir = os.path.join(run_dir, f"trial_{i}")
+                os.makedirs(trial_dir, exist_ok=True)
 
-            # Construct a path under the run outputs directory.
-            run_dir = self.config.get("paths", {}).get(
-                "run_outputs_dir",
-                "runs/isaac_run",
-            )
+                log_path = os.path.join(trial_dir, "validation_log.json")
 
-            target_path = os.path.join(
-                run_dir,
-                f"trial_{i}",
-                "target.json",
-            )
+                with open(log_path, "w") as f:
+                    json.dump(trial_log, f, indent=2)
 
-            _ = export_moveit_target_command(
-                output_path=target_path,
-                target=target,
-                target_local_base=scene_info["target_local_base"],
-                hover_height=0.25,   # you can tune this
-            )
-            # -------------------------------------------------------------
-            target = scene_info["pick_target"]
-            print(f"[TrialRunner] Target: {target['label']}")
+                print(f"[TrialRunner] Validation log saved to: {log_path}")
 
-            # convert to profile
-            object_profile = build_object_profile(target)
-            print(f"[TrialRunner] Object Profile: {object_profile}")
+                print("\n[TrialRunner] Validation summary:")
+                print(f"  target: {trial_log['target']['label']}")
+                print(f"  shape: {trial_log['target']['shape']}")
+                print(f"  material: {trial_log['target']['material']}")
+                print(f"  success: {trial_log['trial_success']}")
+                print(f"  final_reason: {trial_log['final_reason']}")
 
-            # print(f"[TrialRunner] Object: {object_profile['name']}")
+                for a in trial_log["attempts"]:
+                    print(f"  attempt {a['attempt']}:")
+                    print(f"    safe_above_ok: {a['safe_above_ok']}")
+                    print(f"    pre_grasp_ok: {a['pre_grasp_ok']}")
+                    print(f"    grasp_ok: {a['grasp_ok']}")
+                    print(f"    failure_reason: {a['failure_reason']}")
 
-            strategy = select_strategy(object_profile)
+                    if a["close_validation"]:
+                        print(f"    close_success: {a['close_validation']['success']}")
+                        print(f"    close_reasons: {a['close_validation']['reasons']}")
 
-            await manager.run_strategy(strategy)
+                    if a["lift_validation"]:
+                        print(f"    lift_success: {a['lift_validation']['success']}")
+                        print(f"    lift_reasons: {a['lift_validation']['reasons']}")
+
+            # 6. Park robot after trial.
+            await self.pick_executor.park_robot_after_trial()
