@@ -5,6 +5,7 @@
 # =============================
 
 robot:
+  ur5e_model_root: "/mir/base_link_cabinet/cabinet/ur_mount/ur5e_physics"
   ur5e_base_link: "/mir/base_link_cabinet/cabinet/ur_mount/ur5e_physics/base_link"
   ur5e_joints_base: "/mir/base_link_cabinet/cabinet/ur_mount/ur5e_physics/joints"  
   flange_prim:    "/mir/base_link_cabinet/cabinet/ur_mount/ur5e_physics/wrist_3_link/flange"

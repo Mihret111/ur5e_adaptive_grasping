@@ -22,4 +22,4 @@ arm_home_deg:      [90.0, -90.0, 0.0, -90.0, 0.0, 0.0]
 # 7. DEBUG LOGGING
 # ═══════════════════════════════════════════════════════════════════
 
-arm_verbose:      false   # detailed IK + joint logging
+arm_verbose:      true   # detailed IK + joint logging

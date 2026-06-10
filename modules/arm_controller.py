@@ -259,6 +259,11 @@ class UR5EController:
             "ur5e_joints_base",
             "/mir/base_link_cabinet/cabinet/ur_mount/ur5e_physics/joints",
         )
+        # 
+        self.robot_model_root = robot_paths.get(
+            "ur5e_model_root",
+            self.joints_base.rsplit("/joints", 1)[0],
+        )
         self.flange_path = robot_paths.get(
             "flange_prim",
             "/mir/base_link_cabinet/cabinet/ur_mount/"
@@ -535,16 +540,29 @@ class UR5EController:
                 Usd.TimeCode.Default())
         return None
 
+    # def _get_link_world_pos(self, link_name: str):
+    #     """Return [x, y, z] of a named arm link, or None."""
+    #     path = f"{self.joints_base}/{link_name}"
+    #     prim = self.stage.GetPrimAtPath(Sdf.Path(path))
+    #     if not prim.IsValid():
+    #         return None
+    #     xf  = UsdGeom.Xformable(prim)
+    #     mtx = xf.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+    #     return [float(mtx[3][0]), float(mtx[3][1]), float(mtx[3][2])]
     def _get_link_world_pos(self, link_name: str):
         """Return [x, y, z] of a named arm link, or None."""
-        path = f"{self.joints_base}/{link_name}"
+        path = f"{self.robot_model_root}/{link_name}"
         prim = self.stage.GetPrimAtPath(Sdf.Path(path))
-        if not prim.IsValid():
-            return None
-        xf  = UsdGeom.Xformable(prim)
-        mtx = xf.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
-        return [float(mtx[3][0]), float(mtx[3][1]), float(mtx[3][2])]
 
+        if not prim.IsValid():
+            self._log(f"  [Collision] Link prim not found: {path}")
+            return None
+
+        xf = UsdGeom.Xformable(prim)
+        mtx = xf.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+        p = mtx.ExtractTranslation()
+
+        return [float(p[0]), float(p[1]), float(p[2])]
     # ══════════════════════════════════════════════════════════
     # COORDINATE TRANSFORMS
     # ══════════════════════════════════════════════════════════
@@ -1648,8 +1666,8 @@ class UR5EController:
 
         waypoint_order = [
             "safe_above",
-            "grasp",
             "pre_grasp",
+            "grasp",
             "lift",
             "safe_retreat",
             "retract",
