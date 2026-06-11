@@ -549,10 +549,13 @@ class UR5EController:
     #     xf  = UsdGeom.Xformable(prim)
     #     mtx = xf.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
     #     return [float(mtx[3][0]), float(mtx[3][1]), float(mtx[3][2])]
+    
     def _get_link_world_pos(self, link_name: str):
         """Return [x, y, z] of a named arm link, or None."""
         path = f"{self.robot_model_root}/{link_name}"
         prim = self.stage.GetPrimAtPath(Sdf.Path(path))
+       
+        self._log(f"  [Collision] Checking link: {path}")
 
         if not prim.IsValid():
             self._log(f"  [Collision] Link prim not found: {path}")
@@ -693,53 +696,192 @@ class UR5EController:
 
     def _check_arm_body_table_collision(self) -> bool:
         """
-        Check all configured arm links for table penetration.
+        Check arm-body clearance above the tabletop.
 
-        Uses long_link_pairs for dense sampling and point checks
-        for remaining collision links.
+        Runtime protection only:
+          - samples the long arm links as line segments;
+          - checks the remaining configured link-frame positions;
+          - fails closed if an expected collision link cannot be read.
+
+        Notes:
+          This is intentionally conservative.  It protects execution while
+          the arm is moving.  It does NOT replace the later planner-level
+          forward-kinematics branch selector.
         """
         if self._table_info is None:
             return False
 
-        table_z   = self._get_table_surface_z()
-        margin    = self._collision_check_margin
-        n_samples = self.config.get("forearm_sample_count", 5)
-        long_link_pairs = self.config.get("long_link_pairs", [
-            ["forearm_link",   "wrist_1_link"],
-            ["upper_arm_link", "forearm_link"],
-        ])
+        table_z = self._get_table_surface_z()
+
+        # Use the larger of:
+        #   - generic collision margin, and
+        #   - approximate arm-body radius / clearance.
+        #
+        # Previously ARM_BODY_CLEARANCE was configured but unused, so a
+        # link centreline could be above the table while the physical link
+        # body was already touching it.
+        body_margin = max(
+            float(self._collision_check_margin),
+            float(self.ARM_BODY_CLEARANCE),
+        )
+        required_z = table_z + body_margin
+
+        n_samples = int(self.config.get("forearm_sample_count", 9))
+        debug = bool(self.config.get("collision_debug", False))
+        trace_all = bool(
+            self.config.get("collision_trace_all_links", False)
+        )
+        fail_closed = bool(
+            self.config.get(
+                "collision_fail_closed_on_missing_link",
+                True,
+            )
+        )
+
+        long_link_pairs = self.config.get(
+            "long_link_pairs",
+            [
+                ["upper_arm_link", "forearm_link"],
+                ["forearm_link", "wrist_1_link"],
+            ],
+        )
 
         covered_links = set()
 
-        # ── Dense sample along long link pairs ────────────────
+        # ── Dense sampling along long links ──────────────────
         for pair in long_link_pairs:
             if len(pair) != 2:
+                self._log(
+                    f"  [Collision] ⚠️ Invalid long_link_pairs entry: {pair}"
+                )
+                if fail_closed:
+                    return True
                 continue
-            link_a, link_b = pair[0], pair[1]
+
+            link_a, link_b = pair
             covered_links.add(link_a)
+            covered_links.add(link_b)
 
             pos_a, pos_b = self._get_link_endpoints(link_a, link_b)
+
             if pos_a is None or pos_b is None:
+                missing = []
+                if pos_a is None:
+                    missing.append(link_a)
+                if pos_b is None:
+                    missing.append(link_b)
+
+                self._log(
+                    f"  [Collision] ⚠️ Missing link transform(s): {missing}"
+                )
+
+                if fail_closed:
+                    self._log(
+                        "  [Collision] ❌ BLOCKED: cannot prove arm-table "
+                        "clearance because a configured link is missing"
+                    )
+                    return True
+
+                # Diagnostic-only fallback when fail_closed=False.
                 pos = pos_a or pos_b
-                if pos and self._check_point_table_collision(
-                        pos, table_z, margin):
+                if (
+                    pos is not None
+                    and self._check_point_table_collision(
+                        pos, table_z, body_margin
+                    )
+                ):
+                    self._log(
+                        f"  [Collision] ❌ BLOCKED near {link_a} → {link_b}: "
+                        f"point={pos}, required_z>{required_z:.3f}"
+                    )
                     return True
                 continue
 
-            for pt in self._sample_points_along_link(
-                    pos_a, pos_b, n_samples):
-                if self._check_point_table_collision(pt, table_z, margin):
+            sampled_points = self._sample_points_along_link(
+                pos_a,
+                pos_b,
+                n_samples,
+            )
+
+            over_table_points = [
+                pt for pt in sampled_points if self._is_over_table(pt)
+            ]
+            min_over_table_z = (
+                min(pt[2] for pt in over_table_points)
+                if over_table_points
+                else None
+            )
+
+            if debug and trace_all:
+                self._log(
+                    f"  [CollisionDebug] Segment {link_a} → {link_b}\n"
+                    f"      {link_a}: {pos_a}\n"
+                    f"      {link_b}: {pos_b}\n"
+                    f"      samples={len(sampled_points)}  "
+                    f"over_table={len(over_table_points)}  "
+                    f"min_over_table_z={min_over_table_z}  "
+                    f"required_z>{required_z:.3f}"
+                )
+
+            for sample_idx, pt in enumerate(sampled_points):
+                if self._check_point_table_collision(
+                    pt,
+                    table_z,
+                    body_margin,
+                ):
+                    self._log(
+                        f"  [Collision] ❌ BLOCKED: segment "
+                        f"{link_a} → {link_b} too close to tabletop; "
+                        f"sample={sample_idx}/{len(sampled_points) - 1}, "
+                        f"point=({pt[0]:.3f}, {pt[1]:.3f}, {pt[2]:.3f}), "
+                        f"table_z={table_z:.3f}, "
+                        f"required_z>{required_z:.3f}"
+                    )
                     return True
 
-        # ── Point check for remaining links ───────────────────
+        # ── Point checks for links not already sampled ───────
         for link_name in self.ARM_COLLISION_LINKS:
             if link_name in covered_links:
                 continue
+
             link_pos = self._get_link_world_pos(link_name)
+
             if link_pos is None:
+                self._log(
+                    f"  [Collision] ⚠️ Missing link transform: {link_name}"
+                )
+                if fail_closed:
+                    self._log(
+                        "  [Collision] ❌ BLOCKED: cannot prove arm-table "
+                        f"clearance for {link_name}"
+                    )
+                    return True
                 continue
+
+            over_table = self._is_over_table(link_pos)
+
+            if debug and trace_all:
+                self._log(
+                    f"  [CollisionDebug] Point link {link_name}: "
+                    f"x={link_pos[0]:.3f} "
+                    f"y={link_pos[1]:.3f} "
+                    f"z={link_pos[2]:.3f} "
+                    f"over_table={over_table} "
+                    f"required_z>{required_z:.3f}"
+                )
+
             if self._check_point_table_collision(
-                    link_pos, table_z, margin):
+                link_pos,
+                table_z,
+                body_margin,
+            ):
+                self._log(
+                    f"  [Collision] ❌ BLOCKED: {link_name} too close "
+                    f"to tabletop; point=({link_pos[0]:.3f}, "
+                    f"{link_pos[1]:.3f}, {link_pos[2]:.3f}), "
+                    f"table_z={table_z:.3f}, "
+                    f"required_z>{required_z:.3f}"
+                )
                 return True
 
         return False

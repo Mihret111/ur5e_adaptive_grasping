@@ -109,3 +109,13 @@ debug_fixed_table_size: [1.00, 0.60, 0.75]
 debug_fixed_table_approach_deg: 0.0
 debug_fixed_table_facing: "long"
 table_size_range: null
+
+# ───────────── COLLISION CLEARANCE ─────────────
+
+collision_debug: true
+collision_trace_all_links: true
+collision_fail_closed_on_missing_link: true
+
+forearm_sample_count: 9
+collision_check_margin: 0.04
+arm_body_clearance: 0.08
