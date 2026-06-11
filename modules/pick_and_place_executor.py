@@ -402,6 +402,17 @@ class PickAndPlaceExecutor:
                 prim_path=target.get("prim_path"),
             )
 
+            # Added a break with a False return if the IK fails to produce a valid plan.
+            # This ensures that the robot does not attempt to execute a failed plan.
+            if pick_result.get("ik_success", False):
+                print("[Executor] ❌ IK failed to produce a valid plan.")
+                print("[Executor] IK diagnostics:")
+                print(pick_result.get("ik_meta", {}))
+                return False
+            joints = pick_result["joints"]
+
+            # Print-out of the joints. This is useful for debugging
+            # and understanding what the robot is doing.
             print("\n[Executor] Pick planning result:")
             print(f"  target_force_n: {pick_result.get('target_force_n')}")
             print(f"  grasp_strategy: {pick_result.get('grasp_strategy')}")

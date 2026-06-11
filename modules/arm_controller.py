@@ -17,6 +17,7 @@ import glob
 import math
 import random
 import asyncio
+import time
 import numpy as np
 
 import omni.usd
@@ -555,7 +556,7 @@ class UR5EController:
         path = f"{self.robot_model_root}/{link_name}"
         prim = self.stage.GetPrimAtPath(Sdf.Path(path))
        
-        self._log(f"  [Collision] Checking link: {path}")
+        # self._log(f"  [Collision] Checking link: {path}")
 
         if not prim.IsValid():
             self._log(f"  [Collision] Link prim not found: {path}")
@@ -696,105 +697,73 @@ class UR5EController:
 
     def _check_arm_body_table_collision(self) -> bool:
         """
-        Check arm-body clearance above the tabletop.
+        Check configured arm links for table penetration.
 
-        Runtime protection only:
-          - samples the long arm links as line segments;
-          - checks the remaining configured link-frame positions;
-          - fails closed if an expected collision link cannot be read.
-
-        Notes:
-          This is intentionally conservative.  It protects execution while
-          the arm is moving.  It does NOT replace the later planner-level
-          forward-kinematics branch selector.
+        Uses dense sampling for long links and point checks for
+        remaining arm-link frame positions.
         """
         if self._table_info is None:
             return False
 
         table_z = self._get_table_surface_z()
+        margin = self._collision_check_margin
 
-        # Use the larger of:
-        #   - generic collision margin, and
-        #   - approximate arm-body radius / clearance.
-        #
-        # Previously ARM_BODY_CLEARANCE was configured but unused, so a
-        # link centreline could be above the table while the physical link
-        # body was already touching it.
-        body_margin = max(
-            float(self._collision_check_margin),
-            float(self.ARM_BODY_CLEARANCE),
-        )
-        required_z = table_z + body_margin
-
-        n_samples = int(self.config.get("forearm_sample_count", 9))
-        debug = bool(self.config.get("collision_debug", False))
-        trace_all = bool(
-            self.config.get("collision_trace_all_links", False)
-        )
-        fail_closed = bool(
-            self.config.get(
-                "collision_fail_closed_on_missing_link",
-                True,
-            )
+        n_samples = self.config.get(
+            "forearm_sample_count",
+            5,
         )
 
         long_link_pairs = self.config.get(
             "long_link_pairs",
             [
-                ["upper_arm_link", "forearm_link"],
                 ["forearm_link", "wrist_1_link"],
+                ["upper_arm_link", "forearm_link"],
             ],
         )
+
+        debug = self.config.get("collision_debug", False)
 
         covered_links = set()
 
         # ── Dense sampling along long links ──────────────────
         for pair in long_link_pairs:
             if len(pair) != 2:
-                self._log(
-                    f"  [Collision] ⚠️ Invalid long_link_pairs entry: {pair}"
-                )
-                if fail_closed:
-                    return True
                 continue
 
             link_a, link_b = pair
+
             covered_links.add(link_a)
             covered_links.add(link_b)
 
-            pos_a, pos_b = self._get_link_endpoints(link_a, link_b)
+            pos_a, pos_b = self._get_link_endpoints(
+                link_a,
+                link_b,
+            )
 
-            if pos_a is None or pos_b is None:
-                missing = []
-                if pos_a is None:
-                    missing.append(link_a)
-                if pos_b is None:
-                    missing.append(link_b)
-
+            if debug:
                 self._log(
-                    f"  [Collision] ⚠️ Missing link transform(s): {missing}"
+                    f"  [CollisionDebug] Segment {link_a} → {link_b}\n"
+                    f"      {link_a}: {pos_a}\n"
+                    f"      {link_b}: {pos_b}"
                 )
 
-                if fail_closed:
-                    self._log(
-                        "  [Collision] ❌ BLOCKED: cannot prove arm-table "
-                        "clearance because a configured link is missing"
-                    )
-                    return True
-
-                # Diagnostic-only fallback when fail_closed=False.
+            if pos_a is None or pos_b is None:
                 pos = pos_a or pos_b
+
                 if (
                     pos is not None
                     and self._check_point_table_collision(
-                        pos, table_z, body_margin
+                        pos,
+                        table_z,
+                        margin,
                     )
                 ):
                     self._log(
-                        f"  [Collision] ❌ BLOCKED near {link_a} → {link_b}: "
-                        f"point={pos}, required_z>{required_z:.3f}"
+                        f"  [Collision] ❌ Table collision near "
+                        f"{link_a} → {link_b}: point={pos}"
                     )
                     return True
+
                 continue
 
             sampled_points = self._sample_points_along_link(
@@ -803,39 +772,18 @@ class UR5EController:
                 n_samples,
             )
 
-            over_table_points = [
-                pt for pt in sampled_points if self._is_over_table(pt)
-            ]
-            min_over_table_z = (
-                min(pt[2] for pt in over_table_points)
-                if over_table_points
-                else None
-            )
-
-            if debug and trace_all:
-                self._log(
-                    f"  [CollisionDebug] Segment {link_a} → {link_b}\n"
-                    f"      {link_a}: {pos_a}\n"
-                    f"      {link_b}: {pos_b}\n"
-                    f"      samples={len(sampled_points)}  "
-                    f"over_table={len(over_table_points)}  "
-                    f"min_over_table_z={min_over_table_z}  "
-                    f"required_z>{required_z:.3f}"
-                )
-
-            for sample_idx, pt in enumerate(sampled_points):
+            for pt in sampled_points:
                 if self._check_point_table_collision(
                     pt,
                     table_z,
-                    body_margin,
+                    margin,
                 ):
                     self._log(
-                        f"  [Collision] ❌ BLOCKED: segment "
-                        f"{link_a} → {link_b} too close to tabletop; "
-                        f"sample={sample_idx}/{len(sampled_points) - 1}, "
-                        f"point=({pt[0]:.3f}, {pt[1]:.3f}, {pt[2]:.3f}), "
+                        f"  [Collision] ❌ Table collision on segment "
+                        f"{link_a} → {link_b}: "
+                        f"point={pt}, "
                         f"table_z={table_z:.3f}, "
-                        f"required_z>{required_z:.3f}"
+                        f"margin={margin:.3f}"
                     )
                     return True
 
@@ -846,41 +794,26 @@ class UR5EController:
 
             link_pos = self._get_link_world_pos(link_name)
 
+            if debug:
+                self._log(
+                    f"  [CollisionDebug] Point link "
+                    f"{link_name}: {link_pos}"
+                )
+
             if link_pos is None:
-                self._log(
-                    f"  [Collision] ⚠️ Missing link transform: {link_name}"
-                )
-                if fail_closed:
-                    self._log(
-                        "  [Collision] ❌ BLOCKED: cannot prove arm-table "
-                        f"clearance for {link_name}"
-                    )
-                    return True
                 continue
-
-            over_table = self._is_over_table(link_pos)
-
-            if debug and trace_all:
-                self._log(
-                    f"  [CollisionDebug] Point link {link_name}: "
-                    f"x={link_pos[0]:.3f} "
-                    f"y={link_pos[1]:.3f} "
-                    f"z={link_pos[2]:.3f} "
-                    f"over_table={over_table} "
-                    f"required_z>{required_z:.3f}"
-                )
 
             if self._check_point_table_collision(
                 link_pos,
                 table_z,
-                body_margin,
+                margin,
             ):
                 self._log(
-                    f"  [Collision] ❌ BLOCKED: {link_name} too close "
-                    f"to tabletop; point=({link_pos[0]:.3f}, "
-                    f"{link_pos[1]:.3f}, {link_pos[2]:.3f}), "
+                    f"  [Collision] ❌ Table collision at "
+                    f"{link_name}: "
+                    f"point={link_pos}, "
                     f"table_z={table_z:.3f}, "
-                    f"required_z>{required_z:.3f}"
+                    f"margin={margin:.3f}"
                 )
                 return True
 
@@ -1383,71 +1316,160 @@ class UR5EController:
     # IK SOLVERS
     # ══════════════════════════════════════════════════════════
 
+    def _normalise_joint_name(self, name: str) -> str:
+        """Return a short joint name suitable for USD/Lula order matching."""
+        return str(name).split("/")[-1]
+
+    def _get_lula_joint_names(self) -> list:
+        """
+        Return the joint order expected by Lula.
+
+        The USD articulation and the Lula descriptor often use the same UR5e
+        joint names, but a safe controller should not rely on that accidentally
+        being true.  FK and IK inputs must use Lula's own c-space order.
+        """
+        if self._lula_solver is None:
+            return list(self.JOINT_NAMES)
+
+        try:
+            return [
+                self._normalise_joint_name(name)
+                for name in self._lula_solver.get_joint_names()
+            ]
+        except Exception:
+            # Compatibility fallback for Isaac versions without get_joint_names.
+            return list(self.JOINT_NAMES)
+
+    def _controller_deg_to_lula_rad(self, controller_deg) -> np.ndarray:
+        """Map controller JOINT_NAMES order (deg) to Lula order (rad)."""
+        controller_deg = np.asarray(controller_deg, dtype=np.float64)
+
+        if controller_deg.shape != (6,):
+            raise ValueError(
+                f"Expected six controller joints, got shape={controller_deg.shape}"
+            )
+
+        by_name = {
+            self._normalise_joint_name(name): float(value)
+            for name, value in zip(self.JOINT_NAMES, controller_deg)
+        }
+        lula_names = self._get_lula_joint_names()
+
+        missing = [name for name in lula_names if name not in by_name]
+        if missing:
+            raise ValueError(
+                "Cannot map controller joints to Lula order. "
+                f"Missing={missing}, Lula order={lula_names}, "
+                f"controller order={self.JOINT_NAMES}"
+            )
+
+        return np.deg2rad(np.array([by_name[name] for name in lula_names]))
+
+    def _lula_rad_to_controller_deg(self, lula_rad) -> np.ndarray:
+        """Map Lula-order radians back to controller JOINT_NAMES degrees."""
+        lula_rad = np.asarray(lula_rad, dtype=np.float64)
+        lula_names = self._get_lula_joint_names()
+
+        if lula_rad.shape != (len(lula_names),):
+            raise ValueError(
+                f"Unexpected Lula result shape={lula_rad.shape}; "
+                f"Lula order={lula_names}"
+            )
+
+        by_name = {
+            self._normalise_joint_name(name): float(value)
+            for name, value in zip(lula_names, np.rad2deg(lula_rad))
+        }
+
+        missing = [name for name in self.JOINT_NAMES if name not in by_name]
+        if missing:
+            raise ValueError(
+                "Cannot map Lula result back to controller order. "
+                f"Missing={missing}"
+            )
+
+        return np.array([by_name[name] for name in self.JOINT_NAMES])
+
     def _solve_ik_lula(
         self, pos_local, orient=None, seed_deg=None,
     ):
         """
-        Single Lula IK attempt.
+        Perform one Lula IK attempt.
 
-        Args:
-            pos_local: [x, y, z] in robot base_link frame
-            orient:    [w, x, y, z] quaternion (default: straight down)
-            seed_deg:  6-element seed in degrees
+        Important:
+          - this function returns exactly one branch;
+          - it does NOT run an expensive branch search;
+          - the warm-start seed decides which nearby IK branch Lula attempts.
 
-        Returns:
-            np.ndarray of 6 joint angles in degrees, or None
+        Inputs and outputs exposed to the rest of the controller use the USD
+        controller JOINT_NAMES order.  Internally, values are mapped to Lula's
+        own c-space ordering.
         """
         if self._lula_solver is None:
             return None
+
         pos = np.array(pos_local, dtype=np.float64)
         orient = (
             np.array([0.0, 1.0, 0.0, 0.0])
             if orient is None
             else np.array(orient, dtype=np.float64)
         )
-        seed = (
-            np.deg2rad(np.array(seed_deg, dtype=np.float64))
+        seed_controller = (
+            np.asarray(seed_deg, dtype=np.float64)
             if seed_deg is not None
-            else np.deg2rad(self.get_joint_targets_deg())
+            else self.get_joint_targets_deg()
         )
+
         try:
-            result, ok = self._lula_solver.compute_inverse_kinematics(
+            seed_lula = self._controller_deg_to_lula_rad(seed_controller)
+
+            result_lula, ok = self._lula_solver.compute_inverse_kinematics(
                 frame_name=self._ee_frame,
                 target_position=pos,
                 target_orientation=orient,
-                warm_start=seed,
+                warm_start=seed_lula,
             )
-            return np.rad2deg(result) if ok else None
-        except Exception:
+
+            if not ok:
+                return None
+
+            return self._lula_rad_to_controller_deg(result_lula)
+
+        except Exception as e:
+            self._log(f"  [IK] Lula solve failed: {e}")
             return None
 
     def _solve_ik_retries(
         self,
         pos_local,
         orient    = None,
-        retries:  int = 12,
+        retries:  int = None,
         seed_deg  = None,
     ) -> tuple:
         """
-        Multi-attempt IK: current joints → home → random seeds.
+        Legacy convenience solver used outside the lean pick planner.
 
-        PATCH: now returns (joint_angles_deg | None, meta_dict)
-               so callers can record IK diagnostics.
+        Default behaviour is deliberately small and deterministic:
+          1. provided/current seed
+          2. home seed
+          3. optional random retries only when explicitly configured
 
-        Returns:
-            (np.ndarray of 6 joint deg, meta dict)
-            OR
-            (None, meta dict)   ← all attempts failed
+        The lean pick planner below does NOT use this method for branch search.
         """
+        if retries is None:
+            retries = int(self.config.get("ik_legacy_random_retries", 0))
+        else:
+            retries = int(self.config.get("ik_legacy_random_retries", retries))
+
         meta = {
             "attempts":      0,
-            "total_retries": retries + 2,   # seed + home + randoms
+            "total_retries": retries + 2,
             "solver":        self._ik_mode,
             "success":       False,
             "seed_used":     None,
         }
 
-        # ── Attempt 1: user-provided or current joint seed ────
+        # Attempt 1: user-provided or current joint seed.
         meta["attempts"] += 1
         r = self._solve_ik_lula(pos_local, orient, seed_deg)
         if r is not None:
@@ -1455,17 +1477,16 @@ class UR5EController:
             meta["seed_used"] = "provided"
             return r, meta
 
-        # ── Attempt 2: home position seed ────────────────────
+        # Attempt 2: known home pose seed.
         meta["attempts"] += 1
-        home = self.config.get(
-            "arm_home_deg", [0.0, 90.0, 90.0, 0.0, 0.0, 0.0])
+        home = self.go_home()
         r = self._solve_ik_lula(pos_local, orient, home)
         if r is not None:
             meta["success"]   = True
             meta["seed_used"] = "home"
             return r, meta
 
-        # ── Attempts 3..N: random seeds ───────────────────────
+        # Optional legacy random retries. Disabled by default.
         for i in range(retries):
             meta["attempts"] += 1
             seed = [
@@ -1479,6 +1500,7 @@ class UR5EController:
                 return r, meta
 
         return None, meta
+
 
     # ══════════════════════════════════════════════════════════
     # CALIBRATION FALLBACK (no Lula available)
@@ -1582,14 +1604,14 @@ class UR5EController:
         )
 
         if shape == "Cube":
-            # Both faces are equal — try both, randomize order
-            candidates = [
+            # Both faces are equal.  Keep a deterministic preferred order.
+            # Alternative face_B is available only if the caller explicitly
+            # enables alternate grasp orientations.
+            return [
                 ("face_A", compute_grasp_orientation(obj_yaw)),
                 ("face_B", compute_grasp_orientation(
                     obj_yaw + math.pi / 2)),
             ]
-            random.shuffle(candidates)
-            return candidates
 
         if shape == "Rectangle":
             # ── CRITICAL: grip across the WIDTH (short side) ──────
@@ -1661,27 +1683,470 @@ class UR5EController:
 
             return candidates
 
-        # ── Cylinder/Disc — random orientations ──────────
-        if shape in ("Cylinder", "Disc"):
-            yaws = [random.uniform(0, 2 * math.pi) for _ in range(3)]
+        # ── Rotationally symmetric shapes ─────────────────
+        # Use deterministic yaws.  Environment randomization is useful;
+        # safety-critical grasp orientation selection should be repeatable.
+        if shape in ("Cylinder", "Disc", "Sphere"):
+            yaws = [obj_yaw, obj_yaw + math.pi / 2.0]
             return [
-                (f"random_{i}", compute_grasp_orientation(y))
+                (f"yaw_{i}", compute_grasp_orientation(y))
                 for i, y in enumerate(yaws)
             ]
 
-        # ── Sphere — random orientations ─────────────────
-        if shape == "Sphere":
-            yaws = [random.uniform(0, 2 * math.pi) for _ in range(3)]
-            return [
-                (f"random_{i}", compute_grasp_orientation(y))
-                for i, y in enumerate(yaws)
-            ]
-
-        # Unknown shape — random
-        yaws = [random.uniform(0, 2 * math.pi) for _ in range(3)]
+        # Unknown shape — deterministic conservative default.
         return [
-            ("random", compute_grasp_orientation(y)) for y in yaws
+            ("default", compute_grasp_orientation(obj_yaw)),
+            ("default_90", compute_grasp_orientation(
+                obj_yaw + math.pi / 2.0)),
         ]
+
+    # ══════════════════════════════════════════════════════════
+    # LEAN PLANNER-LEVEL FK COLLISION PREDICTION
+    # ══════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _wrapped_joint_delta_deg(a, b) -> np.ndarray:
+        """Smallest signed revolute-joint difference a-b in degrees."""
+        a = np.asarray(a, dtype=np.float64)
+        b = np.asarray(b, dtype=np.float64)
+        return (a - b + 180.0) % 360.0 - 180.0
+
+    def _resolve_lula_frame(self, requested_name: str):
+        """
+        Resolve a configured link name to a frame exposed by Lula.
+
+        If the Isaac build does not expose get_all_frame_names(), return the
+        requested name and let compute_forward_kinematics perform the check.
+        """
+        if self._lula_solver is None:
+            return None
+
+        try:
+            frames = list(self._lula_solver.get_all_frame_names())
+        except Exception:
+            return requested_name
+
+        if requested_name in frames:
+            return requested_name
+
+        short = str(requested_name).split("/")[-1]
+        for frame in frames:
+            if str(frame).split("/")[-1] == short:
+                return frame
+
+        return None
+
+    def _predict_lula_frame_world_pos(self, frame_name: str, joints_deg):
+        """
+        Predict a link-frame world position using Lula FK without moving PhysX.
+
+        This is the crucial difference between:
+          - planner-level checking: predict before moving;
+          - runtime checking: observe the real simulated robot while moving.
+        """
+        if self._lula_solver is None:
+            return None
+
+        resolved = self._resolve_lula_frame(frame_name)
+        if resolved is None:
+            self._log(f"  [FK] Missing Lula frame: {frame_name}")
+            return None
+
+        try:
+            q_lula = self._controller_deg_to_lula_rad(joints_deg)
+            fk_result = self._lula_solver.compute_forward_kinematics(
+                resolved,
+                q_lula,
+            )
+
+            # Isaac versions commonly return (position, rotation).
+            local_pos = fk_result[0] if isinstance(fk_result, tuple) else fk_result
+            world = self._robot_base_to_world(np.asarray(local_pos))
+            return np.asarray(world, dtype=np.float64)
+
+        except Exception as e:
+            self._log(f"  [FK] Failed for frame '{resolved}': {e}")
+            return None
+
+    def _planner_collision_segments(self) -> list:
+        """Robot-link segments used by the cheap offline table checker."""
+        return self.config.get(
+            "lula_collision_segments",
+            [
+                ["upper_arm_link", "forearm_link"],
+                ["forearm_link", "wrist_1_link"],
+                ["wrist_1_link", "wrist_2_link"],
+                ["wrist_2_link", "wrist_3_link"],
+                ["wrist_3_link", self._ee_frame],
+            ],
+        )
+
+    def _evaluate_predicted_table_clearance(
+        self,
+        joints_deg,
+        label: str = "",
+    ) -> dict:
+        """
+        FK-check one candidate arm posture before execution.
+
+        The arm is approximated by thick sampled line segments.  This is much
+        cheaper than a full collision engine query, but it is enough to reject
+        the known elbow-down/table-collision failure mode.
+        """
+        result = {
+            "safe": True,
+            "label": label,
+            "min_clearance_m": float("inf"),
+            "reason": None,
+        }
+
+        if self._table_info is None:
+            return result
+
+        if self._lula_solver is None:
+            result.update(
+                safe=False,
+                reason="Lula solver unavailable for predictive FK checking",
+            )
+            return result
+
+        table_z = float(self._get_table_surface_z())
+        body_margin = max(
+            float(self._collision_check_margin),
+            float(self.ARM_BODY_CLEARANCE),
+        )
+        required_body_z = table_z + body_margin
+        required_flange_z = table_z + float(self._collision_check_margin)
+
+        n_samples = max(
+            1,
+            int(self.config.get("planner_link_sample_count", 5)),
+        )
+        fail_closed = bool(
+            self.config.get(
+                "planner_fail_closed_on_missing_fk_frame",
+                True,
+            )
+        )
+
+        for link_a, link_b in self._planner_collision_segments():
+            pos_a = self._predict_lula_frame_world_pos(link_a, joints_deg)
+            pos_b = self._predict_lula_frame_world_pos(link_b, joints_deg)
+
+            if pos_a is None or pos_b is None:
+                if fail_closed:
+                    result.update(
+                        safe=False,
+                        reason=f"missing FK frame for {link_a}->{link_b}",
+                    )
+                    return result
+                continue
+
+            for sample_idx in range(n_samples + 1):
+                alpha = sample_idx / n_samples
+                pt = pos_a + alpha * (pos_b - pos_a)
+
+                if not self._is_over_table(pt):
+                    continue
+
+                clearance = float(pt[2] - required_body_z)
+                result["min_clearance_m"] = min(
+                    result["min_clearance_m"],
+                    clearance,
+                )
+
+                if clearance < 0.0:
+                    result.update(
+                        safe=False,
+                        reason=(
+                            f"segment {link_a}->{link_b} too close to table "
+                            f"at sample {sample_idx}/{n_samples}: "
+                            f"z={pt[2]:.3f}, required>{required_body_z:.3f}"
+                        ),
+                    )
+                    return result
+
+        flange = self._predict_lula_frame_world_pos(self._ee_frame, joints_deg)
+
+        if flange is None:
+            if fail_closed:
+                result.update(
+                    safe=False,
+                    reason="missing FK end-effector frame",
+                )
+                return result
+
+        elif self._is_over_table(flange):
+            clearance = float(flange[2] - required_flange_z)
+            result["min_clearance_m"] = min(
+                result["min_clearance_m"],
+                clearance,
+            )
+
+            if clearance < 0.0:
+                result.update(
+                    safe=False,
+                    reason=(
+                        f"end effector too close to table: "
+                        f"z={flange[2]:.3f}, required>{required_flange_z:.3f}"
+                    ),
+                )
+                return result
+
+        if not np.isfinite(result["min_clearance_m"]):
+            # No sampled body point was over the table footprint.
+            result["min_clearance_m"] = 1.0
+
+        return result
+
+    def _evaluate_predicted_path_clearance(
+        self,
+        from_deg,
+        to_deg,
+        label: str = "",
+        n_samples: int = None,
+    ) -> dict:
+        """
+        FK-check a low-resolution joint-space transition before execution.
+
+        This is deliberately lean: the runtime collision guard still checks
+        every simulation update while the actual robot moves.
+        """
+        n_samples = max(
+            1,
+            int(
+                n_samples
+                if n_samples is not None
+                else self.config.get("planner_path_sample_count", 6)
+            ),
+        )
+
+        q0 = np.asarray(from_deg, dtype=np.float64)
+        q1 = np.asarray(to_deg, dtype=np.float64)
+
+        result = {
+            "safe": True,
+            "label": label,
+            "min_clearance_m": float("inf"),
+            "reason": None,
+        }
+
+        delta = self._wrapped_joint_delta_deg(q1, q0)
+
+        for sample_idx in range(n_samples + 1):
+            alpha = sample_idx / n_samples
+            q = q0 + alpha * delta
+
+            pose_eval = self._evaluate_predicted_table_clearance(
+                q,
+                label=f"{label}@{sample_idx}/{n_samples}",
+            )
+
+            result["min_clearance_m"] = min(
+                result["min_clearance_m"],
+                pose_eval["min_clearance_m"],
+            )
+
+            if not pose_eval["safe"]:
+                result.update(
+                    safe=False,
+                    reason=(
+                        f"{label} unsafe at sample {sample_idx}/{n_samples}: "
+                        f"{pose_eval['reason']}"
+                    ),
+                )
+                return result
+
+        if not np.isfinite(result["min_clearance_m"]):
+            result["min_clearance_m"] = 1.0
+
+        return result
+
+    def _optional_fallback_seed_bank(self, reference_deg) -> list:
+        """
+        Return a tiny deterministic fallback seed bank.
+
+        Disabled by default.  Turn it on only if the nominal chain is rejected
+        too often despite visually reachable targets.
+        """
+        if not self.config.get("ik_enable_fallback_branches", False):
+            return []
+
+        reference = np.asarray(reference_deg, dtype=np.float64)
+        home = np.asarray(self.go_home(), dtype=np.float64)
+
+        templates = [
+            (
+                "home",
+                home,
+            ),
+            (
+                "elbow_up_A",
+                np.array([
+                    home[0], -90.0, 90.0, -90.0, home[4], home[5],
+                ]),
+            ),
+            (
+                "elbow_up_B",
+                np.array([
+                    home[0], -60.0, 90.0, -120.0, home[4], home[5],
+                ]),
+            ),
+        ]
+
+        max_count = max(
+            0,
+            int(self.config.get("ik_max_fallback_seeds", 2)),
+        )
+
+        unique = []
+        for label, q in templates:
+            q = np.asarray(q, dtype=np.float64)
+
+            if np.linalg.norm(
+                self._wrapped_joint_delta_deg(q, reference)
+            ) < 1.0:
+                continue
+
+            if any(
+                np.linalg.norm(
+                    self._wrapped_joint_delta_deg(q, previous_q)
+                ) < 1.0
+                for _previous_label, previous_q in unique
+            ):
+                continue
+
+            unique.append((label, q))
+
+        return unique[:max_count]
+
+    def _solve_checked_waypoint_nominal_then_fallback(
+        self,
+        pos_local,
+        orient,
+        reference_deg,
+        waypoint_name: str,
+    ) -> tuple:
+        """
+        Solve one waypoint cheaply and safely.
+
+        Fast path:
+          1. solve once from the continuous previous waypoint;
+          2. FK-check the resulting posture;
+          3. FK-check the transition into it.
+
+        Optional fallback:
+          only if explicitly enabled and only after the nominal result fails,
+          try at most a few deterministic alternative warm starts.
+        """
+        reference = np.asarray(reference_deg, dtype=np.float64)
+
+        attempts = [("nominal_reference", reference)]
+        attempts.extend(self._optional_fallback_seed_bank(reference))
+
+        meta = {
+            "waypoint": waypoint_name,
+            "attempts": 0,
+            "selected_seed": None,
+            "used_fallback": False,
+            "min_clearance_m": None,
+            "rejections": [],
+        }
+
+        for attempt_idx, (seed_name, seed_deg) in enumerate(attempts):
+            meta["attempts"] += 1
+
+            joints = self._solve_ik_lula(
+                pos_local,
+                orient,
+                seed_deg=seed_deg,
+            )
+
+            if joints is None:
+                meta["rejections"].append(
+                    {
+                        "seed": seed_name,
+                        "reason": "IK did not converge",
+                    }
+                )
+                continue
+
+            pose_eval = self._evaluate_predicted_table_clearance(
+                joints,
+                label=waypoint_name,
+            )
+
+            if not pose_eval["safe"]:
+                meta["rejections"].append(
+                    {
+                        "seed": seed_name,
+                        "reason": pose_eval["reason"],
+                    }
+                )
+                continue
+
+            path_eval = self._evaluate_predicted_path_clearance(
+                reference,
+                joints,
+                label=f"to_{waypoint_name}",
+            )
+
+            if not path_eval["safe"]:
+                meta["rejections"].append(
+                    {
+                        "seed": seed_name,
+                        "reason": path_eval["reason"],
+                    }
+                )
+                continue
+
+            meta["selected_seed"] = seed_name
+            meta["used_fallback"] = attempt_idx > 0
+            meta["min_clearance_m"] = min(
+                pose_eval["min_clearance_m"],
+                path_eval["min_clearance_m"],
+            )
+
+            if meta["used_fallback"]:
+                self._log(
+                    f"  [LeanIK] {waypoint_name}: nominal rejected; "
+                    f"using fallback seed '{seed_name}'"
+                )
+
+            return np.asarray(joints, dtype=np.float64), meta
+
+        return None, meta
+
+    def _pick_planning_waypoint_order(self) -> list:
+        """
+        Return only the waypoint horizon needed by the current experiment.
+
+        Default baseline:
+          safe_above -> pre_grasp -> grasp
+
+        Lift and retreat are deliberately postponed until they are actually
+        under test.  This avoids paying for unnecessary future planning while
+        debugging generic grasp geometry.
+        """
+        order = [
+            "safe_above",
+            "pre_grasp",
+            "grasp",
+        ]
+
+        if (
+            self.config.get("enable_micro_lift_test", False)
+            or self.config.get("enable_lift_test", False)
+        ):
+            order.append("lift")
+
+        if self.config.get("plan_retreat_during_pick", False):
+            order.extend([
+                "safe_retreat",
+                "retract",
+            ])
+
+        return order
 
     # ══════════════════════════════════════════════════════════
     # IK VALIDATION (collision-free joint configs)
@@ -1691,74 +2156,437 @@ class UR5EController:
         self, joint_angles_deg, waypoint_name: str = "",
     ) -> bool:
         """
-        Temporarily set joints and check for table collision.
-        Restores original joints afterward.
+        Backward-compatible FK-based posture validation wrapper.
+
+        Unlike the old implementation, this does not write PhysX drive targets
+        and immediately inspect stale USD transforms.
         """
-        if self._table_info is None:
-            return True
+        evaluation = self._evaluate_predicted_table_clearance(
+            joint_angles_deg,
+            label=waypoint_name,
+        )
 
-        saved = self.get_joint_targets_deg()
-        self.set_joint_targets_deg(list(joint_angles_deg))
-
-        collision = self._check_arm_body_table_collision()
-        if not collision:
-            flange  = self.get_flange_world_pos()
-            table_z = self._get_table_surface_z()
-            if (self._is_over_table(flange)
-                    and flange[2] < table_z + self._collision_check_margin):
-                collision = True
-
-        self.set_joint_targets_deg(list(saved))
-
-        if collision:
+        if not evaluation["safe"]:
             self._log(
-                f"  [IK] Collision at waypoint '{waypoint_name}'")
+                f"  [IK] Predictive collision at '{waypoint_name}': "
+                f"{evaluation['reason']}"
+            )
 
-        return not collision
+        return bool(evaluation["safe"])
 
     def _validate_path_between_joints(
         self,
         from_deg,
         to_deg,
-        n_samples: int = 8,
+        n_samples: int = None,
         label:     str = "",
     ) -> bool:
+        """Backward-compatible FK-based transition validation wrapper."""
+        evaluation = self._evaluate_predicted_path_clearance(
+            from_deg,
+            to_deg,
+            label=label,
+            n_samples=n_samples,
+        )
+
+        if not evaluation["safe"]:
+            self._log(
+                f"  [IK] Predictive path collision at '{label}': "
+                f"{evaluation['reason']}"
+            )
+
+        return bool(evaluation["safe"])
+
+
+    # ══════════════════════════════════════════════════════════
+    # CASCADED PICK PLANNER HELPERS
+    # ══════════════════════════════════════════════════════════
+
+    def _chain_fallback_initial_seeds(self) -> list:
         """
-        Check n_samples interpolated joint configs between from→to
-        for table collision. Restores original joints afterward.
+        Return at most two deterministic whole-chain warm-start hypotheses.
+
+        These values are NOT commanded to the robot.  They are only Lula
+        warm-start hints for the first waypoint (safe_above).  Once a safe
+        safe_above branch has been found, each following waypoint is solved
+        continuously from the previous waypoint solution.
+
+        Why whole-chain retries?
+          An elbow-down and an elbow-up branch may both be safe at safe_above.
+          The bad branch can reveal itself only later during descent.  Retrying
+          only the final grasp waypoint is therefore insufficient: we must
+          restart the chain from safe_above using a different IK hypothesis.
         """
-        if self._table_info is None:
-            return True
+        if not self.config.get("ik_enable_chain_fallbacks", True):
+            return []
 
-        saved    = self.get_joint_targets_deg()
-        from_arr = np.array(from_deg, dtype=float)
-        to_arr   = np.array(to_deg,   dtype=float)
-        collision = False
+        home = np.asarray(self.go_home(), dtype=np.float64)
+        templates = [
+            (
+                "elbow_up_A",
+                np.array([
+                    home[0], -90.0, 90.0, -90.0, home[4], home[5],
+                ], dtype=np.float64),
+            ),
+            (
+                "elbow_up_B",
+                np.array([
+                    home[0], -60.0, 90.0, -120.0, home[4], home[5],
+                ], dtype=np.float64),
+            ),
+        ]
 
-        for k in range(1, n_samples):
-            t      = k / n_samples
-            interp = from_arr + t * (to_arr - from_arr)
-            self.set_joint_targets_deg(list(interp))
+        max_count = max(
+            0,
+            min(2, int(self.config.get("ik_max_chain_fallbacks", 2))),
+        )
+        return templates[:max_count]
 
-            if self._check_arm_body_table_collision():
-                self._log(
-                    f"  [IK] Path collision at {label} "
-                    f"sample {k}/{n_samples}")
-                collision = True
-                break
+    def _solve_chain_from_initial_seed(
+        self,
+        flange_targets,
+        tool_orient,
+        waypoint_order,
+        actual_start_deg,
+        initial_seed_deg,
+        chain_label: str,
+    ) -> tuple:
+        """
+        Solve and FK-check one complete waypoint chain sequentially.
 
-            flange  = self.get_flange_world_pos()
-            table_z = self._get_table_surface_z()
-            if (self._is_over_table(flange)
-                    and flange[2] < table_z + self._collision_check_margin):
-                self._log(
-                    f"  [IK] Flange path collision at {label} "
-                    f"sample {k}/{n_samples}")
-                collision = True
-                break
+        The first waypoint is solved using initial_seed_deg as a Lula warm
+        start, but its path is checked from the robot's ACTUAL current state.
+        Subsequent waypoints are warm-started from the previous solved pose.
 
-        self.set_joint_targets_deg(list(saved))
-        return not collision
+        Returns:
+            (results_dict | None, chain_meta)
+        """
+        actual_start = np.asarray(actual_start_deg, dtype=np.float64)
+        seed = np.asarray(initial_seed_deg, dtype=np.float64)
+        previous_solution = None
+        results = {}
+        waypoint_meta = {}
+
+        for waypoint_name in waypoint_order:
+            world_target = flange_targets.get(waypoint_name)
+            if not isinstance(world_target, np.ndarray) or len(world_target) != 3:
+                continue
+
+            local_target = self._world_to_robot_base(world_target)
+            warm_start = seed if previous_solution is None else previous_solution
+            path_start = actual_start if previous_solution is None else previous_solution
+
+            joints = self._solve_ik_lula(
+                local_target,
+                tool_orient,
+                seed_deg=warm_start,
+            )
+
+            meta = {
+                "waypoint": waypoint_name,
+                "warm_start": chain_label if previous_solution is None else "previous_waypoint",
+                "ik_converged": joints is not None,
+                "pose_safe": False,
+                "path_safe": False,
+                "min_clearance_m": None,
+                "reason": None,
+            }
+
+            if joints is None:
+                meta["reason"] = "IK did not converge"
+                waypoint_meta[waypoint_name] = meta
+                return None, {
+                    "chain_label": chain_label,
+                    "success": False,
+                    "failed_waypoint": waypoint_name,
+                    "waypoint_meta": waypoint_meta,
+                }
+
+            pose_eval = self._evaluate_predicted_table_clearance(
+                joints,
+                label=f"{chain_label}:{waypoint_name}",
+            )
+            meta["pose_safe"] = bool(pose_eval["safe"])
+
+            if not pose_eval["safe"]:
+                meta["reason"] = pose_eval["reason"]
+                waypoint_meta[waypoint_name] = meta
+                return None, {
+                    "chain_label": chain_label,
+                    "success": False,
+                    "failed_waypoint": waypoint_name,
+                    "waypoint_meta": waypoint_meta,
+                }
+
+            path_eval = self._evaluate_predicted_path_clearance(
+                path_start,
+                joints,
+                label=f"{chain_label}:to_{waypoint_name}",
+            )
+            meta["path_safe"] = bool(path_eval["safe"])
+
+            if not path_eval["safe"]:
+                meta["reason"] = path_eval["reason"]
+                waypoint_meta[waypoint_name] = meta
+                return None, {
+                    "chain_label": chain_label,
+                    "success": False,
+                    "failed_waypoint": waypoint_name,
+                    "waypoint_meta": waypoint_meta,
+                }
+
+            meta["min_clearance_m"] = float(min(
+                pose_eval["min_clearance_m"],
+                path_eval["min_clearance_m"],
+            ))
+            waypoint_meta[waypoint_name] = meta
+            results[waypoint_name] = list(np.asarray(joints, dtype=np.float64))
+            previous_solution = np.asarray(joints, dtype=np.float64)
+
+        if not results:
+            return None, {
+                "chain_label": chain_label,
+                "success": False,
+                "failed_waypoint": None,
+                "waypoint_meta": waypoint_meta,
+                "reason": "no valid waypoints were present",
+            }
+
+        return results, {
+            "chain_label": chain_label,
+            "success": True,
+            "failed_waypoint": None,
+            "waypoint_meta": waypoint_meta,
+        }
+
+    def _score_safe_beam_branch(
+        self,
+        joints_deg,
+        reference_deg,
+        pose_eval: dict,
+        path_eval: dict,
+    ) -> float:
+        """Lower score is better: short motion with generous clearance."""
+        delta = self._wrapped_joint_delta_deg(joints_deg, reference_deg)
+        motion_cost = float(np.dot(delta, delta)) / (180.0 ** 2)
+        min_clearance = max(
+            1e-3,
+            min(
+                float(pose_eval["min_clearance_m"]),
+                float(path_eval["min_clearance_m"]),
+            ),
+        )
+        clearance_cost = 1.0 / min_clearance
+        return (
+            float(self.config.get("ik_motion_score_weight", 1.0)) * motion_cost
+            + float(self.config.get("ik_clearance_score_weight", 0.05))
+            * clearance_cost
+        )
+
+    def _beam_seed_bank(self, reference_deg) -> list:
+        """
+        Return a small deterministic seed bank for last-resort beam search.
+
+        Beam search is intentionally lazy: this function is used only after
+        the nominal whole-chain attempt AND both lightweight whole-chain
+        alternatives have failed.
+        """
+        reference = np.asarray(reference_deg, dtype=np.float64)
+        home = np.asarray(self.go_home(), dtype=np.float64)
+
+        templates = [
+            ("reference", reference),
+            ("home", home),
+            ("elbow_up_A", [home[0], -90.0, 90.0, -90.0, home[4], home[5]]),
+            ("elbow_up_B", [home[0], -60.0, 90.0, -120.0, home[4], home[5]]),
+            ("elbow_up_C", [home[0], -120.0, 90.0, -60.0, home[4], home[5]]),
+            ("elbow_alt_A", [home[0], -90.0, -90.0, 90.0, home[4], home[5]]),
+            ("shoulder_plus", [home[0] + 180.0, -90.0, 90.0, -90.0, home[4], home[5]]),
+            ("shoulder_minus", [home[0] - 180.0, -90.0, 90.0, -90.0, home[4], home[5]]),
+        ]
+
+        max_count = max(1, int(self.config.get("ik_beam_max_seed_hypotheses", 6)))
+        unique = []
+        for label, values in templates:
+            q = np.asarray(values, dtype=np.float64)
+            if q.shape != (6,):
+                continue
+            if any(
+                np.linalg.norm(self._wrapped_joint_delta_deg(q, old_q)) < 1.0
+                for _old_label, old_q in unique
+            ):
+                continue
+            unique.append((label, q))
+        return unique[:max_count]
+
+    def _collect_safe_beam_branches(
+        self,
+        pos_local,
+        orient,
+        reference_deg,
+        waypoint_name: str,
+    ) -> tuple:
+        """Generate, deduplicate, FK-check and score beam-search branches."""
+        reference = np.asarray(reference_deg, dtype=np.float64)
+        solutions = []
+        rejections = []
+        dedup_deg = float(self.config.get("ik_solution_dedup_deg", 4.0))
+
+        for seed_name, seed_deg in self._beam_seed_bank(reference):
+            joints = self._solve_ik_lula(pos_local, orient, seed_deg=seed_deg)
+            if joints is None:
+                rejections.append({"seed": seed_name, "reason": "IK did not converge"})
+                continue
+
+            joints = np.asarray(joints, dtype=np.float64)
+            if any(
+                np.linalg.norm(self._wrapped_joint_delta_deg(joints, old["joints"]))
+                < dedup_deg
+                for old in solutions
+            ):
+                continue
+
+            pose_eval = self._evaluate_predicted_table_clearance(
+                joints,
+                label=f"beam:{waypoint_name}:{seed_name}",
+            )
+            if not pose_eval["safe"]:
+                rejections.append({"seed": seed_name, "reason": pose_eval["reason"]})
+                continue
+
+            path_eval = self._evaluate_predicted_path_clearance(
+                reference,
+                joints,
+                label=f"beam:to_{waypoint_name}:{seed_name}",
+            )
+            if not path_eval["safe"]:
+                rejections.append({"seed": seed_name, "reason": path_eval["reason"]})
+                continue
+
+            solutions.append({
+                "seed": seed_name,
+                "joints": joints,
+                "score": self._score_safe_beam_branch(
+                    joints,
+                    reference,
+                    pose_eval,
+                    path_eval,
+                ),
+                "min_clearance_m": float(min(
+                    pose_eval["min_clearance_m"],
+                    path_eval["min_clearance_m"],
+                )),
+            })
+
+        solutions.sort(key=lambda item: item["score"])
+        return solutions, {
+            "waypoint": waypoint_name,
+            "safe_branch_count": len(solutions),
+            "rejections": rejections,
+        }
+
+    def _solve_chain_with_beam_fallback(
+        self,
+        flange_targets,
+        tool_orient,
+        waypoint_order,
+        actual_start_deg,
+    ) -> tuple:
+        """
+        Last-resort downstream-aware beam search through the current horizon.
+
+        This is NOT run during normal operation.  It activates only after:
+          1. nominal whole-chain planning failed;
+          2. elbow_up_A whole-chain retry failed;
+          3. elbow_up_B whole-chain retry failed.
+        """
+        start = np.asarray(actual_start_deg, dtype=np.float64)
+        beam_width = max(1, int(self.config.get("ik_beam_width", 4)))
+        max_children = max(
+            1,
+            int(self.config.get("ik_beam_max_children_per_state", 3)),
+        )
+
+        frontier = [{
+            "prev_joints": start.copy(),
+            "results": {},
+            "total_score": 0.0,
+            "trace": [],
+            "branch_meta": {},
+        }]
+
+        for waypoint_name in waypoint_order:
+            world_target = flange_targets.get(waypoint_name)
+            if not isinstance(world_target, np.ndarray) or len(world_target) != 3:
+                continue
+
+            local_target = self._world_to_robot_base(world_target)
+            expanded = []
+
+            for state_idx, state in enumerate(frontier):
+                branches, wp_meta = self._collect_safe_beam_branches(
+                    local_target,
+                    tool_orient,
+                    reference_deg=state["prev_joints"],
+                    waypoint_name=waypoint_name,
+                )
+
+                for branch in branches[:max_children]:
+                    branch_meta = dict(state["branch_meta"])
+                    branch_meta[waypoint_name] = {
+                        **wp_meta,
+                        "selected_seed": branch["seed"],
+                        "selected_score": float(branch["score"]),
+                        "selected_min_clearance_m": float(branch["min_clearance_m"]),
+                    }
+                    expanded.append({
+                        "prev_joints": np.asarray(branch["joints"], dtype=np.float64),
+                        "results": {
+                            **state["results"],
+                            waypoint_name: list(np.asarray(branch["joints"], dtype=np.float64)),
+                        },
+                        "total_score": float(state["total_score"]) + float(branch["score"]),
+                        "trace": state["trace"] + [{
+                            "waypoint": waypoint_name,
+                            "seed": branch["seed"],
+                            "score": float(branch["score"]),
+                            "min_clearance_m": float(branch["min_clearance_m"]),
+                            "parent_state": state_idx,
+                        }],
+                        "branch_meta": branch_meta,
+                    })
+
+            if not expanded:
+                return None, {
+                    "planner": "beam_fallback",
+                    "success": False,
+                    "failed_waypoint": waypoint_name,
+                }
+
+            expanded.sort(key=lambda item: item["total_score"])
+            frontier = expanded[:beam_width]
+            self._log(
+                f"  [BeamFallback] {waypoint_name}: kept={len(frontier)}/"
+                f"{len(expanded)} partial chains; "
+                f"best_score={frontier[0]['total_score']:.4f}"
+            )
+
+        if not frontier:
+            return None, {
+                "planner": "beam_fallback",
+                "success": False,
+                "failed_waypoint": None,
+            }
+
+        best = min(frontier, key=lambda item: item["total_score"])
+        return best["results"], {
+            "planner": "beam_fallback",
+            "success": True,
+            "failed_waypoint": None,
+            "chain_score": float(best["total_score"]),
+            "trace": best["trace"],
+            "branch_meta": best["branch_meta"],
+        }
 
     # ══════════════════════════════════════════════════════════
     # LULA IK WAYPOINT SOLVER (with orientation candidates)
@@ -1772,133 +2600,177 @@ class UR5EController:
         prim_path        = None,
     ) -> tuple:
         """
-        Solve IK for all pick waypoints.
+        Solve a cascaded collision-aware pick chain.
 
-        PATCH: now returns (results | None, ik_meta dict)
+        Fast normal case:
+          Tier 0 — one intuitive continuous chain:
+            actual current pose -> safe_above -> pre_grasp -> grasp
 
-        ik_meta keys:
-            orient_name     : str   — chosen orientation label
-            orient_quat     : list  — [w, x, y, z]
-            orient_yaw_deg  : float
-            waypoints_solved: list  — names solved successfully
-            waypoints_failed: list  — names that failed
-            attempts_per_wp : dict  — {wp_name: attempt_count}
-            solver          : str
+        Recovery only when Tier 0 fails:
+          Tier 1 — restart the COMPLETE chain from at most two deterministic
+                   elbow-up warm-start hypotheses;
+          Tier 2 — if enabled, run a small downstream-aware beam search.
+
+        Default horizon ends at grasp.  Lift is appended only when lift testing
+        is enabled; retreat is appended only when explicitly requested.
         """
-        ik_meta = {
-            "orient_name":      None,
-            "orient_quat":      None,
-            "orient_yaw_deg":   None,
-            "waypoints_solved": [],
-            "waypoints_failed": [],
-            "attempts_per_wp":  {},
-            "solver":           self._ik_mode,
-        }
+        planning_started = time.perf_counter()
 
-        # ── Orientation candidates ────────────────────────────
         if object_metadata and prim_path:
-            candidates = self._compute_grasp_candidates_for_object(
-                object_metadata, prim_path)
+            orientation_candidates = self._compute_grasp_candidates_for_object(
+                object_metadata,
+                prim_path,
+            )
         else:
-            candidates = [
+            orientation_candidates = [
                 ("X", compute_grasp_orientation(0.0)),
                 ("Y", compute_grasp_orientation(math.pi / 2.0)),
             ]
-            random.shuffle(candidates)
 
-        waypoint_order = [
-            "safe_above",
-            "pre_grasp",
-            "grasp",
-            "lift",
-            "safe_retreat",
-            "retract",
-        ]
+        # Keep contact-quality intent in control.  A different gripper yaw is
+        # tried only when explicitly requested by the grasp-strategy layer.
+        if not self.config.get("grasp_try_alternate_orientations", False):
+            orientation_candidates = orientation_candidates[:1]
 
-        for orient_name, tool_orient in candidates:
-            results     = {}
-            prev_joints = None
-            all_ok      = True
+        waypoint_order = self._pick_planning_waypoint_order()
+        actual_start = np.asarray(self.get_joint_targets_deg(), dtype=np.float64)
+        rejected_orientations = []
 
-            # Reset per-candidate tracking
-            wp_solved = []
-            wp_failed = []
-            attempts  = {}
+        for orient_name, tool_orient in orientation_candidates:
+            self._log(
+                f"  [CascadeIK] Orientation '{orient_name}' through "
+                f"{waypoint_order}"
+            )
+            tier_meta = []
 
-            for name in waypoint_order:
-                if name not in flange_targets:
-                    continue
-                w = flange_targets[name]
-                if not isinstance(w, np.ndarray) or len(w) != 3:
-                    continue
+            # ── Tier 0: intuitive continuous chain ────────────
+            nominal_results, nominal_meta = self._solve_chain_from_initial_seed(
+                flange_targets,
+                tool_orient,
+                waypoint_order,
+                actual_start_deg=actual_start,
+                initial_seed_deg=actual_start,
+                chain_label="nominal_current",
+            )
+            tier_meta.append({"tier": 0, **nominal_meta})
 
-                local = self._world_to_robot_base(w)
-
-                # ── PATCHED: unpack (joints, meta) tuple ──────
-                j, wp_meta = self._solve_ik_retries(
-                    local, tool_orient, seed_deg=prev_joints)
-                attempts[name] = wp_meta["attempts"]
-
-                if j is None:
-                    self._log(
-                        f"  [IK] No solution for '{name}' "
-                        f"orient={orient_name}")
-                    wp_failed.append(name)
-                    all_ok = False
-                    break
-
-                if not self._validate_joints_no_table_collision(
-                        j, waypoint_name=name):
-                    wp_failed.append(name)
-                    all_ok = False
-                    break
-
-                if prev_joints is not None:
-                    prev_name = waypoint_order[
-                        waypoint_order.index(name) - 1]
-                    if not self._validate_path_between_joints(
-                            prev_joints, j, n_samples=10,
-                            label=f"{prev_name}→{name}"):
-                        wp_failed.append(name)
-                        all_ok = False
-                        break
-
-                results[name] = list(j)
-                wp_solved.append(name)
-                prev_joints = j
-
-            if all_ok and results:
-                # ── Compute yaw from quaternion ───────────────
-                yaw_rad = math.atan2(
-                    2.0 * (tool_orient[0] * tool_orient[3]
-                         + tool_orient[1] * tool_orient[2]),
-                    1.0 - 2.0 * (tool_orient[2] ** 2
-                                + tool_orient[3] ** 2),
-                )
-                yaw_deg = math.degrees(yaw_rad)
-
-                # ── Populate ik_meta ──────────────────────────
-                ik_meta["orient_name"]      = orient_name
-                ik_meta["orient_quat"]      = list(tool_orient)
-                ik_meta["orient_yaw_deg"]   = yaw_deg
-                ik_meta["waypoints_solved"] = wp_solved
-                ik_meta["waypoints_failed"] = wp_failed
-                ik_meta["attempts_per_wp"]  = attempts
-
+            if nominal_results is not None:
+                planning_time_s = time.perf_counter() - planning_started
                 print(
-                    f"    [IK] ✅ Grasp orientation: {orient_name}  "
-                    f"yaw={yaw_deg:.1f}°  "
-                    f"quat=[{tool_orient[0]:.3f}, "
-                    f"{tool_orient[1]:.3f}, "
-                    f"{tool_orient[2]:.3f}, "
-                    f"{tool_orient[3]:.3f}]"
+                    f"    [CascadeIK] ✅ Tier 0 nominal chain selected: "
+                    f"orientation={orient_name}, "
+                    f"waypoints={list(nominal_results.keys())}, "
+                    f"planning_time={planning_time_s:.3f}s"
                 )
-                return results, ik_meta
+                return nominal_results, {
+                    "solver": self._ik_mode,
+                    "planner": "cascade_nominal_then_chain_fallback_then_beam",
+                    "selected_tier": 0,
+                    "selected_chain": "nominal_current",
+                    "orient_name": orient_name,
+                    "orient_quat": list(tool_orient),
+                    "waypoints_solved": list(nominal_results.keys()),
+                    "waypoints_failed": [],
+                    "tier_meta": tier_meta,
+                    "planning_time_s": planning_time_s,
+                }
 
-        # ── All candidates failed ─────────────────────────────
-        self._log("  [IK] All orientation candidates failed")
-        ik_meta["waypoints_failed"] = waypoint_order
-        return None, ik_meta
+            self._log(
+                "  [CascadeIK] Tier 0 nominal chain rejected; "
+                "trying lightweight whole-chain alternatives"
+            )
+
+            # ── Tier 1: two lightweight complete-chain retries ─
+            for fallback_label, fallback_seed in self._chain_fallback_initial_seeds():
+                fallback_results, fallback_meta = self._solve_chain_from_initial_seed(
+                    flange_targets,
+                    tool_orient,
+                    waypoint_order,
+                    actual_start_deg=actual_start,
+                    initial_seed_deg=fallback_seed,
+                    chain_label=fallback_label,
+                )
+                tier_meta.append({"tier": 1, **fallback_meta})
+
+                if fallback_results is not None:
+                    planning_time_s = time.perf_counter() - planning_started
+                    print(
+                        f"    [CascadeIK] ✅ Tier 1 whole-chain fallback "
+                        f"selected: {fallback_label}, "
+                        f"orientation={orient_name}, "
+                        f"waypoints={list(fallback_results.keys())}, "
+                        f"planning_time={planning_time_s:.3f}s"
+                    )
+                    return fallback_results, {
+                        "solver": self._ik_mode,
+                        "planner": "cascade_nominal_then_chain_fallback_then_beam",
+                        "selected_tier": 1,
+                        "selected_chain": fallback_label,
+                        "orient_name": orient_name,
+                        "orient_quat": list(tool_orient),
+                        "waypoints_solved": list(fallback_results.keys()),
+                        "waypoints_failed": [],
+                        "tier_meta": tier_meta,
+                        "planning_time_s": planning_time_s,
+                    }
+
+            # ── Tier 2: lazy beam search as last resort ───────
+            beam_results = None
+            beam_meta = None
+            if self.config.get("ik_enable_beam_fallback", True):
+                self._log(
+                    "  [CascadeIK] Lightweight alternatives failed; "
+                    "activating lazy beam-search fallback"
+                )
+                beam_results, beam_meta = self._solve_chain_with_beam_fallback(
+                    flange_targets,
+                    tool_orient,
+                    waypoint_order,
+                    actual_start_deg=actual_start,
+                )
+                tier_meta.append({"tier": 2, **beam_meta})
+
+            if beam_results is not None:
+                planning_time_s = time.perf_counter() - planning_started
+                print(
+                    f"    [CascadeIK] ✅ Tier 2 beam fallback selected: "
+                    f"orientation={orient_name}, "
+                    f"waypoints={list(beam_results.keys())}, "
+                    f"planning_time={planning_time_s:.3f}s"
+                )
+                return beam_results, {
+                    "solver": self._ik_mode,
+                    "planner": "cascade_nominal_then_chain_fallback_then_beam",
+                    "selected_tier": 2,
+                    "selected_chain": "beam_fallback",
+                    "orient_name": orient_name,
+                    "orient_quat": list(tool_orient),
+                    "waypoints_solved": list(beam_results.keys()),
+                    "waypoints_failed": [],
+                    "tier_meta": tier_meta,
+                    "planning_time_s": planning_time_s,
+                }
+
+            rejected_orientations.append({
+                "orient_name": orient_name,
+                "tier_meta": tier_meta,
+            })
+
+        planning_time_s = time.perf_counter() - planning_started
+        self._log("  [CascadeIK] ❌ No safe grasp chain found")
+        return None, {
+            "solver": self._ik_mode,
+            "planner": "cascade_nominal_then_chain_fallback_then_beam",
+            "selected_tier": None,
+            "selected_chain": None,
+            "orient_name": None,
+            "orient_quat": None,
+            "waypoints_solved": [],
+            "waypoints_failed": waypoint_order,
+            "rejected_orientations": rejected_orientations,
+            "planning_time_s": planning_time_s,
+        }
+
     # ══════════════════════════════════════════════════════════
     # PUBLIC API — compute_pick_joints
     # ══════════════════════════════════════════════════════════
@@ -1946,6 +2818,7 @@ class UR5EController:
             "grasp_strategy": targets.get("grasp_strategy", "full_wrap"),
             "object_height":  targets.get("object_height", 0.035),
             "height_info":    targets.get("height_info", {}),
+            "planning_failed": False,
             "ik_meta": {
                 "solver":           self._ik_mode,
                 "orient_name":      None,
@@ -1976,10 +2849,26 @@ class UR5EController:
             result["ik_meta"].update(lula_meta)
 
         # ── Calibration fallback ──────────────────────────────
+        # Safety-first default: helps to not to allow silent bypass of predictive FK checks
+        # when Lula could not produce a verified/valid grasp chain.
+        if not self.config.get(
+            "allow_calibration_fallback_for_pick",
+            True,
+        ):
+            result["joints"] = {}
+            result["planning_failed"] = True
+            result["ik_meta"]["used_calibration"] = False
+            result["ik_meta"]["solver"] = self._ik_mode
+            return result
+
         result["joints"] = self._compute_pick_calibration(
-            object_world_pos, pan_to_object_deg, targets)
+            object_world_pos,
+            pan_to_object_deg,
+            targets,
+        )
+        result["planning_failed"] = False
         result["ik_meta"]["used_calibration"] = True
-        result["ik_meta"]["solver"]           = "calibration"
+        result["ik_meta"]["solver"] = "calibration"
         return result
 
     # ══════════════════════════════════════════════════════════

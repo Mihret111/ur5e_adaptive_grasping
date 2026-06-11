@@ -110,12 +110,55 @@ debug_fixed_table_approach_deg: 0.0
 debug_fixed_table_facing: "long"
 table_size_range: null
 
-# ───────────── COLLISION CLEARANCE ─────────────
+# ───────────── Cascaded IK planner: fast nominal → 2 whole-chain retries → beam fallback
 
+# Runtime guard remains independent
 collision_debug: true
-collision_trace_all_links: true
+collision_trace_all_links: false
 collision_fail_closed_on_missing_link: true
 
 forearm_sample_count: 9
 collision_check_margin: 0.04
 arm_body_clearance: 0.08
+# Keep grasp contact intent in control. Alternate gripper yaws are NOT tried
+# unless explicitly enabled later by the grasp-strategy layer.
+grasp_try_alternate_orientations: false
+
+# Tier 1: only after the intuitive nominal chain fails, retry the COMPLETE
+# chain from at most two deterministic elbow-up warm-start hypotheses.
+ik_enable_chain_fallbacks: true
+ik_max_chain_fallbacks: 2
+
+# Tier 2: only after nominal + both lightweight retries fail, activate a small
+# downstream-aware beam search. These values are deliberately modest.
+ik_enable_beam_fallback: true
+ik_beam_width: 4
+ik_beam_max_children_per_state: 3
+ik_beam_max_seed_hypotheses: 6
+ik_solution_dedup_deg: 4.0
+
+# Candidate ranking used only inside the last-resort beam fallback.
+ik_motion_score_weight: 1.0
+ik_clearance_score_weight: 0.05
+
+# Lean FK safety resolution. These remain small because the runtime collision
+# guard still checks the actual simulated arm continuously during execution.
+planner_path_sample_count: 6
+planner_link_sample_count: 5
+planner_fail_closed_on_missing_fk_frame: true
+
+# Runtime emergency guard remains active.
+collision_fail_closed_on_missing_link: true
+collision_debug: false
+collision_trace_all_links: false
+forearm_sample_count: 7
+collision_check_margin: 0.04
+arm_body_clearance: 0.08
+
+# Do not silently fall back to an unverified calibration motion.
+allow_calibration_fallback_for_pick: false
+
+# Current experiment: plan and execute only through grasp.
+enable_lift_test: true
+plan_retreat_during_pick: true
+max_grasp_attempts: 2
