@@ -143,12 +143,25 @@ enable_lift_test: true
 plan_retreat_during_pick: true
 max_grasp_attempts: 1
 
-# ──────────── PRE-CLOSE DIAGNOSTIC EXPERIMENT OVERRIDES ─────────────
-# Diagnostic only: measure actual flange/object geometry before closing.
-# No rejection gate is enabled until the USD flange-axis convention is verified.
-enable_preclose_diagnostics: true
-preclose_diagnostics_print_all_axes: true
+# ───────────── CALIBRATED PRE-CLOSE GEOMETRY GATE ─────────────
+# Two diagnostic trials with different objects and table locations identified
+# flange-local +X as the direction from flange toward the active finger region.
+finger_capture_axis_local: "+X"
+enable_preclose_geometry_gate: true
 
-# Keep this experiment focused on approach + close validation only.
+# Initial conservative thresholds.  Tune empirically after collecting a batch.
+max_preclose_grasp_centre_xy_error_m: 0.015
+min_preclose_vertical_overlap_m: 0.010
+max_preclose_flange_tracking_error_m: 0.010
+
+# Keep as a diagnostic warning initially; do not reject solely on axis mismatch.
+require_preclose_closest_axis_match: false
+
+# The axis has been calibrated, so keep the concise output by default.
+preclose_diagnostics_print_all_axes: false
+
+# Continue close-only validation before adding micro-lift.
+enable_micro_lift_test: false
 enable_lift_test: false
 plan_retreat_during_pick: false
+max_grasp_attempts: 1

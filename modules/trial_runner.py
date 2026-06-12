@@ -118,6 +118,25 @@ class TrialRunner:
                             f"{d['planned_flange_tracking_error_m']}"
                         )
 
+                    if a.get("preclose_geometry_gate"):
+                        g = a["preclose_geometry_gate"]
+                        print(
+                            "    preclose_geometry_ok: "
+                            f"{g['geometry_ok']}"
+                        )
+                        print(
+                            "    preclose_xy_error_m: "
+                            f"{g['grasp_centre_xy_error_m']:.4f}"
+                        )
+                        print(
+                            "    preclose_vertical_overlap_m: "
+                            f"{g['vertical_overlap_m']:.4f}"
+                        )
+                        print(
+                            "    preclose_gate_reasons: "
+                            f"{g['reasons']}"
+                        )
+
                     if a["close_validation"]:
                         print(f"    close_success: {a['close_validation']['success']}")
                         print(f"    close_reasons: {a['close_validation']['reasons']}")

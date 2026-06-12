@@ -371,6 +371,7 @@ class PickAndPlaceExecutor:
                 "pre_grasp_ok": False,
                 "grasp_ok": False,
                 "preclose_diagnostics": None,
+                "preclose_geometry_gate": None,
                 "close_validation": None,
                 "lift_validation": None,
                 "gripper_diagnostics_after_close": None,
@@ -567,6 +568,70 @@ class PickAndPlaceExecutor:
                                 f"centre={axis_info['grasp_centre_world_pos']} "
                                 f"distance={axis_info['grasp_centre_object_distance_m']:.4f} m"
                             )
+
+                    # ──── Calibrated pre-close geometry gate ────
+                    preclose_gate = self.arm.evaluate_preclose_geometry_gate(
+                        preclose_diag
+                    )
+                    attempt_log["preclose_geometry_gate"] = preclose_gate
+
+                    print("\n[Executor] Calibrated pre-close geometry gate:")
+                    print(
+                        "  calibrated finger axis:    "
+                        f"{preclose_gate['calibrated_finger_axis_local']}"
+                    )
+                    print(
+                        "  geometry_ok:               "
+                        f"{preclose_gate['geometry_ok']}"
+                    )
+                    print(
+                        "  grasp-centre XY error:     "
+                        f"{preclose_gate['grasp_centre_xy_error_m']:.4f} m"
+                    )
+                    print(
+                        "  vertical finger overlap:   "
+                        f"{preclose_gate['vertical_overlap_m']:.4f} m"
+                    )
+                    print(
+                        "  flange tracking error:     "
+                        f"{preclose_gate['planned_flange_tracking_error_m']}"
+                    )
+
+                    if (
+                        self.config.get("enable_preclose_geometry_gate", True)
+                        and not preclose_gate["geometry_ok"]
+                    ):
+                        print(
+                            "[Executor] ❌ Rejecting close: pre-close geometry "
+                            "is not plausible."
+                        )
+                        for reason in preclose_gate["reasons"]:
+                            print(f"  - {reason}")
+
+                        attempt_log["failure_reason"] = (
+                            "preclose_geometry_gate_failed"
+                        )
+                        trial_log["attempts"].append(attempt_log)
+                        trial_log["trial_success"] = False
+                        trial_log["final_reason"] = (
+                            "preclose_geometry_gate_failed"
+                        )
+                        self._last_trial_log = trial_log
+
+                        # The fingers are still open. Retreat gently instead of
+                        # issuing a meaningless close command.
+                        await self.arm.move_to(
+                            pre_grasp,
+                            duration=2.0,
+                            steps=100,
+                            check_table_collision=True,
+                        )
+                        await self.arm.move_via_safe_height(
+                            safe_above,
+                            duration=3.0,
+                            steps=150,
+                        )
+                        return False
                 else:
                     print(
                         "[Executor] ⚠️ Pre-close diagnostics skipped: "
