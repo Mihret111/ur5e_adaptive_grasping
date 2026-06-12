@@ -404,8 +404,8 @@ class PickAndPlaceExecutor:
 
             # Added a break with a False return if the IK fails to produce a valid plan.
             # This ensures that the robot does not attempt to execute a failed plan.
-            if pick_result.get("ik_success", False):
-                print("[Executor] ❌ IK failed to produce a valid plan.")
+            if pick_result.get("planning_failed", False):
+                print("[Executor] ❌ Planner rejected the grasp before execution.")
                 print("[Executor] IK diagnostics:")
                 print(pick_result.get("ik_meta", {}))
                 return False

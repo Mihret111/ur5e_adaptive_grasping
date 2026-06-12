@@ -16,6 +16,15 @@ build_table: true
 table_size: [1.0, 0.6, 0.75]
 table_leg_radius: 0.02
 
+# ───────────── DEBUG TABLE POSITION ─────────────
+
+# fixed for now, not using table randomization
+debug_fixed_table: true
+debug_fixed_table_center: [1.10, 0.00, 0.0]
+debug_fixed_table_size: [1.00, 0.60, 0.75]
+debug_fixed_table_approach_deg: 0.0
+debug_fixed_table_facing: "long"
+table_size_range: null
 # ───────────── TABLE PLACEMENT ─────────────
 
 near_edge_padding: 0.03
@@ -39,12 +48,6 @@ move_home_before_pick: true
 enable_pre_grasp_test: true
 enable_grasp_pose_test: true
 enable_gripper_close_test: true
-
-# ── Number of attempts before declaring failure ──
-max_grasp_attempts: 2
-
-# ── Enable lift-off test after successful grasp ──
-enable_lift_test: true
 
 # ───────────── GRASP VALIDATION ─────────────
 max_object_shift_during_close_m: 0.03
@@ -70,13 +73,10 @@ lift_steps: 300
 post_close_hold_seconds: 1.0
 # ───────────── INSPECTION ─────────────
 
-# turned off, Recheck and delete the unused configs
 debug_hold_after_stage: false
 inspection_hold_seconds: 2.0 # how many seconds to hold before opening in inspection
 leave_sim_running_after_trial: false
 
-startup_home_duration: 6.0
-startup_home_steps: 360
 post_home_settle_seconds: 0.8
 
 reset_robot_before_trial: true
@@ -95,31 +95,11 @@ park_settle_seconds: 0.5
 # useful for recording videos
 post_spawn_settle_seconds: 0.5
 post_run_hold_seconds: 0.0
-leave_sim_running_after_trial: false
 
-# ───────────── DEBUG TABLE POSITION ─────────────
 
-# fixed for now, has been rondomized before
-table_size: [1.00, 0.60, 0.75]
-table_size_range: null
-
-debug_fixed_table: true
-debug_fixed_table_center: [1.10, 0.00, 0.0]
-debug_fixed_table_size: [1.00, 0.60, 0.75]
-debug_fixed_table_approach_deg: 0.0
-debug_fixed_table_facing: "long"
-table_size_range: null
 
 # ───────────── Cascaded IK planner: fast nominal → 2 whole-chain retries → beam fallback
 
-# Runtime guard remains independent
-collision_debug: true
-collision_trace_all_links: false
-collision_fail_closed_on_missing_link: true
-
-forearm_sample_count: 9
-collision_check_margin: 0.04
-arm_body_clearance: 0.08
 # Keep grasp contact intent in control. Alternate gripper yaws are NOT tried
 # unless explicitly enabled later by the grasp-strategy layer.
 grasp_try_alternate_orientations: false
