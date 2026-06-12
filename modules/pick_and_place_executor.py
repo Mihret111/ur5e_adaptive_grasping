@@ -370,6 +370,7 @@ class PickAndPlaceExecutor:
                 "safe_above_ok": False,
                 "pre_grasp_ok": False,
                 "grasp_ok": False,
+                "preclose_diagnostics": None,
                 "close_validation": None,
                 "lift_validation": None,
                 "gripper_diagnostics_after_close": None,
@@ -408,6 +409,10 @@ class PickAndPlaceExecutor:
                 print("[Executor] ❌ Planner rejected the grasp before execution.")
                 print("[Executor] IK diagnostics:")
                 print(pick_result.get("ik_meta", {}))
+                attempt_log["failure_reason"] = "planning_failed_before_safe_above"
+                trial_log["attempts"].append(attempt_log)
+                trial_log["final_reason"] = "planning_failed_before_safe_above"
+                self._last_trial_log = trial_log
                 return False
             joints = pick_result["joints"]
 
@@ -459,6 +464,16 @@ class PickAndPlaceExecutor:
                 object_metadata=target,
                 prim_path=target.get("prim_path"),
             )
+            if pick_result.get("planning_failed", False):
+                print("[Executor] ❌ Replanning from safe_above was rejected.")
+                print("[Executor] IK diagnostics:")
+                print(pick_result.get("ik_meta", {}))
+                attempt_log["failure_reason"] = "planning_failed_after_safe_above"
+                trial_log["attempts"].append(attempt_log)
+                trial_log["final_reason"] = "planning_failed_after_safe_above"
+                self._last_trial_log = trial_log
+                return False
+
             ## get the computed joints again
             joints = pick_result.get("joints", {})
             # safe_above = joints.get("safe_above")
@@ -504,6 +519,59 @@ class PickAndPlaceExecutor:
 
             print("[Executor] ✅ Reached grasp pose.")
             attempt_log["grasp_ok"] = True
+
+            # ──── Diagnostic-only snapshot before gripper closure ────
+            # We do not reject a grasp yet.  First verify the professor USD's
+            # actual flange-to-finger axis convention using measured evidence.
+            if self.config.get("enable_preclose_diagnostics", True):
+                preclose_object_pos = self._get_prim_world_pos(
+                    target.get("prim_path")
+                )
+
+                if preclose_object_pos is not None:
+                    preclose_diag = self.arm.get_preclose_geometry_diagnostics(
+                        object_world_pos=preclose_object_pos,
+                        object_metadata=target,
+                        planned_flange_world_pos=(
+                            pick_result.get("flange_targets", {}).get("grasp")
+                        ),
+                    )
+                    attempt_log["preclose_diagnostics"] = preclose_diag
+
+                    print("\n[Executor] Pre-close geometry diagnostics (no rejection):")
+                    print(
+                        "  planned flange tracking error: "
+                        f"{preclose_diag['planned_flange_tracking_error_m']}"
+                    )
+                    print(
+                        "  flange-object delta: "
+                        f"{preclose_diag['flange_object_delta_m']}"
+                    )
+                    print(
+                        "  closest local flange-axis candidate: "
+                        f"{preclose_diag['closest_axis_candidate']}"
+                    )
+                    print(
+                        "  closest candidate grasp-centre distance: "
+                        f"{preclose_diag['closest_axis_distance_m']:.4f} m"
+                    )
+
+                    if self.config.get(
+                        "preclose_diagnostics_print_all_axes", True
+                    ):
+                        for axis_name, axis_info in (
+                            preclose_diag["candidate_axes"].items()
+                        ):
+                            print(
+                                f"    {axis_name}: "
+                                f"centre={axis_info['grasp_centre_world_pos']} "
+                                f"distance={axis_info['grasp_centre_object_distance_m']:.4f} m"
+                            )
+                else:
+                    print(
+                        "[Executor] ⚠️ Pre-close diagnostics skipped: "
+                        "object pose unavailable"
+                    )
 
             # ──── Now try to close the gripper and validate the grasp. ────
             print("\n[Executor] Closing gripper at grasp pose...")
@@ -586,6 +654,11 @@ class PickAndPlaceExecutor:
 
                 if not self.config.get("enable_lift_test", False):
                     print("[Executor] Lift disabled for now. Ending after successful close validation.")
+                    attempt_log["success"] = True
+                    trial_log["trial_success"] = True
+                    trial_log["final_reason"] = "close_validation_passed_lift_disabled"
+                    trial_log["attempts"].append(attempt_log)
+                    self._last_trial_log = trial_log
                     return True
 
                 # ──── Perform the lift ────

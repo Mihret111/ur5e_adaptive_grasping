@@ -103,6 +103,21 @@ class TrialRunner:
                     print(f"    grasp_ok: {a['grasp_ok']}")
                     print(f"    failure_reason: {a['failure_reason']}")
 
+                    if a.get("preclose_diagnostics"):
+                        d = a["preclose_diagnostics"]
+                        print(
+                            "    preclose_closest_axis: "
+                            f"{d['closest_axis_candidate']}"
+                        )
+                        print(
+                            "    preclose_axis_distance_m: "
+                            f"{d['closest_axis_distance_m']:.4f}"
+                        )
+                        print(
+                            "    preclose_tracking_error_m: "
+                            f"{d['planned_flange_tracking_error_m']}"
+                        )
+
                     if a["close_validation"]:
                         print(f"    close_success: {a['close_validation']['success']}")
                         print(f"    close_reasons: {a['close_validation']['reasons']}")

@@ -141,4 +141,14 @@ allow_calibration_fallback_for_pick: false
 # Current experiment: plan and execute only through grasp.
 enable_lift_test: true
 plan_retreat_during_pick: true
-max_grasp_attempts: 2
+max_grasp_attempts: 1
+
+# ──────────── PRE-CLOSE DIAGNOSTIC EXPERIMENT OVERRIDES ─────────────
+# Diagnostic only: measure actual flange/object geometry before closing.
+# No rejection gate is enabled until the USD flange-axis convention is verified.
+enable_preclose_diagnostics: true
+preclose_diagnostics_print_all_axes: true
+
+# Keep this experiment focused on approach + close validation only.
+enable_lift_test: false
+plan_retreat_during_pick: false

@@ -510,6 +510,144 @@ class UR5EController:
         p   = mtx.ExtractTranslation()
         return [p[0], p[1], p[2]]
 
+    def _transform_flange_local_point_to_world(self, local_xyz) -> list:
+        """Transform a point from flange-local coordinates into world coordinates.
+
+        Diagnostic helper only.  At this stage we deliberately do not assume
+        which local flange axis points toward the useful finger-capture region.
+        """
+        prim = self.stage.GetPrimAtPath(Sdf.Path(self.flange_path))
+        if not prim.IsValid():
+            raise RuntimeError(
+                f"Cannot compute pre-close diagnostics: invalid flange prim "
+                f"'{self.flange_path}'"
+            )
+
+        xf = UsdGeom.Xformable(prim)
+        mtx = xf.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+        local = Gf.Vec3d(
+            float(local_xyz[0]),
+            float(local_xyz[1]),
+            float(local_xyz[2]),
+        )
+        world = mtx.Transform(local)
+        return [float(world[0]), float(world[1]), float(world[2])]
+
+    @staticmethod
+    def _euclidean_distance(a, b) -> float:
+        return float(np.linalg.norm(
+            np.asarray(a, dtype=np.float64)
+            - np.asarray(b, dtype=np.float64)
+        ))
+
+    def get_preclose_geometry_diagnostics(
+        self,
+        object_world_pos,
+        object_metadata=None,
+        planned_flange_world_pos=None,
+    ) -> dict:
+        """Return diagnostic evidence immediately before gripper closure.
+
+        This method intentionally does *not* reject a grasp yet.  The final
+        USD mounting convention must first be verified experimentally.
+
+        It reports candidate useful-grasp-centre positions for all six local
+        flange-axis directions (+/-X, +/-Y, +/-Z).  The closest candidate to
+        the object gives us evidence about the real flange-to-finger axis in
+        the professor-provided USD model.
+        """
+        obj = np.asarray(object_world_pos, dtype=np.float64)
+        flange = np.asarray(self.get_flange_world_pos(), dtype=np.float64)
+
+        planned_flange_error = None
+        if planned_flange_world_pos is not None:
+            planned = np.asarray(planned_flange_world_pos, dtype=np.float64)
+            planned_flange_error = self._euclidean_distance(flange, planned)
+
+        axis_vectors = {
+            "+X": [1.0, 0.0, 0.0],
+            "-X": [-1.0, 0.0, 0.0],
+            "+Y": [0.0, 1.0, 0.0],
+            "-Y": [0.0, -1.0, 0.0],
+            "+Z": [0.0, 0.0, 1.0],
+            "-Z": [0.0, 0.0, -1.0],
+        }
+
+        candidate_axes = {}
+        centre_offset = float(self._flange_to_grasp_centre)
+        base_offset = float(self._flange_to_finger_base)
+        tip_offset = float(self._flange_to_fingertips)
+
+        for axis_name, axis in axis_vectors.items():
+            centre_local = [centre_offset * v for v in axis]
+            base_local = [base_offset * v for v in axis]
+            tip_local = [tip_offset * v for v in axis]
+
+            centre_world = self._transform_flange_local_point_to_world(
+                centre_local
+            )
+            finger_base_world = self._transform_flange_local_point_to_world(
+                base_local
+            )
+            fingertips_world = self._transform_flange_local_point_to_world(
+                tip_local
+            )
+
+            candidate_axes[axis_name] = {
+                "grasp_centre_world_pos": centre_world,
+                "finger_base_world_pos": finger_base_world,
+                "fingertips_world_pos": fingertips_world,
+                "grasp_centre_object_distance_m": self._euclidean_distance(
+                    centre_world, obj
+                ),
+                "grasp_centre_object_delta_m": (
+                    np.asarray(centre_world, dtype=np.float64) - obj
+                ).tolist(),
+            }
+
+        best_axis = min(
+            candidate_axes,
+            key=lambda name: candidate_axes[name][
+                "grasp_centre_object_distance_m"
+            ],
+        )
+
+        gripper_base_pos = None
+        gripper_base_mtx = self._get_gripper_base_transform()
+        if gripper_base_mtx is not None:
+            p = gripper_base_mtx.ExtractTranslation()
+            gripper_base_pos = [float(p[0]), float(p[1]), float(p[2])]
+
+        object_height = float(self._get_object_height(object_metadata))
+
+        return {
+            "mode": "diagnostic_only_no_rejection",
+            "object_world_pos": obj.tolist(),
+            "object_height_m": object_height,
+            "actual_flange_world_pos": flange.tolist(),
+            "planned_flange_world_pos": (
+                None
+                if planned_flange_world_pos is None
+                else np.asarray(
+                    planned_flange_world_pos, dtype=np.float64
+                ).tolist()
+            ),
+            "planned_flange_tracking_error_m": planned_flange_error,
+            "flange_object_delta_m": (flange - obj).tolist(),
+            "flange_object_distance_m": self._euclidean_distance(
+                flange, obj
+            ),
+            "gripper_base_world_pos": gripper_base_pos,
+            "flange_to_grasp_centre_m": centre_offset,
+            "flange_to_finger_base_m": base_offset,
+            "flange_to_fingertips_m": tip_offset,
+            "candidate_axes": candidate_axes,
+            "closest_axis_candidate": best_axis,
+            "closest_axis_distance_m": candidate_axes[best_axis][
+                "grasp_centre_object_distance_m"
+            ],
+        }
+
     def get_base_world_pos(self) -> list:
         """Return [x, y, z] world position of the UR5E base_link."""
         prim = self.stage.GetPrimAtPath(Sdf.Path(self.base_link_path))
