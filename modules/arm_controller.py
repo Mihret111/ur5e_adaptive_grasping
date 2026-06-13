@@ -777,6 +777,40 @@ class UR5EController:
             "reasons": reasons,
         }
 
+    def get_calibrated_capture_geometry_world(self) -> dict:
+        """Return world positions of the calibrated active finger geometry.
+
+        The flange-local capture direction was calibrated in simulation from
+        pre-close diagnostics.  Keeping this query in the arm controller makes
+        the executive independent of USD frame details.
+        """
+        axis_vectors = {
+            "+X": [1.0, 0.0, 0.0],
+            "-X": [-1.0, 0.0, 0.0],
+            "+Y": [0.0, 1.0, 0.0],
+            "-Y": [0.0, -1.0, 0.0],
+            "+Z": [0.0, 0.0, 1.0],
+            "-Z": [0.0, 0.0, -1.0],
+        }
+        axis = axis_vectors[self._finger_capture_axis_name]
+
+        def scaled(distance_m: float):
+            return [float(distance_m) * value for value in axis]
+
+        return {
+            "axis_local": self._finger_capture_axis_name,
+            "flange_world_pos": self.get_flange_world_pos(),
+            "grasp_centre_world_pos": self._transform_flange_local_point_to_world(
+                scaled(self._flange_to_grasp_centre)
+            ),
+            "finger_base_world_pos": self._transform_flange_local_point_to_world(
+                scaled(self._flange_to_finger_base)
+            ),
+            "fingertips_world_pos": self._transform_flange_local_point_to_world(
+                scaled(self._flange_to_fingertips)
+            ),
+        }
+
     def get_base_world_pos(self) -> list:
         """Return [x, y, z] world position of the UR5E base_link."""
         prim = self.stage.GetPrimAtPath(Sdf.Path(self.base_link_path))
@@ -1464,7 +1498,17 @@ class UR5EController:
         flange_pre    = flange_grasp.copy()          
         flange_pre[2] = flange_grasp[2] + pre_grasp_z_offset  
 
-        # ── Lift (after grasp) ────────────────────────────────
+        # ── Micro-lift (verification checkpoint after grasp) ───
+        # Keep the same XY grasp alignment and raise the flange only a small
+        # amount.  This allows the executive to verify that the object truly
+        # follows the gripper before committing to a full lift.
+        flange_micro_lift    = flange_grasp.copy()
+        flange_micro_lift[2] = (
+            flange_grasp[2]
+            + float(self.config.get("micro_lift_height_m", 0.025))
+        )
+
+        # ── Full lift (only after micro-lift validation) ───────
         flange_lift    = flange_grasp.copy()
         flange_lift[2] = (
             table_height
@@ -1495,6 +1539,7 @@ class UR5EController:
             "safe_above":         flange_safe_above,
             "pre_grasp":          flange_pre,
             "grasp":              flange_grasp,
+            "micro_lift":         flange_micro_lift,
             "lift":               flange_lift,
             "safe_retreat":       flange_safe_retreat,
             "retract":            flange_retract,
@@ -2401,10 +2446,10 @@ class UR5EController:
             "grasp",
         ]
 
-        if (
-            self.config.get("enable_micro_lift_test", False)
-            or self.config.get("enable_lift_test", False)
-        ):
+        if self.config.get("enable_micro_lift_test", False):
+            order.append("micro_lift")
+
+        if self.config.get("enable_lift_test", False):
             order.append("lift")
 
         if self.config.get("plan_retreat_during_pick", False):

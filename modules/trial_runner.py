@@ -141,6 +141,14 @@ class TrialRunner:
                         print(f"    close_success: {a['close_validation']['success']}")
                         print(f"    close_reasons: {a['close_validation']['reasons']}")
 
+                    if a.get("micro_lift_validation"):
+                        m = a["micro_lift_validation"]
+                        print(f"    micro_lift_success: {m['success']}")
+                        print(f"    micro_lift_object_dz_m: {m['object_lift_delta_z_m']}")
+                        print(f"    micro_lift_following_ratio: {m['following_ratio']}")
+                        print(f"    micro_lift_relative_drift_m: {m['relative_grasp_drift_m']}")
+                        print(f"    micro_lift_reasons: {m['reasons']}")
+
                     if a["lift_validation"]:
                         print(f"    lift_success: {a['lift_validation']['success']}")
                         print(f"    lift_reasons: {a['lift_validation']['reasons']}")

@@ -160,8 +160,21 @@ require_preclose_closest_axis_match: false
 # The axis has been calibrated, so keep the concise output by default.
 preclose_diagnostics_print_all_axes: false
 
-# Continue close-only validation before adding micro-lift.
-enable_micro_lift_test: false
+# ───────────── CURRENT MICRO-LIFT VALIDATION EXPERIMENT ─────────────
+# The pre-close gate remains active. After a successful close, lift only
+# 25 mm and verify that the object genuinely follows the gripper.
+enable_micro_lift_test: true
 enable_lift_test: false
 plan_retreat_during_pick: false
 max_grasp_attempts: 1
+
+micro_lift_height_m: 0.025
+micro_lift_duration: 2.0
+micro_lift_steps: 120
+post_micro_lift_settle_seconds: 0.4
+
+# Initial conservative acceptance thresholds for a commanded 25 mm lift.
+min_success_micro_lift_delta_m: 0.015
+min_commanded_micro_lift_delta_m: 0.015
+min_micro_lift_following_ratio: 0.60
+max_micro_lift_relative_drift_m: 0.015

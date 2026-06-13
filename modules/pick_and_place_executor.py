@@ -2,6 +2,7 @@
 
 from modules.arm_controller import UR5EController
 from modules.gripper_controller import Gripper2FG7
+from modules.micro_lift_validator import MicroLiftValidator
 import omni.kit.app
 from pxr import UsdGeom, Sdf, Usd    # import required usd modules
 
@@ -41,6 +42,7 @@ class PickAndPlaceExecutor:
             right_joint_path=right_joint,
             config=config,
         )
+        self.micro_lift_validator = MicroLiftValidator(config)
         # self.move_home_before_pick = config.get("move_home_before_pick", True)   #
         print("[PickAndPlaceExecutor] Ready.")
 
@@ -373,8 +375,10 @@ class PickAndPlaceExecutor:
                 "preclose_diagnostics": None,
                 "preclose_geometry_gate": None,
                 "close_validation": None,
+                "micro_lift_validation": None,
                 "lift_validation": None,
                 "gripper_diagnostics_after_close": None,
+                "gripper_diagnostics_after_micro_lift": None,
                 "gripper_diagnostics_after_lift": None,
                 "success": False,
                 "failure_reason": None,
@@ -717,7 +721,110 @@ class PickAndPlaceExecutor:
                     float(self.config.get("post_close_hold_seconds", 1.0))
                 )
 
-                if not self.config.get("enable_lift_test", False):
+                # ──── Micro-lift proof-of-hold checkpoint ────
+                # A partially closed gripper can report contact even after the
+                # object has slipped.  Before committing to a full lift, move
+                # only a few centimetres and verify that the object follows the
+                # calibrated grasp centre.
+                if self.config.get("enable_micro_lift_test", False):
+                    micro_lift = joints.get("micro_lift")
+                    if micro_lift is None:
+                        print("[Executor] ❌ No micro_lift waypoint available.")
+                        attempt_log["failure_reason"] = "missing_micro_lift_waypoint"
+                        trial_log["attempts"].append(attempt_log)
+                        trial_log["final_reason"] = "missing_micro_lift_waypoint"
+                        self._last_trial_log = trial_log
+                        return False
+
+                    object_before_micro = self._get_prim_world_pos(
+                        target.get("prim_path")
+                    )
+                    geometry_before_micro = (
+                        self.arm.get_calibrated_capture_geometry_world()
+                    )
+
+                    print("\n[Executor] Performing micro-lift verification checkpoint...")
+                    ok = await self.arm.move_to(
+                        micro_lift,
+                        duration=float(self.config.get("micro_lift_duration", 2.0)),
+                        steps=int(self.config.get("micro_lift_steps", 120)),
+                        check_table_collision=True,
+                        step_callback=self.gripper.update,
+                    )
+
+                    if not ok:
+                        print("[Executor] ❌ Micro-lift motion failed.")
+                        attempt_log["failure_reason"] = "micro_lift_motion_failed"
+                        trial_log["attempts"].append(attempt_log)
+                        trial_log["final_reason"] = "micro_lift_motion_failed"
+                        self._last_trial_log = trial_log
+                        return False
+
+                    await self._step_gripper_for_seconds(
+                        float(self.config.get("post_micro_lift_settle_seconds", 0.4))
+                    )
+
+                    object_after_micro = self._get_prim_world_pos(
+                        target.get("prim_path")
+                    )
+                    geometry_after_micro = (
+                        self.arm.get_calibrated_capture_geometry_world()
+                    )
+
+                    micro_validation = self.micro_lift_validator.evaluate(
+                        object_pos_before=object_before_micro,
+                        object_pos_after=object_after_micro,
+                        flange_pos_before=geometry_before_micro["flange_world_pos"],
+                        flange_pos_after=geometry_after_micro["flange_world_pos"],
+                        grasp_centre_before=geometry_before_micro["grasp_centre_world_pos"],
+                        grasp_centre_after=geometry_after_micro["grasp_centre_world_pos"],
+                        gripper_has_object=self.gripper.has_object(),
+                    )
+
+                    print("\n[Executor] Micro-lift validation:")
+                    print(micro_validation)
+                    attempt_log["micro_lift_validation"] = micro_validation
+                    attempt_log["gripper_diagnostics_after_micro_lift"] = (
+                        self.gripper.get_diagnostics()
+                    )
+
+                    if not micro_validation["success"]:
+                        print("[Executor] ❌ Micro-lift validation failed.")
+                        for reason in micro_validation["reasons"]:
+                            print(f"  - {reason}")
+                        attempt_log["failure_reason"] = "micro_lift_validation_failed"
+                        trial_log["attempts"].append(attempt_log)
+                        trial_log["final_reason"] = "micro_lift_validation_failed"
+                        self._last_trial_log = trial_log
+
+                        # Safe reactive recovery: keep hold pressure while
+                        # retreating upward, then release only at safe height.
+                        await self.arm.move_via_safe_height(
+                            safe_above,
+                            duration=float(self.config.get("retry_to_safe_duration", 4.0)),
+                            steps=int(self.config.get("retry_to_safe_steps", 240)),
+                            step_callback=self.gripper.update,
+                        )
+                        self.gripper.open()
+                        await self._step_gripper_for_seconds(
+                            float(self.config.get("post_open_settle_seconds", 0.8))
+                        )
+                        return False
+
+                    print("[Executor] ✅ Micro-lift passed: object followed gripper.")
+
+                    if not self.config.get("enable_lift_test", False):
+                        print("[Executor] Full lift disabled. Ending after validated micro-lift.")
+                        attempt_log["success"] = True
+                        trial_log["trial_success"] = True
+                        trial_log["final_reason"] = (
+                            "micro_lift_validation_passed_full_lift_disabled"
+                        )
+                        trial_log["attempts"].append(attempt_log)
+                        self._last_trial_log = trial_log
+                        return True
+
+                elif not self.config.get("enable_lift_test", False):
                     print("[Executor] Lift disabled for now. Ending after successful close validation.")
                     attempt_log["success"] = True
                     trial_log["trial_success"] = True
@@ -726,7 +833,7 @@ class PickAndPlaceExecutor:
                     self._last_trial_log = trial_log
                     return True
 
-                # ──── Perform the lift ────
+                # ──── Perform the full lift ────
                 lift = joints.get("lift")
                 if lift is None:
                     print("[Executor] ❌ No lift waypoint available.")
