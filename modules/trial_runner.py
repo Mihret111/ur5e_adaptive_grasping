@@ -2,6 +2,8 @@ from modules.scene_builder import SceneBuilder
 from modules.pick_and_place_executor import PickAndPlaceExecutor
 import os
 import json
+from modules.trial_diagnostics import json_safe
+from datetime import datetime
 
 class TrialRunner:
     def __init__(self, config, table_materials, table_slots, step_fn, step_seconds_fn):
@@ -82,10 +84,12 @@ class TrialRunner:
                 trial_dir = os.path.join(run_dir, f"trial_{i}")
                 os.makedirs(trial_dir, exist_ok=True)
 
-                log_path = os.path.join(trial_dir, "validation_log.json")
+                run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                log_path = os.path.join(trial_dir, f"validation_log_{run_stamp}.json")
+
 
                 with open(log_path, "w") as f:
-                    json.dump(trial_log, f, indent=2)
+                    json.dump(json_safe(trial_log), f, indent=2)
 
                 print(f"[TrialRunner] Validation log saved to: {log_path}")
 

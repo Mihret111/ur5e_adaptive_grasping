@@ -1,4 +1,4 @@
-"""Micro-lift grasp verification.
+"""Micro-lift grasp verification
 
 Pure evaluation logic: no Isaac-Sim dependency.  The executor provides
 measured object, flange, and calibrated grasp-centre positions before and
@@ -58,6 +58,7 @@ class MicroLiftValidator:
             "object_grasp_centre_distance_after_m": None,
             "relative_grasp_drift_m": None,
             "success": False,
+            "failure_classification": None,
             "reasons": [],
         }
 
@@ -154,4 +155,20 @@ class MicroLiftValidator:
             )
 
         result["success"] = len(result["reasons"]) == 0
+
+        if result["success"]:
+            result["failure_classification"] = None
+        elif not gripper_has_object:
+            result["failure_classification"] = "GRIPPER_LOST_OBJECT"
+        elif flange_dz < min_flange_dz:
+            result["failure_classification"] = "ARM_DID_NOT_EXECUTE_MICRO_LIFT"
+        elif object_dz < min_object_dz and relative_drift > max_relative_drift:
+            result["failure_classification"] = "NO_SECURE_CAPTURE_OBJECT_DID_NOT_FOLLOW"
+        elif following_ratio is not None and following_ratio < min_following_ratio:
+            result["failure_classification"] = "PARTIAL_SLIP_OR_WEAK_CAPTURE"
+        elif relative_drift > max_relative_drift:
+            result["failure_classification"] = "OBJECT_DRIFTED_IN_GRIPPER"
+        else:
+            result["failure_classification"] = "MICRO_LIFT_VALIDATION_FAILED_UNKNOWN"
+
         return result

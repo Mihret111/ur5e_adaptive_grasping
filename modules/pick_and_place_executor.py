@@ -3,6 +3,14 @@
 from modules.arm_controller import UR5EController
 from modules.gripper_controller import Gripper2FG7
 from modules.micro_lift_validator import MicroLiftValidator
+from modules.trial_diagnostics import (
+    compact_pick_result,
+    grip_feasibility,
+    json_safe,
+    make_event,
+    pose_snapshot,
+    selected_config_snapshot,
+)
 import omni.kit.app
 from pxr import UsdGeom, Sdf, Usd    # import required usd modules
 
@@ -310,7 +318,7 @@ class PickAndPlaceExecutor:
 
     # Method to get last trial log as .json file and write it to the output directory with a timestamp and create the dir if not exists
     def get_last_trial_log(self):
-        return getattr(self, "_last_trial_log", None)
+        return json_safe(getattr(self, "_last_trial_log", None))
         
     # implement move to pregrasp_approach position (a point above target pos with constant height of pregrasp_height)
     async def run_generic_pick(self, scene_info: dict) -> bool:
@@ -343,6 +351,7 @@ class PickAndPlaceExecutor:
         print(self.arm.get_status())
 
         trial_log = {
+            "schema_version": "b2b_validation_v2_analysis",
             "target": {
                 "label": target.get("label", "unknown"),
                 "shape": target.get("shape", "unknown"),
@@ -351,6 +360,17 @@ class PickAndPlaceExecutor:
                 "grip_dim_mm": target.get("grip_dim_mm", "unknown"),
                 "prim_path": target.get("prim_path", "unknown"),
             },
+            "target_full": json_safe(target),
+            "target_feasibility": grip_feasibility(target, self.config),
+            "table_info": json_safe(table_info),
+            "config_snapshot": selected_config_snapshot(self.config),
+            "events": [
+                make_event(
+                    "trial_log_created",
+                    target_label=target.get("label", "unknown"),
+                    target_shape=target.get("shape", "unknown"),
+                )
+            ],
             "attempts": [],
             "trial_success": False,
             "final_reason": None,
@@ -367,11 +387,14 @@ class PickAndPlaceExecutor:
             print(f"\n[Executor] Grasp attempt {attempt + 1}/{max_attempts}")
             attempt_log = {
                 "attempt": attempt + 1,
-                "stored_object_pos": target.get("world_pos"),
+                "stored_object_pos": json_safe(target.get("world_pos")),
                 "actual_object_pos": None,
+                "target_feasibility": grip_feasibility(target, self.config),
                 "safe_above_ok": False,
                 "pre_grasp_ok": False,
                 "grasp_ok": False,
+                "planning_initial": None,
+                "planning_replanned_after_safe_above": None,
                 "preclose_diagnostics": None,
                 "preclose_geometry_gate": None,
                 "close_validation": None,
@@ -380,6 +403,8 @@ class PickAndPlaceExecutor:
                 "gripper_diagnostics_after_close": None,
                 "gripper_diagnostics_after_micro_lift": None,
                 "gripper_diagnostics_after_lift": None,
+                "snapshots": {},
+                "events": [make_event("attempt_started", attempt=attempt + 1)],
                 "success": False,
                 "failure_reason": None,
             }
@@ -388,7 +413,10 @@ class PickAndPlaceExecutor:
             if actual_object_pos is None:
                 actual_object_pos = target["world_pos"]
 
-            attempt_log["actual_object_pos"] = actual_object_pos
+            attempt_log["actual_object_pos"] = json_safe(actual_object_pos)
+            attempt_log["snapshots"]["before_planning"] = pose_snapshot(
+                self, target, "before_planning"
+            )
 
             print("[Executor] Stored object pos:", target["world_pos"])
             print("[Executor] Actual object pos:", actual_object_pos)
@@ -410,6 +438,16 @@ class PickAndPlaceExecutor:
 
             # Added a break with a False return if the IK fails to produce a valid plan.
             # This ensures that the robot does not attempt to execute a failed plan.
+            attempt_log["planning_initial"] = compact_pick_result(pick_result)
+            attempt_log["events"].append(
+                make_event(
+                    "planning_initial_done",
+                    planning_failed=pick_result.get("planning_failed", False),
+                    target_force_n=pick_result.get("target_force_n"),
+                    waypoints=list((pick_result.get("joints", {}) or {}).keys()),
+                )
+            )
+
             if pick_result.get("planning_failed", False):
                 print("[Executor] ❌ Planner rejected the grasp before execution.")
                 print("[Executor] IK diagnostics:")
@@ -454,13 +492,20 @@ class PickAndPlaceExecutor:
 
             print("[Executor] ✅ Reached safe_above.")
             attempt_log["safe_above_ok"] = True
+            attempt_log["snapshots"]["after_safe_above"] = pose_snapshot(
+                self, target, "after_safe_above"
+            )
+            attempt_log["events"].append(make_event("safe_above_reached"))
 
             ## read actual object pose again 
             actual_object_pos = self._get_prim_world_pos(target.get("prim_path"))
             if actual_object_pos is None:
                 actual_object_pos = target["world_pos"]
             
-            attempt_log["actual_object_pos"] = actual_object_pos
+            attempt_log["actual_object_pos"] = json_safe(actual_object_pos)
+            attempt_log["snapshots"]["after_safe_above_object_refresh"] = pose_snapshot(
+                self, target, "after_safe_above_object_refresh"
+            )
             
             pick_result = self.arm.compute_pick_joints(
                 object_world_pos=actual_object_pos,    # pass actual_object_pos instead of the stale object_world_pos in target to make it robust to small errors in target position during runtime    
@@ -469,6 +514,18 @@ class PickAndPlaceExecutor:
                 object_metadata=target,
                 prim_path=target.get("prim_path"),
             )
+            attempt_log["planning_replanned_after_safe_above"] = compact_pick_result(
+                pick_result
+            )
+            attempt_log["events"].append(
+                make_event(
+                    "planning_replanned_after_safe_above_done",
+                    planning_failed=pick_result.get("planning_failed", False),
+                    target_force_n=pick_result.get("target_force_n"),
+                    waypoints=list((pick_result.get("joints", {}) or {}).keys()),
+                )
+            )
+
             if pick_result.get("planning_failed", False):
                 print("[Executor] ❌ Replanning from safe_above was rejected.")
                 print("[Executor] IK diagnostics:")
@@ -524,6 +581,10 @@ class PickAndPlaceExecutor:
 
             print("[Executor] ✅ Reached grasp pose.")
             attempt_log["grasp_ok"] = True
+            attempt_log["snapshots"]["at_grasp_before_preclose"] = pose_snapshot(
+                self, target, "at_grasp_before_preclose"
+            )
+            attempt_log["events"].append(make_event("grasp_pose_reached"))
 
             # ──── Diagnostic-only snapshot before gripper closure ────
             # We do not reject a grasp yet.  First verify the professor USD's
@@ -541,7 +602,7 @@ class PickAndPlaceExecutor:
                             pick_result.get("flange_targets", {}).get("grasp")
                         ),
                     )
-                    attempt_log["preclose_diagnostics"] = preclose_diag
+                    attempt_log["preclose_diagnostics"] = json_safe(preclose_diag)
 
                     print("\n[Executor] Pre-close geometry diagnostics (no rejection):")
                     print(
@@ -664,8 +725,20 @@ class PickAndPlaceExecutor:
 
             print("\n[Executor] Close validation:")
             print(close_validation)
-            attempt_log["close_validation"] = close_validation
-            attempt_log["gripper_diagnostics_after_close"] = self.gripper.get_diagnostics()
+            attempt_log["close_validation"] = json_safe(close_validation)
+            attempt_log["gripper_diagnostics_after_close"] = json_safe(
+                self.gripper.get_diagnostics()
+            )
+            attempt_log["snapshots"]["after_close_validation"] = pose_snapshot(
+                self, target, "after_close_validation"
+            )
+            attempt_log["events"].append(
+                make_event(
+                    "close_validation_done",
+                    success=close_validation.get("success"),
+                    reasons=close_validation.get("reasons", []),
+                )
+            )
 
             # ──── Handle close validation failure: retry or fail ────
             if not close_validation["success"]:
@@ -783,9 +856,19 @@ class PickAndPlaceExecutor:
 
                     print("\n[Executor] Micro-lift validation:")
                     print(micro_validation)
-                    attempt_log["micro_lift_validation"] = micro_validation
-                    attempt_log["gripper_diagnostics_after_micro_lift"] = (
+                    attempt_log["micro_lift_validation"] = json_safe(micro_validation)
+                    attempt_log["gripper_diagnostics_after_micro_lift"] = json_safe(
                         self.gripper.get_diagnostics()
+                    )
+                    attempt_log["snapshots"]["after_micro_lift_validation"] = pose_snapshot(
+                        self, target, "after_micro_lift_validation"
+                    )
+                    attempt_log["events"].append(
+                        make_event(
+                            "micro_lift_validation_done",
+                            success=micro_validation.get("success"),
+                            reasons=micro_validation.get("reasons", []),
+                        )
                     )
 
                     if not micro_validation["success"]:
