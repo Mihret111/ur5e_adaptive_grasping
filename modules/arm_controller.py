@@ -663,119 +663,143 @@ class UR5EController:
             ],
         }
 
-    def evaluate_preclose_geometry_gate(self, diagnostics: dict) -> dict:
-        """Evaluate whether closing the gripper is geometrically plausible.
+def evaluate_preclose_geometry_gate(self, diagnostics: dict) -> dict:
+    """Evaluate whether closing the gripper is geometrically plausible.
 
-        Uses the calibrated flange-local finger axis rather than the
-        closest of six diagnostic hypotheses.  It checks three quantities:
+    Uses the calibrated flange-local finger axis rather than the
+    closest of six diagnostic hypotheses.
 
-          1. Cartesian flange tracking error;
-          2. horizontal grasp-centre alignment with the object;
-          3. vertical overlap between the object and the active finger span.
+    Checks:
+      1. flange tracking error;
+      2. horizontal grasp-centre alignment;
+      3. vertical overlap between object and active finger span.
 
-        It intentionally does not require the grasp centre to coincide with
-        the object's 3-D geometric centre.  A valid grasp may just engage an upper
-        portion of a tall object
-        """
-        axis_name = self._finger_capture_axis_name
-        axis_info = diagnostics["candidate_axes"][axis_name]
+    The vertical-overlap threshold is object-aware:
+    for normal objects we require an absolute minimum overlap;
+    for very thin objects we require a percentage of the object height.
+    """
+    axis_name = self._finger_capture_axis_name
+    axis_info = diagnostics["candidate_axes"][axis_name]
 
-        obj = np.asarray(
-            diagnostics["object_world_pos"], dtype=np.float64
+    obj = np.asarray(
+        diagnostics["object_world_pos"], dtype=np.float64
+    )
+    centre = np.asarray(
+        axis_info["grasp_centre_world_pos"], dtype=np.float64
+    )
+    finger_base = np.asarray(
+        axis_info["finger_base_world_pos"], dtype=np.float64
+    )
+    fingertips = np.asarray(
+        axis_info["fingertips_world_pos"], dtype=np.float64
+    )
+
+    object_height = float(diagnostics["object_height_m"])
+    object_low_z = float(obj[2] - object_height / 2.0)
+    object_high_z = float(obj[2] + object_height / 2.0)
+
+    capture_low_z = float(min(finger_base[2], fingertips[2]))
+    capture_high_z = float(max(finger_base[2], fingertips[2]))
+
+    vertical_overlap = max(
+        0.0,
+        min(object_high_z, capture_high_z)
+        - max(object_low_z, capture_low_z),
+    )
+
+    grasp_centre_xy_error = float(np.linalg.norm(centre[:2] - obj[:2]))
+    tracking_error = diagnostics.get("planned_flange_tracking_error_m")
+
+    max_xy_error = float(
+        self.config.get("max_preclose_grasp_centre_xy_error_m", 0.015)
+    )
+
+    absolute_min_overlap = float(
+        self.config.get("min_preclose_vertical_overlap_m", 0.010)
+    )
+
+    relative_overlap_fraction = float(
+        self.config.get("min_preclose_overlap_fraction", 0.70)
+    )
+
+    required_vertical_overlap = min(
+        absolute_min_overlap,
+        relative_overlap_fraction * object_height,
+    )
+
+    max_tracking_error = float(
+        self.config.get("max_preclose_flange_tracking_error_m", 0.010)
+    )
+
+    reasons = []
+
+    if tracking_error is None:
+        reasons.append("planned flange tracking error unavailable")
+    elif float(tracking_error) > max_tracking_error:
+        reasons.append(
+            "flange tracking error too large: "
+            f"{float(tracking_error):.4f} m > "
+            f"{max_tracking_error:.4f} m"
         )
-        centre = np.asarray(
-            axis_info["grasp_centre_world_pos"], dtype=np.float64
-        )
-        finger_base = np.asarray(
-            axis_info["finger_base_world_pos"], dtype=np.float64
-        )
-        fingertips = np.asarray(
-            axis_info["fingertips_world_pos"], dtype=np.float64
+
+    if grasp_centre_xy_error > max_xy_error:
+        reasons.append(
+            "grasp-centre XY error too large: "
+            f"{grasp_centre_xy_error:.4f} m > "
+            f"{max_xy_error:.4f} m"
         )
 
-        object_height = float(diagnostics["object_height_m"])
-        object_low_z = float(obj[2] - object_height / 2.0)
-        object_high_z = float(obj[2] + object_height / 2.0)
-
-        capture_low_z = float(min(finger_base[2], fingertips[2]))
-        capture_high_z = float(max(finger_base[2], fingertips[2]))
-
-        vertical_overlap = max(
-            0.0,
-            min(object_high_z, capture_high_z)
-            - max(object_low_z, capture_low_z),
+    if vertical_overlap < required_vertical_overlap:
+        reasons.append(
+            "vertical finger/object overlap too small: "
+            f"{vertical_overlap:.4f} m < {required_vertical_overlap:.4f} m "
+            f"(object_height={object_height:.4f} m)"
         )
 
-        grasp_centre_xy_error = float(np.linalg.norm(centre[:2] - obj[:2]))
-        tracking_error = diagnostics.get("planned_flange_tracking_error_m")
+    require_axis_match = bool(
+        self.config.get("require_preclose_closest_axis_match", False)
+    )
 
-        max_xy_error = float(
-            self.config.get("max_preclose_grasp_centre_xy_error_m", 0.015)
+    closest_axis = diagnostics.get("closest_axis_candidate")
+    axis_match = closest_axis == axis_name
+
+    if require_axis_match and not axis_match:
+        reasons.append(
+            "closest diagnostic axis differs from calibrated finger axis: "
+            f"closest={closest_axis}, calibrated={axis_name}"
         )
-        min_overlap = float(
-            self.config.get("min_preclose_vertical_overlap_m", 0.010)
-        )
-        max_tracking_error = float(
-            self.config.get("max_preclose_flange_tracking_error_m", 0.010)
-        )
 
-        reasons = []
+    return {
+        "mode": "calibrated_preclose_gate",
+        "calibrated_finger_axis_local": axis_name,
+        "closest_diagnostic_axis": closest_axis,
+        "axis_match": axis_match,
 
-        if tracking_error is None:
-            reasons.append("planned flange tracking error unavailable")
-        elif float(tracking_error) > max_tracking_error:
-            reasons.append(
-                "flange tracking error too large: "
-                f"{float(tracking_error):.4f} m > "
-                f"{max_tracking_error:.4f} m"
-            )
+        "grasp_centre_world_pos": centre.tolist(),
+        "finger_base_world_pos": finger_base.tolist(),
+        "fingertips_world_pos": fingertips.tolist(),
+        "object_world_pos": obj.tolist(),
 
-        if grasp_centre_xy_error > max_xy_error:
-            reasons.append(
-                "grasp-centre XY error too large: "
-                f"{grasp_centre_xy_error:.4f} m > "
-                f"{max_xy_error:.4f} m"
-            )
+        "object_height_m": object_height,
+        "object_low_z": object_low_z,
+        "object_high_z": object_high_z,
+        "capture_low_z": capture_low_z,
+        "capture_high_z": capture_high_z,
 
-        if vertical_overlap < min_overlap:
-            reasons.append(
-                "insufficient finger/object vertical overlap: "
-                f"{vertical_overlap:.4f} m < {min_overlap:.4f} m"
-            )
+        "grasp_centre_xy_error_m": grasp_centre_xy_error,
+        "vertical_overlap_m": vertical_overlap,
+        "required_vertical_overlap_m": required_vertical_overlap,
 
-        require_axis_match = bool(
-            self.config.get("require_preclose_closest_axis_match", False)
-        )
-        closest_axis = diagnostics.get("closest_axis_candidate")
-        axis_match = closest_axis == axis_name
-        if require_axis_match and not axis_match:
-            reasons.append(
-                "closest diagnostic axis differs from calibrated finger axis: "
-                f"closest={closest_axis}, calibrated={axis_name}"
-            )
+        "planned_flange_tracking_error_m": tracking_error,
 
-        return {
-            "mode": "calibrated_preclose_gate",
-            "calibrated_finger_axis_local": axis_name,
-            "closest_diagnostic_axis": closest_axis,
-            "axis_match": axis_match,
-            "grasp_centre_world_pos": centre.tolist(),
-            "finger_base_world_pos": finger_base.tolist(),
-            "fingertips_world_pos": fingertips.tolist(),
-            "object_world_pos": obj.tolist(),
-            "object_low_z": object_low_z,
-            "object_high_z": object_high_z,
-            "capture_low_z": capture_low_z,
-            "capture_high_z": capture_high_z,
-            "grasp_centre_xy_error_m": grasp_centre_xy_error,
-            "vertical_overlap_m": vertical_overlap,
-            "planned_flange_tracking_error_m": tracking_error,
-            "max_preclose_grasp_centre_xy_error_m": max_xy_error,
-            "min_preclose_vertical_overlap_m": min_overlap,
-            "max_preclose_flange_tracking_error_m": max_tracking_error,
-            "geometry_ok": len(reasons) == 0,
-            "reasons": reasons,
-        }
+        "max_preclose_grasp_centre_xy_error_m": max_xy_error,
+        "min_preclose_vertical_overlap_m": absolute_min_overlap,
+        "min_preclose_overlap_fraction": relative_overlap_fraction,
+        "max_preclose_flange_tracking_error_m": max_tracking_error,
+
+        "geometry_ok": len(reasons) == 0,
+        "reasons": reasons,
+    }
 
     def get_calibrated_capture_geometry_world(self) -> dict:
         """Return world positions of the calibrated active finger geometry.

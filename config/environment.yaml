@@ -152,7 +152,9 @@ enable_preclose_geometry_gate: true
 # Initial conservative thresholds.  Tune empirically after collecting a batch.
 max_preclose_grasp_centre_xy_error_m: 0.015
 min_preclose_vertical_overlap_m: 0.010
+min_preclose_overlap_fraction: 0.70
 max_preclose_flange_tracking_error_m: 0.010
+robust_grip_margin_m: 0.003  #TODO justify this value based on gripper spec
 
 # Keep as a diagnostic warning initially; do not reject solely on axis mismatch.
 require_preclose_closest_axis_match: false

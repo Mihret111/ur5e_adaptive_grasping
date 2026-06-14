@@ -119,30 +119,123 @@ def _shape_grip_dimension_m(target: dict) -> Optional[float]:
         if target.get("radius") is not None:
             return 2.0 * float(target.get("radius"))
     return None
+# check feasibility of gripper with margin
+def classify_grip_feasibility(
+    grip_dim_m: float,
+    grip_min_m: float,
+    grip_max_m: float,
+    margin_m: float = 0.003,
+) -> dict:
+    reasons = []
 
+    if grip_dim_m < grip_min_m:
+        return {
+            "class": "infeasible_too_small",
+            "within_hard_range": False,
+            "within_robust_range": False,
+            "margin_to_min_m": grip_dim_m - grip_min_m,
+            "margin_to_max_m": grip_max_m - grip_dim_m,
+            "reasons": [
+                f"grip dimension {grip_dim_m:.4f} m below minimum {grip_min_m:.4f} m"
+            ],
+        }
 
+    if grip_dim_m > grip_max_m:
+        return {
+            "class": "infeasible_too_large",
+            "within_hard_range": False,
+            "within_robust_range": False,
+            "margin_to_min_m": grip_dim_m - grip_min_m,
+            "margin_to_max_m": grip_max_m - grip_dim_m,
+            "reasons": [
+                f"grip dimension {grip_dim_m:.4f} m above maximum {grip_max_m:.4f} m"
+            ],
+        }
+
+    margin_to_min = grip_dim_m - grip_min_m
+    margin_to_max = grip_max_m - grip_dim_m
+
+    if margin_to_min < margin_m:
+        reasons.append(
+            f"grip dimension only {margin_to_min:.4f} m above lower limit"
+        )
+
+    if margin_to_max < margin_m:
+        reasons.append(
+            f"grip dimension only {margin_to_max:.4f} m below upper limit"
+        )
+
+    if reasons:
+        cls = "marginal"
+        robust = False
+    else:
+        cls = "robust"
+        robust = True
+
+    return {
+        "class": cls,
+        "within_hard_range": True,
+        "within_robust_range": robust,
+        "margin_to_min_m": margin_to_min,
+        "margin_to_max_m": margin_to_max,
+        "reasons": reasons,
+    }
+
+# grip feasibility of object in terms of dimension 
 def grip_feasibility(target: dict, config: dict) -> Dict[str, Any]:
-    """Check whether the object span is inside the configured 2FG7 grip range."""
+    """Check whether the object span is inside the configured 2FG7 grip range.
+
+    This returns both:
+      - hard feasibility: inside physical configured range;
+      - robust feasibility: comfortably away from range limits.
+    """
     grip_mode = config.get("grip_mode", "outwards")
     grip_cfg = config.get(f"{grip_mode}_grip", {})
+
     grip_min = float(grip_cfg.get("grip_range_min", 0.035))
     grip_max = float(grip_cfg.get("grip_range_max", 0.073))
+
     dim = _shape_grip_dimension_m(target)
 
-    reasons = []
-    within = None
+    robust_margin = float(
+        config.get("robust_grip_margin_m", 0.003)
+    )
+
     if dim is None:
-        reasons.append("object grip dimension unavailable")
-    else:
-        within = grip_min <= dim <= grip_max
-        if dim < grip_min:
-            reasons.append(
-                f"object grip dimension {dim:.4f} m below gripper minimum {grip_min:.4f} m"
-            )
-        if dim > grip_max:
-            reasons.append(
-                f"object grip dimension {dim:.4f} m above gripper maximum {grip_max:.4f} m"
-            )
+        return json_safe(
+            {
+                "grip_mode": grip_mode,
+                "grip_range_min_m": grip_min,
+                "grip_range_max_m": grip_max,
+                "estimated_object_grip_dim_m": None,
+                "estimated_object_grip_dim_mm": None,
+
+                "within_configured_range": None,
+                "within_hard_range": None,
+                "within_robust_range": None,
+                "grip_feasibility_class": "unknown",
+
+                "margin_to_min_m": None,
+                "margin_to_max_m": None,
+                "grip_margin_to_min_m": None,
+                "grip_margin_to_max_m": None,
+
+                "robust_grip_margin_m": robust_margin,
+                "reasons": ["object grip dimension unavailable"],
+                "robust_feasibility_reasons": [
+                    "object grip dimension unavailable"
+                ],
+            }
+        )
+
+    classification = classify_grip_feasibility(
+        grip_dim_m=dim,
+        grip_min_m=grip_min,
+        grip_max_m=grip_max,
+        margin_m=robust_margin,
+    )
+
+    within_hard = bool(classification["within_hard_range"])
 
     return json_safe(
         {
@@ -150,15 +243,26 @@ def grip_feasibility(target: dict, config: dict) -> Dict[str, Any]:
             "grip_range_min_m": grip_min,
             "grip_range_max_m": grip_max,
             "estimated_object_grip_dim_m": dim,
-            "estimated_object_grip_dim_mm": None if dim is None else dim * 1000.0,
-            "within_configured_range": within,
-            "margin_to_min_m": None if dim is None else dim - grip_min,
-            "margin_to_max_m": None if dim is None else grip_max - dim,
-            "reasons": reasons,
+            "estimated_object_grip_dim_mm": dim * 1000.0,
+
+            # Backward-compatible field used by previous logs.
+            "within_configured_range": within_hard,
+
+            # New richer fields.
+            "within_hard_range": classification["within_hard_range"],
+            "within_robust_range": classification["within_robust_range"],
+            "grip_feasibility_class": classification["class"],
+
+            "margin_to_min_m": classification["margin_to_min_m"],
+            "margin_to_max_m": classification["margin_to_max_m"],
+            "grip_margin_to_min_m": classification["margin_to_min_m"],
+            "grip_margin_to_max_m": classification["margin_to_max_m"],
+
+            "robust_grip_margin_m": robust_margin,
+            "reasons": classification["reasons"],
+            "robust_feasibility_reasons": classification["reasons"],
         }
     )
-
-
 def compact_pick_result(pick_result: Optional[dict]) -> Optional[Dict[str, Any]]:
     """Store only the analysis-relevant parts of a pick_result."""
     if not pick_result:
@@ -217,3 +321,4 @@ def pose_snapshot(executor: Any, target: dict, stage: str) -> Dict[str, Any]:
             "gripper_diagnostics": gripper_diag,
         }
     )
+
