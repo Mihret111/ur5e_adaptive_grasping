@@ -72,7 +72,18 @@ def selected_config_snapshot(config: dict) -> Dict[str, Any]:
         "max_micro_lift_relative_drift_m",
         "max_preclose_grasp_centre_xy_error_m",
         "min_preclose_vertical_overlap_m",
+        "min_preclose_overlap_fraction",
         "max_preclose_flange_tracking_error_m",
+        "robust_grip_margin_m",
+        "retry_close_fail_grasp_z_delta_m",
+        "retry_no_follow_grasp_z_delta_m",
+        "retry_no_follow_force_scale",
+        "retry_no_follow_hold_extra_s",
+        "retry_no_follow_micro_lift_speed_scale",
+        "retry_partial_slip_grasp_z_delta_m",
+        "retry_partial_slip_force_scale",
+        "retry_partial_slip_hold_extra_s",
+        "retry_partial_slip_micro_lift_speed_scale",
         "min_grip_force",
         "max_grip_force",
         "force_safety_factor",
@@ -119,6 +130,138 @@ def _shape_grip_dimension_m(target: dict) -> Optional[float]:
         if target.get("radius") is not None:
             return 2.0 * float(target.get("radius"))
     return None
+
+
+def grip_feasibility(target: dict, config: dict) -> Dict[str, Any]:
+    """Check whether the object span is inside the configured 2FG7 grip range.
+
+    Returns both:
+      - hard feasibility: inside the configured physical range;
+      - robust feasibility: comfortably away from the limits.
+    """
+    grip_mode = config.get("grip_mode", "outwards")
+    grip_cfg = config.get(f"{grip_mode}_grip", {})
+
+    grip_min = float(grip_cfg.get("grip_range_min", 0.035))
+    grip_max = float(grip_cfg.get("grip_range_max", 0.073))
+    dim = _shape_grip_dimension_m(target)
+
+    robust_margin = float(config.get("robust_grip_margin_m", 0.003))
+
+    if dim is None:
+        return json_safe(
+            {
+                "grip_mode": grip_mode,
+                "grip_range_min_m": grip_min,
+                "grip_range_max_m": grip_max,
+                "estimated_object_grip_dim_m": None,
+                "estimated_object_grip_dim_mm": None,
+                "within_configured_range": None,
+                "within_hard_range": None,
+                "within_robust_range": None,
+                "grip_feasibility_class": "unknown",
+                "margin_to_min_m": None,
+                "margin_to_max_m": None,
+                "grip_margin_to_min_m": None,
+                "grip_margin_to_max_m": None,
+                "robust_grip_margin_m": robust_margin,
+                "reasons": ["object grip dimension unavailable"],
+                "robust_feasibility_reasons": [
+                    "object grip dimension unavailable"
+                ],
+            }
+        )
+
+    classification = classify_grip_feasibility(
+        grip_dim_m=dim,
+        grip_min_m=grip_min,
+        grip_max_m=grip_max,
+        margin_m=robust_margin,
+    )
+
+    within_hard = bool(classification["within_hard_range"])
+
+    return json_safe(
+        {
+            "grip_mode": grip_mode,
+            "grip_range_min_m": grip_min,
+            "grip_range_max_m": grip_max,
+            "estimated_object_grip_dim_m": dim,
+            "estimated_object_grip_dim_mm": dim * 1000.0,
+            "within_configured_range": within_hard,
+            "within_hard_range": classification["within_hard_range"],
+            "within_robust_range": classification["within_robust_range"],
+            "grip_feasibility_class": classification["class"],
+            "margin_to_min_m": classification["margin_to_min_m"],
+            "margin_to_max_m": classification["margin_to_max_m"],
+            "grip_margin_to_min_m": classification["margin_to_min_m"],
+            "grip_margin_to_max_m": classification["margin_to_max_m"],
+            "robust_grip_margin_m": robust_margin,
+            "reasons": classification["reasons"],
+            "robust_feasibility_reasons": classification["reasons"],
+        }
+    )
+
+
+def compact_pick_result(pick_result: Optional[dict]) -> Optional[Dict[str, Any]]:
+    """Store only the analysis-relevant parts of a pick_result."""
+    if not pick_result:
+        return None
+    joints = pick_result.get("joints", {}) or {}
+    flange_targets = pick_result.get("flange_targets", {}) or {}
+    return json_safe(
+        {
+            "planning_failed": pick_result.get("planning_failed", False),
+            "target_force_n": pick_result.get("target_force_n"),
+            "grasp_strategy": pick_result.get("grasp_strategy"),
+            "object_height": pick_result.get("object_height"),
+            "height_info": pick_result.get("height_info"),
+            "ik_meta": pick_result.get("ik_meta"),
+            "waypoint_names": list(joints.keys()),
+            "flange_targets": flange_targets,
+            "joint_targets_deg": joints,
+        }
+    )
+
+
+def pose_snapshot(executor: Any, target: dict, stage: str) -> Dict[str, Any]:
+    """Capture a compact state snapshot for diagnosis."""
+    prim_path = target.get("prim_path") if target else None
+    object_pos = None
+    try:
+        object_pos = executor._get_prim_world_pos(prim_path)
+    except Exception as e:
+        object_pos = f"unavailable: {e}"
+
+    capture = None
+    try:
+        capture = executor.arm.get_calibrated_capture_geometry_world()
+    except Exception as e:
+        capture = {"error": str(e)}
+
+    arm_status = None
+    try:
+        arm_status = executor.arm.get_status()
+    except Exception as e:
+        arm_status = {"error": str(e)}
+
+    gripper_diag = None
+    try:
+        gripper_diag = executor.gripper.get_diagnostics()
+    except Exception as e:
+        gripper_diag = {"error": str(e)}
+
+    return json_safe(
+        {
+            "stage": stage,
+            "t_unix": time.time(),
+            "object_world_pos": object_pos,
+            "capture_geometry": capture,
+            "arm_status": arm_status,
+            "gripper_diagnostics": gripper_diag,
+        }
+    )
+
 # check feasibility of gripper with margin
 def classify_grip_feasibility(
     grip_dim_m: float,
@@ -180,145 +323,3 @@ def classify_grip_feasibility(
         "margin_to_max_m": margin_to_max,
         "reasons": reasons,
     }
-
-# grip feasibility of object in terms of dimension 
-def grip_feasibility(target: dict, config: dict) -> Dict[str, Any]:
-    """Check whether the object span is inside the configured 2FG7 grip range.
-
-    This returns both:
-      - hard feasibility: inside physical configured range;
-      - robust feasibility: comfortably away from range limits.
-    """
-    grip_mode = config.get("grip_mode", "outwards")
-    grip_cfg = config.get(f"{grip_mode}_grip", {})
-
-    grip_min = float(grip_cfg.get("grip_range_min", 0.035))
-    grip_max = float(grip_cfg.get("grip_range_max", 0.073))
-
-    dim = _shape_grip_dimension_m(target)
-
-    robust_margin = float(
-        config.get("robust_grip_margin_m", 0.003)
-    )
-
-    if dim is None:
-        return json_safe(
-            {
-                "grip_mode": grip_mode,
-                "grip_range_min_m": grip_min,
-                "grip_range_max_m": grip_max,
-                "estimated_object_grip_dim_m": None,
-                "estimated_object_grip_dim_mm": None,
-
-                "within_configured_range": None,
-                "within_hard_range": None,
-                "within_robust_range": None,
-                "grip_feasibility_class": "unknown",
-
-                "margin_to_min_m": None,
-                "margin_to_max_m": None,
-                "grip_margin_to_min_m": None,
-                "grip_margin_to_max_m": None,
-
-                "robust_grip_margin_m": robust_margin,
-                "reasons": ["object grip dimension unavailable"],
-                "robust_feasibility_reasons": [
-                    "object grip dimension unavailable"
-                ],
-            }
-        )
-
-    classification = classify_grip_feasibility(
-        grip_dim_m=dim,
-        grip_min_m=grip_min,
-        grip_max_m=grip_max,
-        margin_m=robust_margin,
-    )
-
-    within_hard = bool(classification["within_hard_range"])
-
-    return json_safe(
-        {
-            "grip_mode": grip_mode,
-            "grip_range_min_m": grip_min,
-            "grip_range_max_m": grip_max,
-            "estimated_object_grip_dim_m": dim,
-            "estimated_object_grip_dim_mm": dim * 1000.0,
-
-            # Backward-compatible field used by previous logs.
-            "within_configured_range": within_hard,
-
-            # New richer fields.
-            "within_hard_range": classification["within_hard_range"],
-            "within_robust_range": classification["within_robust_range"],
-            "grip_feasibility_class": classification["class"],
-
-            "margin_to_min_m": classification["margin_to_min_m"],
-            "margin_to_max_m": classification["margin_to_max_m"],
-            "grip_margin_to_min_m": classification["margin_to_min_m"],
-            "grip_margin_to_max_m": classification["margin_to_max_m"],
-
-            "robust_grip_margin_m": robust_margin,
-            "reasons": classification["reasons"],
-            "robust_feasibility_reasons": classification["reasons"],
-        }
-    )
-def compact_pick_result(pick_result: Optional[dict]) -> Optional[Dict[str, Any]]:
-    """Store only the analysis-relevant parts of a pick_result."""
-    if not pick_result:
-        return None
-    joints = pick_result.get("joints", {}) or {}
-    flange_targets = pick_result.get("flange_targets", {}) or {}
-    return json_safe(
-        {
-            "planning_failed": pick_result.get("planning_failed", False),
-            "target_force_n": pick_result.get("target_force_n"),
-            "grasp_strategy": pick_result.get("grasp_strategy"),
-            "object_height": pick_result.get("object_height"),
-            "height_info": pick_result.get("height_info"),
-            "ik_meta": pick_result.get("ik_meta"),
-            "waypoint_names": list(joints.keys()),
-            "flange_targets": flange_targets,
-            "joint_targets_deg": joints,
-        }
-    )
-
-
-def pose_snapshot(executor: Any, target: dict, stage: str) -> Dict[str, Any]:
-    """Capture a compact state snapshot for diagnosis."""
-    prim_path = target.get("prim_path") if target else None
-    object_pos = None
-    try:
-        object_pos = executor._get_prim_world_pos(prim_path)
-    except Exception as e:
-        object_pos = f"unavailable: {e}"
-
-    capture = None
-    try:
-        capture = executor.arm.get_calibrated_capture_geometry_world()
-    except Exception as e:
-        capture = {"error": str(e)}
-
-    arm_status = None
-    try:
-        arm_status = executor.arm.get_status()
-    except Exception as e:
-        arm_status = {"error": str(e)}
-
-    gripper_diag = None
-    try:
-        gripper_diag = executor.gripper.get_diagnostics()
-    except Exception as e:
-        gripper_diag = {"error": str(e)}
-
-    return json_safe(
-        {
-            "stage": stage,
-            "t_unix": time.time(),
-            "object_world_pos": object_pos,
-            "capture_geometry": capture,
-            "arm_status": arm_status,
-            "gripper_diagnostics": gripper_diag,
-        }
-    )
-

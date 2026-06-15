@@ -3,6 +3,7 @@
 from modules.arm_controller import UR5EController
 from modules.gripper_controller import Gripper2FG7
 from modules.micro_lift_validator import MicroLiftValidator
+from modules.retry_policy import RetryPolicy
 from modules.trial_diagnostics import (
     compact_pick_result,
     grip_feasibility,
@@ -51,6 +52,7 @@ class PickAndPlaceExecutor:
             config=config,
         )
         self.micro_lift_validator = MicroLiftValidator(config)
+        self.retry_policy = RetryPolicy(config)
         # self.move_home_before_pick = config.get("move_home_before_pick", True)   #
         print("[PickAndPlaceExecutor] Ready.")
 
@@ -319,7 +321,114 @@ class PickAndPlaceExecutor:
     # Method to get last trial log as .json file and write it to the output directory with a timestamp and create the dir if not exists
     def get_last_trial_log(self):
         return json_safe(getattr(self, "_last_trial_log", None))
-        
+    
+    def _apply_retry_adjustments_to_pick_result(
+        self,
+        pick_result: dict,
+        adjustments: dict,
+    ) -> dict:
+        """Apply retry-time command adjustments to a planned pick result.
+
+        The arm planner computes the geometric plan.
+        RetryPolicy may then scale the commanded grasp force for the next attempt.
+
+        Geometry adjustment, such as grasp_z_delta_m, is handled separately
+        inside arm_controller through set_runtime_grasp_z_delta().
+        """
+        if not pick_result:
+            return pick_result
+
+        adjustments = adjustments or {}
+
+        force_scale = float(adjustments.get("force_scale", 1.0))
+
+        old_force = float(pick_result.get("target_force_n", 80.0))
+        min_force = float(self.config.get("min_grip_force", 40.0))
+        max_force = float(self.config.get("max_grip_force", 140.0))
+
+        new_force = max(
+            min_force,
+            min(max_force, old_force * force_scale),
+        )
+
+        pick_result["target_force_n_before_retry_scale"] = old_force
+        pick_result["retry_force_scale"] = force_scale
+        pick_result["target_force_n"] = new_force
+
+        return pick_result
+
+    async def _recover_to_safe_for_retry(
+        self,
+        pre_grasp,
+        safe_above,
+        from_micro_lift: bool = False,
+    ):
+        """Return to a safe configuration before another grasp attempt.
+
+        This is a recovery fixed-action pattern.
+
+        If failure happened after micro-lift, the arm is already above the
+        object and the gripper may still be holding or partially holding
+        something. In that case, move upward safely first, then open.
+
+        If failure happened during/after close at grasp pose, open and retreat
+        through pre_grasp and safe_above.
+        """
+        print("[Executor] Recovering safely before retry...")
+
+        # Case A:
+        # Failure happened after micro-lift.
+        # The safest behaviour is to keep hold pressure while moving upward,
+        # then open only at a safer height.
+        if from_micro_lift:
+            if safe_above is not None:
+                await self.arm.move_via_safe_height(
+                    safe_above,
+                    duration=float(self.config.get("retry_to_safe_duration", 4.0)),
+                    steps=int(self.config.get("retry_to_safe_steps", 240)),
+                    step_callback=self.gripper.update,
+                )
+
+            self.gripper.open()
+            await self._step_gripper_for_seconds(
+                float(self.config.get("post_open_settle_seconds", 0.8))
+            )
+            return
+
+        # Case B:
+        # Failure happened before/during close or during close validation.
+        # First give the simulator a small pause, then open the gripper.
+        await self._step_gripper_for_seconds(
+            float(self.config.get("post_failed_close_pause_seconds", 0.5))
+        )
+
+        self.gripper.open()
+        await self._step_gripper_for_seconds(
+            float(self.config.get("post_open_settle_seconds", 0.8))
+        )
+
+        # Move back upward along the approach chain.
+        if pre_grasp is not None:
+            await self.arm.move_to(
+                pre_grasp,
+                duration=float(self.config.get("retry_to_pregrasp_duration", 3.0)),
+                steps=int(self.config.get("retry_to_pregrasp_steps", 180)),
+                check_table_collision=True,
+                step_callback=self.gripper.update,
+            )
+
+        await self._step_gripper_for_seconds(
+            float(self.config.get("retry_mid_settle_seconds", 0.3))
+        )
+
+        if safe_above is not None:
+            await self.arm.move_via_safe_height(
+                safe_above,
+                duration=float(self.config.get("retry_to_safe_duration", 4.0)),
+                steps=int(self.config.get("retry_to_safe_steps", 240)),
+                step_callback=self.gripper.update,
+            )
+
     # implement move to pregrasp_approach position (a point above target pos with constant height of pregrasp_height)
     async def run_generic_pick(self, scene_info: dict) -> bool:
         """
@@ -381,7 +490,8 @@ class PickAndPlaceExecutor:
         #-------------------------
         # implemented a simple pick_result using compute pick joints for now 
         # TODO:  (if possible)need to improve for robust picking using ML based model later
-        max_attempts = int(self.config.get("max_grasp_attempts", 2))
+        max_attempts = int(self.config.get("max_grasp_attempts", 1))
+        current_retry_adjustments = {}
 
         for attempt in range(max_attempts):
             print(f"\n[Executor] Grasp attempt {attempt + 1}/{max_attempts}")
@@ -408,6 +518,13 @@ class PickAndPlaceExecutor:
                 "success": False,
                 "failure_reason": None,
             }
+            attempt_log["retry_adjustments_applied"] = json_safe(
+                current_retry_adjustments
+            )
+            self.arm.set_runtime_grasp_z_delta(
+                float(current_retry_adjustments.get("grasp_z_delta_m", 0.0))
+            )
+
             actual_object_pos = self._get_prim_world_pos(target.get("prim_path"))
 
             if actual_object_pos is None:
@@ -434,6 +551,10 @@ class PickAndPlaceExecutor:
                 table_height=table_height,
                 object_metadata=target,
                 prim_path=target.get("prim_path"),
+            )
+            pick_result = self._apply_retry_adjustments_to_pick_result(
+                pick_result,
+                current_retry_adjustments,
             )
 
             # Added a break with a False return if the IK fails to produce a valid plan.
@@ -513,6 +634,10 @@ class PickAndPlaceExecutor:
                 table_height=table_height,
                 object_metadata=target,
                 prim_path=target.get("prim_path"),
+            )
+            pick_result = self._apply_retry_adjustments_to_pick_result(
+                pick_result,
+                current_retry_adjustments,
             )
             attempt_log["planning_replanned_after_safe_above"] = compact_pick_result(
                 pick_result
@@ -673,14 +798,23 @@ class PickAndPlaceExecutor:
                         for reason in preclose_gate["reasons"]:
                             print(f"  - {reason}")
 
-                        attempt_log["failure_reason"] = (
-                            "preclose_geometry_gate_failed"
-                        )
+                        attempt_log["failure_reason"] = "preclose_geometry_gate_failed"
+                        decision = self.retry_policy.decide(trial_log, attempt_log)
+                        attempt_log["retry_decision"] = json_safe(decision)
                         trial_log["attempts"].append(attempt_log)
+
+                        if decision["retry"] and attempt < max_attempts - 1:
+                            print(f"[Executor] RetryPolicy: {decision['reason']}")
+                            current_retry_adjustments = decision.get("adjustments", {})
+                            await self._recover_to_safe_for_retry(
+                                pre_grasp=pre_grasp,
+                                safe_above=safe_above,
+                                from_micro_lift=False,
+                            )
+                            continue
+
                         trial_log["trial_success"] = False
-                        trial_log["final_reason"] = (
-                            "preclose_geometry_gate_failed"
-                        )
+                        trial_log["final_reason"] = "preclose_geometry_gate_failed"
                         self._last_trial_log = trial_log
 
                         # The fingers are still open. Retreat gently instead of
@@ -746,38 +880,22 @@ class PickAndPlaceExecutor:
                 for reason in close_validation["reasons"]:
                     print(f"  - {reason}")
 
-                attempt_log["failure_reason"] = str(close_validation["reasons"])
+                attempt_log["failure_reason"] = "close_validation_failed"
+                attempt_log["close_failure_reasons"] = json_safe(
+                    close_validation.get("reasons", [])
+                )
+                decision = self.retry_policy.decide(trial_log, attempt_log)
+                attempt_log["retry_decision"] = json_safe(decision)
                 trial_log["attempts"].append(attempt_log)
 
-                if attempt < max_attempts - 1:
-                    print("[Executor] Retrying safely: pause → open → pre_grasp → safe_above")
-
-                    await self._step_gripper_for_seconds(
-                        float(self.config.get("post_failed_close_pause_seconds", 0.5))
+                if decision["retry"] and attempt < max_attempts - 1:
+                    print(f"[Executor] RetryPolicy: {decision['reason']}")
+                    current_retry_adjustments = decision.get("adjustments", {})
+                    await self._recover_to_safe_for_retry(
+                        pre_grasp=pre_grasp,
+                        safe_above=safe_above,
+                        from_micro_lift=False,
                     )
-
-                    self.gripper.open()
-                    await self._step_gripper_for_seconds(
-                        float(self.config.get("post_open_settle_seconds", 0.8))
-                    )
-
-                    await self.arm.move_to(
-                        pre_grasp,
-                        duration=float(self.config.get("retry_to_pregrasp_duration", 3.0)),
-                        steps=int(self.config.get("retry_to_pregrasp_steps", 180)),
-                        check_table_collision=True,
-                    )
-
-                    await self._step_gripper_for_seconds(
-                        float(self.config.get("retry_mid_settle_seconds", 0.3))
-                    )
-
-                    await self.arm.move_via_safe_height(
-                        safe_above,
-                        duration=float(self.config.get("retry_to_safe_duration", 4.0)),
-                        steps=int(self.config.get("retry_to_safe_steps", 240)),
-                    )
-
                     continue
 
                 trial_log["trial_success"] = False
@@ -790,9 +908,13 @@ class PickAndPlaceExecutor:
 
                 # ──── hold for 1 second after close validation, 
                 # this is in case hysics contact may need a short stabilization time before arm motion begins. ────
-                await self._step_gripper_for_seconds(
-                    float(self.config.get("post_close_hold_seconds", 1.0))
+                hold_settle_time = float(
+                    self.config.get("post_close_hold_seconds", 1.0)
+                ) + float(
+                    current_retry_adjustments.get("hold_settle_extra_s", 0.0)
                 )
+
+                await self._step_gripper_for_seconds(hold_settle_time)
 
                 # ──── Micro-lift proof-of-hold checkpoint ────
                 # A partially closed gripper can report contact even after the
@@ -817,9 +939,20 @@ class PickAndPlaceExecutor:
                     )
 
                     print("\n[Executor] Performing micro-lift verification checkpoint...")
+                    micro_lift_speed_scale = float(
+                        current_retry_adjustments.get("micro_lift_speed_scale", 1.0)
+                    )
+                    base_micro_lift_duration = float(
+                        self.config.get("micro_lift_duration", 2.0)
+                    )
+                    micro_lift_duration = base_micro_lift_duration / max(
+                        0.1,
+                        micro_lift_speed_scale,
+                    )
+
                     ok = await self.arm.move_to(
                         micro_lift,
-                        duration=float(self.config.get("micro_lift_duration", 2.0)),
+                        duration=micro_lift_duration,
                         steps=int(self.config.get("micro_lift_steps", 120)),
                         check_table_collision=True,
                         step_callback=self.gripper.update,
@@ -876,7 +1009,21 @@ class PickAndPlaceExecutor:
                         for reason in micro_validation["reasons"]:
                             print(f"  - {reason}")
                         attempt_log["failure_reason"] = "micro_lift_validation_failed"
+
+                        decision = self.retry_policy.decide(trial_log, attempt_log)
+                        attempt_log["retry_decision"] = json_safe(decision)
                         trial_log["attempts"].append(attempt_log)
+
+                        if decision["retry"] and attempt < max_attempts - 1:
+                            print(f"[Executor] RetryPolicy: {decision['reason']}")
+                            current_retry_adjustments = decision.get("adjustments", {})
+                            await self._recover_to_safe_for_retry(
+                                pre_grasp=pre_grasp,
+                                safe_above=safe_above,
+                                from_micro_lift=True,
+                            )
+                            continue
+
                         trial_log["final_reason"] = "micro_lift_validation_failed"
                         self._last_trial_log = trial_log
 
@@ -979,42 +1126,26 @@ class PickAndPlaceExecutor:
  
                 ###
 
-            # ──── No object detected? RETRY with NEW GRASP pose?  ────
+            # ──── Fallback: no object detected after close. ────
             print("[Executor] ❌ No object detected after close.")
-            
-            # retry or give up 
-            if attempt < max_attempts - 1:
-                print("[Executor] Retrying safely: pause → open → pre_grasp → safe_above")
+            attempt_log["failure_reason"] = "close_validation_failed"
+            decision = self.retry_policy.decide(trial_log, attempt_log)
+            attempt_log["retry_decision"] = json_safe(decision)
+            trial_log["attempts"].append(attempt_log)
 
-                await self._step_gripper_for_seconds(
-                    float(self.config.get("post_failed_close_pause_seconds", 0.5))
+            if decision["retry"] and attempt < max_attempts - 1:
+                print(f"[Executor] RetryPolicy: {decision['reason']}")
+                current_retry_adjustments = decision.get("adjustments", {})
+                await self._recover_to_safe_for_retry(
+                    pre_grasp=pre_grasp,
+                    safe_above=safe_above,
+                    from_micro_lift=False,
                 )
+                continue
 
-                self.gripper.open()
-                await self._step_gripper_for_seconds(
-                    float(self.config.get("post_open_settle_seconds", 0.8))
-                )
-
-                # retreat to pre_grasp with new approach
-                
-                await self.arm.move_to(
-                    pre_grasp,
-                    duration=float(self.config.get("retry_to_pregrasp_duration", 3.0)),
-                    steps=int(self.config.get("retry_to_pregrasp_steps", 180)),    # these 
-                    check_table_collision=True,
-                )
-
-                await self._step_gripper_for_seconds(
-                    float(self.config.get("retry_mid_settle_seconds", 0.3))
-                )
-
-                await self.arm.move_via_safe_height(
-                    safe_above,
-                    duration=float(self.config.get("retry_to_safe_duration", 4.0)),
-                    steps=int(self.config.get("retry_to_safe_steps", 240)),
-                )
-
-            else:
-                print("[Executor] ❌ All grasp attempts failed.")
-                await self._hold_for_inspection()
-                return False
+            print("[Executor] ❌ All grasp attempts failed.")
+            trial_log["trial_success"] = False
+            trial_log["final_reason"] = "all_attempts_failed_no_object_after_close"
+            self._last_trial_log = trial_log
+            await self._hold_for_inspection()
+            return False

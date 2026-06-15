@@ -141,7 +141,6 @@ allow_calibration_fallback_for_pick: false
 # Current experiment: plan and execute only through grasp.
 enable_lift_test: true
 plan_retreat_during_pick: true
-max_grasp_attempts: 1
 
 # ───────────── CALIBRATED PRE-CLOSE GEOMETRY GATE ─────────────
 # Two diagnostic trials with different objects and table locations identified
@@ -168,7 +167,7 @@ preclose_diagnostics_print_all_axes: false
 enable_micro_lift_test: true
 enable_lift_test: false
 plan_retreat_during_pick: false
-max_grasp_attempts: 1
+max_grasp_attempts: 2
 
 micro_lift_height_m: 0.025
 micro_lift_duration: 2.0
@@ -180,3 +179,18 @@ min_success_micro_lift_delta_m: 0.015
 min_commanded_micro_lift_delta_m: 0.015
 min_micro_lift_following_ratio: 0.60
 max_micro_lift_relative_drift_m: 0.015
+
+# ───────────── FAILURE-AWARE RETRY POLICY ─────────────
+# One additional attempt is allowed. RetryPolicy decides whether to use it
+# and how to modify the next attempt from the observed failure class.
+retry_close_fail_grasp_z_delta_m: -0.003
+
+retry_no_follow_grasp_z_delta_m: -0.004
+retry_no_follow_force_scale: 1.10
+retry_no_follow_hold_extra_s: 0.4
+retry_no_follow_micro_lift_speed_scale: 0.80
+
+retry_partial_slip_grasp_z_delta_m: -0.002
+retry_partial_slip_force_scale: 1.15
+retry_partial_slip_hold_extra_s: 0.5
+retry_partial_slip_micro_lift_speed_scale: 0.70
