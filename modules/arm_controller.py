@@ -1191,6 +1191,23 @@ class UR5EController:
         tool0_z += self._grasp_z_offset
         tool0_z += self._runtime_grasp_z_delta
 
+        # check if the tool0_z is too close to the table
+        raw_tool0_z = tool0_z
+        min_fingertip_clearance = float(
+            self.config.get("min_fingertip_table_clearance_m", 0.0015)
+        )
+        min_tool0_z = (
+            table_height
+            + self._flange_to_fingertips
+            + min_fingertip_clearance
+        )
+        grasp_z_was_clamped = False
+
+        if tool0_z < min_tool0_z:
+            tool0_z = min_tool0_z
+            grasp_z_was_clamped = True
+        
+        # log tool0_z
         self._log(
             f"  [Height] {strategy}  obj={obj_h * 1000:.0f}mm  "
             f"tool0_z={tool0_z:.4f}"
@@ -1205,6 +1222,10 @@ class UR5EController:
             "finger_bottom_z": tool0_z - self._flange_to_fingertips,
             "runtime_grasp_z_delta_m": self._runtime_grasp_z_delta,
             "grasp_ok":        True,
+            "raw_tool0_z_before_table_clamp": raw_tool0_z,
+            "min_tool0_z_table_clearance": min_tool0_z,
+            "grasp_z_was_clamped": grasp_z_was_clamped,
+            "min_fingertip_table_clearance_m": min_fingertip_clearance,
         }
 
     # ══════════════════════════════════════════════════════════

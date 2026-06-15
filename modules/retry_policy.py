@@ -16,6 +16,41 @@ class RetryPolicy:
         material = str(material or "").lower()
         fragile_keywords = ["ceramic", "glass", "fragile", "thin", "delicate"]
         return any(k in material for k in fragile_keywords)
+    
+    # additional rule for thin objects
+    def _is_thin_object(self, target: dict, attempt_log: dict) -> bool:
+        """Return True for thin objects where lowering the grasp risks table contact."""
+        shape = str(target.get("shape", "")).lower()
+
+        height = None
+        plan = (
+            attempt_log.get("planning_replanned_after_safe_above")
+            or attempt_log.get("planning_initial")
+            or {}
+        )
+
+        if plan:
+            height = plan.get("object_height")
+
+        if height is None:
+            height = target.get("height")
+
+        try:
+            height = float(height)
+        except Exception:
+            height = None
+
+        thin_threshold = float(
+            self.config.get("retry_thin_object_height_threshold_m", 0.015)
+        )
+
+        if shape in ("disc", "disk"):
+            return True
+
+        if height is not None and height <= thin_threshold:
+            return True
+
+        return False
 
     def decide(self, trial_log: dict, attempt_log: dict) -> dict:
         failure_reason = attempt_log.get("failure_reason")
@@ -31,6 +66,7 @@ class RetryPolicy:
         material = target.get("material", "unknown")
         shape = target.get("shape", "unknown")
         fragile = self._is_fragile_material(material)
+        thin_object = self._is_thin_object(target, attempt_log)
 
         decision = {
             "retry": False,
@@ -43,6 +79,7 @@ class RetryPolicy:
                 "material": material,
                 "fragile_material": fragile,
                 "micro_lift_classification": micro.get("failure_classification"),
+                "thin_object": thin_object,
             },
         }
 
@@ -86,7 +123,7 @@ class RetryPolicy:
                 decision["reason"] = "retry_no_secure_capture"
                 decision["adjustments"] = {
                     "refresh_object_pose": True,
-                    "grasp_z_delta_m": float(
+                    "grasp_z_delta_m": 0.0 if thin_object else float(
                         self.config.get("retry_no_follow_grasp_z_delta_m", -0.004)
                     ),
                     "force_scale": 1.0 if fragile else float(
@@ -106,7 +143,7 @@ class RetryPolicy:
                 decision["reason"] = "retry_partial_slip_or_weak_capture"
                 decision["adjustments"] = {
                     "refresh_object_pose": False,
-                    "grasp_z_delta_m": float(
+                    "grasp_z_delta_m": 0.0 if thin_object else float(
                         self.config.get("retry_partial_slip_grasp_z_delta_m", -0.002)
                     ),
                     "force_scale": 1.0 if fragile else float(

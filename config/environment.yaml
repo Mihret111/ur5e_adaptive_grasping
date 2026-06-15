@@ -195,6 +195,8 @@ retry_partial_slip_force_scale: 1.15
 retry_partial_slip_hold_extra_s: 0.5
 retry_partial_slip_micro_lift_speed_scale: 0.70
 
+retry_thin_object_height_threshold_m: 0.015
+min_fingertip_table_clearance_m: 0.0015
 
 ## Gripper contact plausibility
 gripper_contact_position_tolerance_m: 0.004
