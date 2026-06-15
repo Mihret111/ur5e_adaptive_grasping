@@ -73,13 +73,30 @@ class PickAndPlaceExecutor:
         await self._step_gripper_for_seconds(1.0)
         print(f"[Executor] Gripper state: {self.gripper.get_state()}")
 
-    async def close_gripper(self, force_n=None):
+    async def close_gripper(
+        self,
+        force_n=None,
+        expected_grip_dim_m=None,
+    ):
+        """Close gripper with optional object-size-aware contact expectation.
+
+        expected_grip_dim_m is the estimated object width/diameter along the
+        gripper closing direction. The gripper controller uses it to reject
+        impossible early-contact detections.
+        """
         print("[Executor] Closing gripper...")
-        self.gripper.close(force_n=force_n)
-        await self._step_gripper_for_seconds(2.0)
+
+        self.gripper.close(
+            force_n=force_n,
+            expected_grip_dim_m=expected_grip_dim_m,
+        )
+
+        await self._step_gripper_for_seconds(
+            float(self.config.get("gripper_close_wait_seconds", 2.0))
+        )
+
         print(f"[Executor] Gripper state: {self.gripper.get_state()}")
         print(f"[Executor] Has object: {self.gripper.has_object()}")
-
     # helper to just pause and hold the gripper open or close for inspection 
     async def _hold_for_inspection(self, seconds: float = None):
         if not self.config.get("debug_hold_after_stage", False):
@@ -844,9 +861,28 @@ class PickAndPlaceExecutor:
             object_pos_before_close = self._get_prim_world_pos(target.get("prim_path"))
 
             # TODO: use the same approach as in compute_pick_joints to get target force
-            target_force = pick_result.get("target_force_n", None)      # TODO target force based on object what ? investigate this more
-            await self.close_gripper(force_n=target_force)
+            target_force = pick_result.get("target_force_n", None)
 
+            target_feasibility_for_close = (
+                attempt_log.get("target_feasibility")
+                or trial_log.get("target_feasibility")
+                or {}
+            )
+
+            expected_grip_dim_m = target_feasibility_for_close.get(
+                "estimated_object_grip_dim_m"
+            )
+
+            print(
+                "[Executor] Expected grip dimension for close: "
+                f"{expected_grip_dim_m}"
+            )
+
+            await self.close_gripper(
+                force_n=target_force,
+                expected_grip_dim_m=expected_grip_dim_m,
+            )
+            # get diagnostics from the gripper after close
             diag = self.gripper.get_diagnostics()
             print("\n[Executor] Gripper diagnostics after close:")
             # print(diag)

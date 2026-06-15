@@ -194,3 +194,12 @@ retry_partial_slip_grasp_z_delta_m: -0.002
 retry_partial_slip_force_scale: 1.15
 retry_partial_slip_hold_extra_s: 0.5
 retry_partial_slip_micro_lift_speed_scale: 0.70
+
+
+## Gripper contact plausibility
+gripper_contact_position_tolerance_m: 0.004
+gripper_min_unexpected_contact_joint_pos: 0.0015
+gripper_max_closing_ticks: 180
+
+gripper_min_closing_ticks: 15
+gripper_stall_ticks: 8
