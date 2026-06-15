@@ -96,21 +96,27 @@ class PickAndPlaceExecutor:
 
         # Wait until the gripper leaves CLOSING, or until timeout.
         # This avoids validating while the gripper is still moving.
-        resolved_state = await self._wait_for_gripper_close_resolution(
-            float(self.config.get("gripper_close_wait_timeout_s", 5.0))
+        close_resolution = await self._wait_for_gripper_close_resolution(
+            float(self.config.get("gripper_close_wait_timeout_s", 6.0))
         )
 
-        print(f"[Executor] Gripper close resolved as: {resolved_state}")
+        # attempt_log["gripper_close_resolution"] = json_safe(close_resolution)
+
+        print(f"[Executor] Gripper close resolved as: {close_resolution}")
 
         hold_settle_time = float(
             self.config.get("post_close_hold_seconds", 1.0)
-        ) + float(hold_settle_extra_s)
+        ) + float(
+            hold_settle_extra_s
+        )
 
         await self._step_gripper_for_seconds(hold_settle_time)
 
         print(f"[Executor] Gripper state: {self.gripper.get_state()}")
         print(f"[Executor] Has object: {self.gripper.has_object()}")
         
+        return close_resolution
+
     # helper to just pause and hold the gripper open or close for inspection 
     async def _hold_for_inspection(self, seconds: float = None):
         if not self.config.get("debug_hold_after_stage", False):
@@ -463,30 +469,70 @@ class PickAndPlaceExecutor:
     async def _wait_for_gripper_close_resolution(
         self,
         max_seconds: float = None,
-    ):
-        """Step simulation until gripper close resolves or timeout occurs.
+    ) -> dict:
+        """Wait until the gripper close action reaches a terminal state.
 
-        Close resolves when the gripper leaves CLOSING state, usually into HOLDING.
-        If timeout is reached, the current state is returned.
+        We should not validate grasp success while the gripper is still CLOSING.
+
+        The close is considered resolved when:
+          - the gripper enters HOLDING after plausible contact/squeeze, or
+          - the gripper enters HOLDING after a no-object timeout/full close, or
+          - the timeout expires.
+
+        Returns a diagnostic dictionary for logging.
         """
-
         app = omni.kit.app.get_app()
 
         if max_seconds is None:
             max_seconds = float(
-                self.config.get("gripper_close_wait_timeout_s", 5.0)
+                self.config.get("gripper_close_wait_timeout_s", 6.0)
             )
 
-        max_frames = max(1, int(max_seconds * 60))
+        # We use frame count because gripper.update() is called once per frame.
+        # 6 seconds × 60 Hz = 360 updates, enough for:
+        # max_closing_ticks ≈ 180 + squeeze_ticks ≈ 50 + margin.
+        updates_per_second = float(
+            self.config.get("gripper_close_wait_updates_per_second", 60.0)
+        )
 
-        for _ in range(max_frames):
-            state = self.gripper.update()
+        max_frames = max(
+            1,
+            int(max_seconds * updates_per_second),
+        )
+
+        last_state = None
+        frames_used = 0
+
+        for i in range(max_frames):
+            last_state = self.gripper.update()
+            frames_used = i + 1
+
             await app.next_update_async()
 
-            if state != self.gripper.CLOSING:
-                return state
+            # The key guard:
+            # Do not continue waiting once close has resolved.
+            if last_state != self.gripper.CLOSING:
+                diagnostics = self.gripper.get_diagnostics()
+                return {
+                    "resolved": True,
+                    "frames_used": frames_used,
+                    "max_frames": max_frames,
+                    "final_state": last_state,
+                    "timeout_s": max_seconds,
+                    "gripper_diagnostics": diagnostics,
+                }
 
-        return self.gripper.get_state()
+        # Timeout: close did not resolve.
+        diagnostics = self.gripper.get_diagnostics()
+        return {
+            "resolved": False,
+            "frames_used": frames_used,
+            "max_frames": max_frames,
+            "final_state": last_state,
+            "timeout_s": max_seconds,
+            "gripper_diagnostics": diagnostics,
+            "reason": "gripper_close_wait_timeout",
+        }
     # implement move to pregrasp_approach position (a point above target pos with constant height of pregrasp_height)
     async def run_generic_pick(self, scene_info: dict) -> bool:
         """
@@ -919,7 +965,7 @@ class PickAndPlaceExecutor:
                 f"{expected_grip_dim_m}"
             )
 
-            await self.close_gripper(
+            close_resolution = await self.close_gripper(
                 force_n=target_force,
                 expected_grip_dim_m=expected_grip_dim_m,
                 hold_settle_extra_s=float(
@@ -932,11 +978,54 @@ class PickAndPlaceExecutor:
             print("\n[Executor] Gripper diagnostics after close:")
             # print(diag)
 
+            # Refuse close-validation if close did not resolve
+            if not close_resolution.get("resolved", False):
+                print("[Executor] Close did not resolve before validation timeout.")
+
+                attempt_log["close_validation"] = {
+                    "stage": "after_close",
+                    "success": False,
+                    "reasons": ["gripper_close_not_resolved_before_validation"],
+                    "gripper_state": close_resolution.get("final_state"),
+                }
+
+                attempt_log["gripper_diagnostics_after_close"] = (
+                    self.gripper.get_diagnostics()
+                )
+
+                attempt_log["failure_reason"] = "close_validation_failed"
+                attempt_log["close_failure_reasons"] = [
+                    "gripper_close_not_resolved_before_validation"
+                ]
+
+                decision = self.retry_policy.decide(trial_log, attempt_log)
+                attempt_log["retry_decision"] = json_safe(decision)
+
+                trial_log["attempts"].append(attempt_log)
+
+                if decision["retry"] and attempt < max_attempts - 1:
+                    print(f"[Executor] RetryPolicy: {decision['reason']}")
+                    current_retry_adjustments = decision.get("adjustments", {})
+
+                    await self._recover_to_safe_for_retry(
+                        pre_grasp=pre_grasp,
+                        safe_above=safe_above,
+                        from_micro_lift=False,
+                    )
+                    continue
+
+                trial_log["trial_success"] = False
+                trial_log["final_reason"] = "gripper_close_not_resolved_before_validation"
+                self._last_trial_log = trial_log
+                return False
+            # 
+
             # ──── Validate grasp/contact after closing ────
             close_validation = self.validate_after_close(
                 target=target,
                 object_pos_before_close=object_pos_before_close,
             )
+
 
             print("\n[Executor] Close validation:")
             print(close_validation)

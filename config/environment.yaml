@@ -206,4 +206,7 @@ gripper_max_closing_ticks: 180
 
 gripper_min_closing_ticks: 15
 gripper_stall_ticks: 8
-gripper_close_wait_timeout_s: 5.0
+
+# Gripper close resolution guard
+gripper_close_wait_timeout_s: 6.0
+gripper_close_wait_updates_per_second: 60.0
