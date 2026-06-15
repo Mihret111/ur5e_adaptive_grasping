@@ -77,12 +77,15 @@ class PickAndPlaceExecutor:
         self,
         force_n=None,
         expected_grip_dim_m=None,
+        hold_settle_extra_s: float = 0.0,
     ):
         """Close gripper with optional object-size-aware contact expectation.
 
         expected_grip_dim_m is the estimated object width/diameter along the
-        gripper closing direction. The gripper controller uses it to reject
-        impossible early-contact detections.
+        gripper closing direction.
+
+        hold_settle_extra_s is added by RetryPolicy when a retry needs more
+        contact stabilization before validation.
         """
         print("[Executor] Closing gripper...")
 
@@ -91,12 +94,23 @@ class PickAndPlaceExecutor:
             expected_grip_dim_m=expected_grip_dim_m,
         )
 
-        await self._step_gripper_for_seconds(
-            float(self.config.get("gripper_close_wait_seconds", 2.0))
+        # Wait until the gripper leaves CLOSING, or until timeout.
+        # This avoids validating while the gripper is still moving.
+        resolved_state = await self._wait_for_gripper_close_resolution(
+            float(self.config.get("gripper_close_wait_timeout_s", 5.0))
         )
+
+        print(f"[Executor] Gripper close resolved as: {resolved_state}")
+
+        hold_settle_time = float(
+            self.config.get("post_close_hold_seconds", 1.0)
+        ) + float(hold_settle_extra_s)
+
+        await self._step_gripper_for_seconds(hold_settle_time)
 
         print(f"[Executor] Gripper state: {self.gripper.get_state()}")
         print(f"[Executor] Has object: {self.gripper.has_object()}")
+        
     # helper to just pause and hold the gripper open or close for inspection 
     async def _hold_for_inspection(self, seconds: float = None):
         if not self.config.get("debug_hold_after_stage", False):
@@ -446,6 +460,33 @@ class PickAndPlaceExecutor:
                 step_callback=self.gripper.update,
             )
 
+    async def _wait_for_gripper_close_resolution(
+        self,
+        max_seconds: float = None,
+    ):
+        """Step simulation until gripper close resolves or timeout occurs.
+
+        Close resolves when the gripper leaves CLOSING state, usually into HOLDING.
+        If timeout is reached, the current state is returned.
+        """
+
+        app = omni.kit.app.get_app()
+
+        if max_seconds is None:
+            max_seconds = float(
+                self.config.get("gripper_close_wait_timeout_s", 5.0)
+            )
+
+        max_frames = max(1, int(max_seconds * 60))
+
+        for _ in range(max_frames):
+            state = self.gripper.update()
+            await app.next_update_async()
+
+            if state != self.gripper.CLOSING:
+                return state
+
+        return self.gripper.get_state()
     # implement move to pregrasp_approach position (a point above target pos with constant height of pregrasp_height)
     async def run_generic_pick(self, scene_info: dict) -> bool:
         """
@@ -881,7 +922,11 @@ class PickAndPlaceExecutor:
             await self.close_gripper(
                 force_n=target_force,
                 expected_grip_dim_m=expected_grip_dim_m,
+                hold_settle_extra_s=float(
+                    current_retry_adjustments.get("hold_settle_extra_s", 0.0)
+                ),
             )
+
             # get diagnostics from the gripper after close
             diag = self.gripper.get_diagnostics()
             print("\n[Executor] Gripper diagnostics after close:")
@@ -941,16 +986,6 @@ class PickAndPlaceExecutor:
 
             else:
                 print("[Executor] ✅ Close validation passed.")
-
-                # ──── hold for 1 second after close validation, 
-                # this is in case hysics contact may need a short stabilization time before arm motion begins. ────
-                hold_settle_time = float(
-                    self.config.get("post_close_hold_seconds", 1.0)
-                ) + float(
-                    current_retry_adjustments.get("hold_settle_extra_s", 0.0)
-                )
-
-                await self._step_gripper_for_seconds(hold_settle_time)
 
                 # ──── Micro-lift proof-of-hold checkpoint ────
                 # A partially closed gripper can report contact even after the
