@@ -7,7 +7,7 @@
 # 1. GRIP MODE
 # ═══════════════════════════════════════════════════════════════════
 
-grip_mode: "outwards_grip"  # "Outwards" or "Inwards"
+grip_mode: "outwards"  # "Outwards" or "Inwards"
 
 
 # ═══════════════════════════════════════════════════════════════════
