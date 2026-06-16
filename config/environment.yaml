@@ -214,6 +214,11 @@ gripper_max_closing_ticks: 180
 gripper_close_wait_timeout_s: 6.0
 gripper_close_wait_updates_per_second: 60.0
 
+# Gripper close asymmetry guard
+gripper_max_clean_contact_asymmetry_m:   0.006
+gripper_max_allowed_contact_asymmetry_m: 0.012
+
+
 
 # Contact-aware retry policy additions
 retry_near_table_extra_clearance_threshold_m: 0.003

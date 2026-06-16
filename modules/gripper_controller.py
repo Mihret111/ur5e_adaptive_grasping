@@ -28,9 +28,10 @@ class Gripper2FG7:
     OPENING = "OPENING"
     CLOSING = "CLOSING"
     HOLDING = "HOLDING"  #TODO  can holding be represented as just one state? safe holding, slipped kind of... don't know check
+    FAILED_CLOSE = "FAILED_CLOSE"  # close resolved, but no physically plausible two-finger grasp
 
     # ── Version marker ─────────────────────────────────────────────
-    VERSION = "v3-hold-fix" #??
+    VERSION = "v5-balanced-contact-close" # pair-aware contact + balanced hold
 
     def __init__(
         self,
@@ -101,6 +102,17 @@ class Gripper2FG7:
             "gripper_max_closing_ticks", 180
         )
 
+        # Contact quality is evaluated from the two-finger pair, not from
+        # min(left, right) alone.  This prevents a bad case where one finger
+        # stays almost open while the other finger closes deeply, yet the
+        # scalar min-position makes the contact look plausible.
+        self._max_clean_asymmetry = self.config.get(
+            "gripper_max_clean_contact_asymmetry_m", 0.006
+        )
+        self._max_allowed_asymmetry = self.config.get(
+            "gripper_max_allowed_contact_asymmetry_m", 0.012
+        )
+
         self._expected_grip_dim_m = None
         self._expected_contact_position = None
         self._close_failure_reason = None
@@ -115,6 +127,16 @@ class Gripper2FG7:
         self._closing_ticks    = 0
         self._last_positions   = None
         self._contact_position = None
+        # Per-finger contact/target memory.
+        # The scalar _contact_position is kept for backward-compatible logs,
+        # but the actual squeeze/hold motor command uses these per-finger
+        # targets so an asymmetric real contact is not collapsed into one
+        # common target.
+        self._contact_positions = None
+        self._squeeze_targets = None
+        self._hold_targets = None
+        self._hold_target_mode = "scalar_legacy"
+        self._contact_quality = None
         self._squeeze_phase    = False
         self._squeeze_ticks    = 0
         self._had_contact      = False 
@@ -235,6 +257,77 @@ class Gripper2FG7:
             else:
                 print(f"  [2FG7] ❌ _set_drive: no DriveAPI on {joint.GetPath()}")
 
+    def _set_drive_targets(
+        self,
+        targets: list,
+        force: float,
+        stiffness: float,
+        damping: float,
+        velocity: float = 0.0,
+    ):
+        """Set a separate target position for each finger joint.
+
+        The order follows _valid_joints(), i.e. left then right in this
+        controller. If the number of targets does not match the number of
+        joints, the method falls back to the average target so the gripper
+        remains controllable rather than crashing during a trial.
+        """
+        joints = list(self._valid_joints())
+
+        if not joints:
+            return
+
+        if not targets or len(targets) != len(joints):
+            if targets:
+                target = sum(float(t) for t in targets) / len(targets)
+            else:
+                target = self.CLOSED_POS
+
+            self._set_drive(
+                target=target,
+                force=force,
+                stiffness=stiffness,
+                damping=damping,
+                velocity=velocity,
+            )
+            return
+
+        for joint, target in zip(joints, targets):
+            target = max(self.OPEN_POS, min(self.CLOSED_POS, float(target)))
+
+            drive = UsdPhysics.DriveAPI.Get(joint, "linear")
+            if not drive:
+                drive = UsdPhysics.DriveAPI.Apply(joint, "linear")
+            if drive:
+                drive.GetTypeAttr().Set("force")
+                drive.GetTargetPositionAttr().Set(float(target))
+                drive.GetMaxForceAttr().Set(float(force))
+                drive.GetStiffnessAttr().Set(float(stiffness))
+                drive.GetDampingAttr().Set(float(damping))
+                drive.GetTargetVelocityAttr().Set(float(velocity))
+            else:
+                print(f"  [2FG7] ❌ _set_drive_targets: no DriveAPI on {joint.GetPath()}")
+
+    def _clamp_joint_positions(self, positions: list) -> list:
+        return [
+            max(self.OPEN_POS, min(self.CLOSED_POS, float(p)))
+            for p in positions
+        ]
+
+    def _make_more_closed_targets(self, positions: list, extra_close: float) -> list:
+        positions = self._clamp_joint_positions(positions)
+        return [
+            min(p + float(extra_close), self.CLOSED_POS)
+            for p in positions
+        ]
+
+    def _finger_asymmetry(self, positions: Optional[list] = None) -> Optional[float]:
+        if positions is None:
+            positions = self._get_positions()
+        if not positions or len(positions) < 2:
+            return None
+        return abs(float(positions[0]) - float(positions[1]))
+
     def _get_physx_positions(self) -> list:
         positions = []
         for joint in self._valid_joints():
@@ -282,6 +375,11 @@ class Gripper2FG7:
         self._squeeze_ticks = 0
         self._reset_tracking()
         self._contact_position = None
+        self._contact_positions = None
+        self._squeeze_targets = None
+        self._hold_targets = None
+        self._hold_target_mode = "scalar_legacy"
+        self._contact_quality = None
         self._had_contact = False
         self._close_failure_reason = None
         self._expected_grip_dim_m = None
@@ -356,14 +454,136 @@ class Gripper2FG7:
         return low, high
 
     def _contact_position_is_plausible(self, joint_pos: float) -> bool:
-        """Return True if a detected stall is plausible object contact.
+        """Legacy scalar plausibility check used only for simple queries.
 
-        Contact is plausible only if the finger joint has closed into the
-        expected window for the object's grip dimension.
+        The state machine itself uses _contact_quality_from_positions(),
+        because object width is related to the average two-finger opening,
+        not the minimum joint position alone.
         """
         joint_pos = float(joint_pos)
         low, high = self._contact_position_window()
         return low <= joint_pos <= high
+
+    def _contact_quality_from_positions(self, positions: list) -> dict:
+        """Classify two-finger contact quality from the finger pair.
+
+        For external gripping, object width is estimated from the average
+        finger joint position:
+
+            opening = grip_max - 2 * mean(q_left, q_right)
+
+        Therefore contact plausibility should use the average position.
+        Asymmetry is tracked separately because a very asymmetric closure can
+        mean one finger missed, scraped the table, or pushed the object aside.
+        """
+        positions = self._clamp_joint_positions(positions or [])
+
+        if not positions:
+            return {
+                "quality": "missing_positions",
+                "plausible": False,
+                "clean": False,
+            }
+
+        avg = sum(positions) / len(positions)
+        min_pos = min(positions)
+        max_pos = max(positions)
+        asym = max_pos - min_pos
+        low, high = self._contact_position_window()
+
+        avg_in_window = low <= avg <= high
+
+        if avg < low:
+            quality = "too_open_or_early"
+            plausible = False
+            clean = False
+        elif avg > high:
+            quality = "too_closed_or_missed"
+            plausible = False
+            clean = False
+        elif asym > self._max_allowed_asymmetry:
+            quality = "too_asymmetric"
+            plausible = False
+            clean = False
+        elif asym > self._max_clean_asymmetry:
+            quality = "plausible_but_asymmetric"
+            plausible = True
+            clean = False
+        else:
+            quality = "plausible_clean"
+            plausible = True
+            clean = True
+
+        return {
+            "quality": quality,
+            "plausible": plausible,
+            "clean": clean,
+            "positions": positions,
+            "avg_position_m": avg,
+            "min_position_m": min_pos,
+            "max_position_m": max_pos,
+            "asymmetry_m": asym,
+            "window_m": [low, high],
+            "avg_in_window": avg_in_window,
+            "max_clean_asymmetry_m": self._max_clean_asymmetry,
+            "max_allowed_asymmetry_m": self._max_allowed_asymmetry,
+        }
+
+    def _make_balanced_more_closed_targets(self, positions: list, extra_close: float) -> list:
+        """Build stable two-finger squeeze/hold targets without opening a finger.
+
+        Pure per-finger targets preserve asymmetry forever.  A single scalar
+        target may open the finger that had already closed farther.  This
+        balanced rule closes the lagging finger toward the pair average while
+        never commanding any finger to open.
+        """
+        positions = self._clamp_joint_positions(positions)
+        if not positions:
+            return [self.CLOSED_POS, self.CLOSED_POS]
+
+        base = min(
+            self.CLOSED_POS,
+            (sum(positions) / len(positions)) + float(extra_close),
+        )
+
+        return [
+            min(self.CLOSED_POS, max(float(p), base))
+            for p in positions
+        ]
+
+    def _fail_close(self, reason: str, positions: Optional[list] = None):
+        """Resolve a close attempt as failed without entering HOLDING.
+
+        Earlier versions called hold() even after a failed close.  That made
+        logs say HOLDING while has_object=False and could keep squeezing after
+        we already knew the grasp was invalid.  FAILED_CLOSE is clearer and
+        safer: the executor will open/recover.
+        """
+        positions = self._clamp_joint_positions(
+            positions or self._get_physx_positions() or self._get_positions()
+        )
+
+        self._state = self.FAILED_CLOSE
+        self._had_contact = False
+        self._close_failure_reason = reason
+        self._contact_positions = positions if positions else None
+        self._contact_position = min(positions) if positions else None
+        self._contact_quality = self._contact_quality_from_positions(positions)
+        self._squeeze_phase = False
+        self._squeeze_ticks = 0
+        self._reset_tracking()
+
+        # Stop the fingers where they are; do not build hold pressure.
+        if positions:
+            self._set_drive_targets(
+                targets=positions,
+                force=self._default_force,
+                stiffness=self._approach_stiffness,
+                damping=self._approach_damping,
+                velocity=0.0,
+            )
+
+        self._log(f"Close failed: {reason}; positions={positions}")
 
     def close(
         self,
@@ -386,6 +606,11 @@ class Gripper2FG7:
         self._squeeze_ticks = 0
         self._reset_tracking()
         self._contact_position = None
+        self._contact_positions = None
+        self._squeeze_targets = None
+        self._hold_targets = None
+        self._hold_target_mode = "scalar_legacy"
+        self._contact_quality = None
         self._had_contact = False 
 
         # Object-size-aware expected contact position.
@@ -415,13 +640,34 @@ class Gripper2FG7:
         positions = physx_pos if physx_pos else self._get_positions()
 
         if positions:
-            self._contact_position = min(positions)
+            # Preserve the actual two-finger geometry at the moment we enter
+            # HOLDING. This is important because real/simulated contact is
+            # often asymmetric by a few millimetres.
+            self._contact_positions = self._clamp_joint_positions(positions)
+            self._contact_position = min(self._contact_positions)
+        elif self._contact_positions:
+            self._contact_positions = self._clamp_joint_positions(
+                self._contact_positions
+            )
+            self._contact_position = min(self._contact_positions)
         else:
+            self._contact_positions = [self.CLOSED_POS, self.CLOSED_POS]
             self._contact_position = self.CLOSED_POS
 
-        # ── Safe hold target ───────────────────────────────────────
-        hold_target = self._contact_position + self._hold_extra_close
-        hold_target = min(hold_target, self.CLOSED_POS)
+        # ── Per-finger hold targets ────────────────────────────────
+        # Old behavior used one scalar target for both fingers:
+        #     min(left, right) + extra
+        # That can unintentionally reduce pressure on the finger that had
+        # already closed farther. Now each finger holds relative to its own
+        # measured contact/settled position.
+        self._contact_quality = self._contact_quality_from_positions(
+            self._contact_positions
+        )
+        self._hold_targets = self._make_balanced_more_closed_targets(
+            self._contact_positions,
+            self._hold_extra_close,
+        )
+        self._hold_target_mode = "balanced_pair_no_opening"
 
         # ── Verify hold target is physically reachable ─────────────
         # Near-full closure can still be valid for objects close to the
@@ -435,8 +681,8 @@ class Gripper2FG7:
             self._log("Hold: fingers fully closed outside plausible window — no object")
 
         self._state = self.HOLDING
-        self._set_drive(
-            target=hold_target,
+        self._set_drive_targets(
+            targets=self._hold_targets,
             force=self._hold_force,
             stiffness=self._hold_stiffness,
             damping=self._hold_damping,
@@ -445,7 +691,9 @@ class Gripper2FG7:
 
         print(
             f"          [2FG7] HOLD: contact={self._contact_position:.5f}m  "
-            f"target={hold_target:.5f}m  (+{self._hold_extra_close*1000:.1f}mm)  "
+            f"contact_positions={[round(p, 5) for p in self._contact_positions]}  "
+            f"targets={[round(t, 5) for t in self._hold_targets]}  "
+            f"(+{self._hold_extra_close*1000:.1f}mm per finger)  "
             f"F={self._hold_force:.0f}N  K={self._hold_stiffness:.0f}"
         )
 
@@ -495,10 +743,7 @@ class Gripper2FG7:
             not self._squeeze_phase
             and self._closing_ticks > self._max_closing_ticks
         ):
-            self._had_contact = False
-            self._close_failure_reason = "closing_timeout_no_plausible_contact"
-            self._log("Closing timeout — no plausible contact detected")
-            self.hold()
+            self._fail_close("closing_timeout_no_plausible_contact", cur)
             return
 
         # ── Phase 2: SQUEEZE settling ──────────────────────────────
@@ -546,42 +791,40 @@ class Gripper2FG7:
                 f"window={self._contact_position_window()}"
             )
 
+        quality = self._contact_quality_from_positions(cur)
+
         # Check full closure every tick. For very small objects, near-full
-        # closure can still be plausible, so test the contact window first.
+        # closure can still be plausible, but only if the two-finger pair
+        # average is inside the expected window and asymmetry is acceptable.
         if all(p >= (self.CLOSED_POS - 0.001) for p in cur):
-            if self._contact_position_is_plausible(min_pos):
-                self._start_squeeze_at(min_pos)
+            if quality.get("plausible", False):
+                self._start_squeeze_from_positions(cur)
             else:
-                self._had_contact = False
-                self._close_failure_reason = "fully_closed_position_check_no_object"
-                self._log("Fully closed outside plausible window — no object")
-                self.hold()
+                self._fail_close("fully_closed_position_check_no_object", cur)
             return
 
         # Stall reasoning happens as soon as enough consecutive still ticks
         # accumulate, not only on logging ticks.
         if self._stall_count >= self._stall_ticks_required:
-            # Case 1: plausible object contact.
-            if self._contact_position_is_plausible(min_pos):
-                self._start_squeeze_at(min_pos)
+            # Case 1: plausible object contact from the pair geometry.
+            if quality.get("plausible", False):
+                self._start_squeeze_from_positions(cur)
                 return
 
-            # Case 2: fingers really reached full closure outside window.
-            if min_pos >= no_obj_limit:
-                self._had_contact = False
-                self._close_failure_reason = "fully_closed_no_object"
-                self._log(f"Fully closed at {min_pos:.5f}m — no object")
-                self.hold()
+            # Case 2: the pair average closed beyond the object window.
+            if quality.get("quality") == "too_closed_or_missed" or min_pos >= no_obj_limit:
+                self._fail_close("fully_closed_no_object_or_missed_object", cur)
                 return
 
-            # Case 3: implausibly early stall. Keep closing.
-            self._close_failure_reason = "ignored_implausible_early_stall"
+            # Case 3: implausibly early or too asymmetric stall. Keep closing.
+            self._close_failure_reason = "ignored_implausible_pair_stall"
             self._log(
-                "Ignoring implausible early stall: "
-                f"joint={min_pos:.5f}m, "
-                f"expected_contact={self._expected_contact_position}, "
-                f"window={self._contact_position_window()}, "
-                f"expected_dim={self._expected_grip_dim_m}"
+                "Ignoring implausible pair stall: "
+                f"quality={quality.get('quality')}, "
+                f"positions={[f'{p:.5f}' for p in cur]}, "
+                f"avg={quality.get('avg_position_m'):.5f}, "
+                f"asym={quality.get('asymmetry_m'):.5f}, "
+                f"window={quality.get('window_m')}"
             )
             self._stall_count = 0
             self._last_positions = cur
@@ -589,10 +832,27 @@ class Gripper2FG7:
 
         self._last_positions = cur
 
-    def _start_squeeze_at(self, contact_pos: float):
-        """Enter squeeze phase from a plausible contact position."""
-        contact_pos = max(self.OPEN_POS, min(self.CLOSED_POS, float(contact_pos)))
-        self._contact_position = contact_pos
+    def _start_squeeze_from_positions(self, positions: list):
+        """Enter squeeze phase from a plausible contact configuration.
+
+        We keep a per-finger record of the contact configuration. A single
+        scalar contact position is still logged for backward compatibility,
+        but motor commands use separate targets for left and right fingers.
+        """
+        positions = self._clamp_joint_positions(positions)
+        if not positions:
+            positions = [self.CLOSED_POS, self.CLOSED_POS]
+
+        self._contact_positions = positions
+        self._contact_position = min(positions)
+        self._contact_quality = self._contact_quality_from_positions(positions)
+        self._squeeze_targets = self._make_balanced_more_closed_targets(
+            positions,
+            0.001,
+        )
+        self._hold_targets = None
+        self._hold_target_mode = "balanced_pair_pending_hold"
+
         self._had_contact = True
         self._close_failure_reason = None
         self._squeeze_phase = True
@@ -601,21 +861,17 @@ class Gripper2FG7:
         self._closing_ticks = 0
         self._last_positions = None
 
-        squeeze_target = min(
-            contact_pos + 0.001,
-            self.CLOSED_POS,
-        )
-
-        self._set_drive(
-            target=squeeze_target,
+        self._set_drive_targets(
+            targets=self._squeeze_targets,
             force=self._close_force,
             stiffness=self._squeeze_stiffness,
             damping=self._squeeze_damping,
             velocity=0.0,
         )
         self._log(
-            f"Plausible contact at {contact_pos:.5f}m "
-            f"→ squeeze target {squeeze_target:.5f}m"
+            f"Plausible contact at positions "
+            f"{[f'{p:.5f}' for p in positions]} "
+            f"→ squeeze targets {[f'{t:.5f}' for t in self._squeeze_targets]}"
         )
 
     def _tick_holding(self):
@@ -625,15 +881,28 @@ class Gripper2FG7:
         Without this, PhysX can relax the joint drive during arm motion
         and the fingers spring open, dropping the object.
         """
-        if self._contact_position is None:
-            return
+        if self._hold_targets is None:
+            # Backward-compatible fallback: if HOLDING was entered without
+            # explicit targets, build per-finger targets from the current
+            # measured positions.
+            positions = self._get_physx_positions() or self._get_positions()
+            if not positions:
+                return
+            self._contact_positions = self._clamp_joint_positions(positions)
+            self._contact_position = min(self._contact_positions)
+            self._contact_quality = self._contact_quality_from_positions(
+                self._contact_positions
+            )
+            self._hold_targets = self._make_balanced_more_closed_targets(
+                self._contact_positions,
+                self._hold_extra_close,
+            )
+            self._hold_target_mode = "balanced_pair_recovered"
 
-        hold_target = self._contact_position + self._hold_extra_close
-        hold_target = min(hold_target, self.CLOSED_POS)
-
-        # Re-apply EVERY tick to fight PhysX solver drift
-        self._set_drive(
-            target=hold_target,
+        # Re-apply EVERY tick to fight PhysX solver drift, preserving the
+        # per-finger targets rather than collapsing them into one scalar.
+        self._set_drive_targets(
+            targets=self._hold_targets,
             force=self._hold_force,
             stiffness=self._hold_stiffness,
             damping=self._hold_damping,
@@ -670,6 +939,13 @@ class Gripper2FG7:
             self._log("has_object: no contact during close → False")
             return False
 
+        if self._contact_quality and not self._contact_quality.get("plausible", False):
+            self._log(
+                "has_object: stored contact quality is not plausible "
+                f"({self._contact_quality.get('quality')}) → False"
+            )
+            return False
+
         # Secondary: check if object has since slipped out
         physx_pos = self._get_physx_positions()
         if physx_pos:
@@ -694,6 +970,12 @@ class Gripper2FG7:
     def get_contact_position(self) -> Optional[float]:
         return self._contact_position
 
+    def get_contact_positions(self) -> Optional[list]:
+        return self._contact_positions
+
+    def get_hold_targets(self) -> Optional[list]:
+        return self._hold_targets
+
     def get_active_forces(self) -> dict:
         return {
             "close_force_n": self._close_force,
@@ -716,6 +998,13 @@ class Gripper2FG7:
             "physx_positions":  physx,
             "drive_positions":  self._get_positions(),
             "contact_position": self._contact_position,
+            "contact_positions": self._contact_positions,
+            "squeeze_targets": self._squeeze_targets,
+            "hold_targets": self._hold_targets,
+            "hold_target_mode": self._hold_target_mode,
+            "finger_position_asymmetry_m": self._finger_asymmetry(physx),
+            "hold_target_asymmetry_m": self._finger_asymmetry(self._hold_targets),
+            "contact_quality":  self._contact_quality,
             "has_object":       self.has_object(),
             "opening_m":        self.get_opening(),
             "close_force_n":    self._close_force,
