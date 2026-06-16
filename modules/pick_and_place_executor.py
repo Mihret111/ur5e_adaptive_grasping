@@ -972,6 +972,7 @@ class PickAndPlaceExecutor:
                     current_retry_adjustments.get("hold_settle_extra_s", 0.0)
                 ),
             )
+            attempt_log["gripper_close_resolution"] = json_safe(close_resolution)
 
             # get diagnostics from the gripper after close
             diag = self.gripper.get_diagnostics()

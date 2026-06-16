@@ -282,7 +282,10 @@ class Gripper2FG7:
         self._squeeze_ticks = 0
         self._reset_tracking()
         self._contact_position = None
-        self._had_contact = False 
+        self._had_contact = False
+        self._close_failure_reason = None
+        self._expected_grip_dim_m = None
+        self._expected_contact_position = None
 
         self._set_drive(
             target=self.OPEN_POS,
@@ -326,25 +329,41 @@ class Gripper2FG7:
         )
 
     # helper function for plausibility check of the stall
-    def _contact_position_is_plausible(self, joint_pos: float) -> bool:
-        """Return True if a detected stall is plausible object contact.
-
-        If an expected object width is known, the gripper must have closed
-        near the expected contact position before stall can count as contact.
-
-        If no object width is known, use a small generic progress threshold.
-        """
-        joint_pos = float(joint_pos)
-
+    def _contact_position_window(self):
+        """Return acceptable joint-position window for object contact."""
         if self._expected_contact_position is None:
-            return joint_pos >= self._min_unexpected_contact_pos
+            low = self._min_unexpected_contact_pos
+            high = self.CLOSED_POS - 0.0005
+            return low, high
 
-        required = max(
+        low = max(
             self.OPEN_POS,
             self._expected_contact_position - self._contact_pos_tolerance,
         )
 
-        return joint_pos >= required
+        upper_tol = float(
+            self.config.get(
+                "gripper_contact_position_upper_tolerance_m",
+                self._contact_pos_tolerance,
+            )
+        )
+
+        high = min(
+            self.CLOSED_POS,
+            self._expected_contact_position + upper_tol,
+        )
+
+        return low, high
+
+    def _contact_position_is_plausible(self, joint_pos: float) -> bool:
+        """Return True if a detected stall is plausible object contact.
+
+        Contact is plausible only if the finger joint has closed into the
+        expected window for the object's grip dimension.
+        """
+        joint_pos = float(joint_pos)
+        low, high = self._contact_position_window()
+        return low <= joint_pos <= high
 
     def close(
         self,
@@ -369,7 +388,7 @@ class Gripper2FG7:
         self._contact_position = None
         self._had_contact = False 
 
-# Added behavior to estimate contact position from grip dimension
+        # Object-size-aware expected contact position.
         self._close_failure_reason = None
         self._expected_grip_dim_m = expected_grip_dim_m
         self._expected_contact_position = (
@@ -377,7 +396,6 @@ class Gripper2FG7:
                 expected_grip_dim_m
             )
         )
-#
         self._set_drive(
             target=self.CLOSED_POS,
             force=self._close_force,
@@ -406,10 +424,15 @@ class Gripper2FG7:
         hold_target = min(hold_target, self.CLOSED_POS)
 
         # ── Verify hold target is physically reachable ─────────────
-        # If contact_position is already at CLOSED_POS, object slipped
-        if self._contact_position >= self.CLOSED_POS - 0.0005:
+        # Near-full closure can still be valid for objects close to the
+        # lower grip-width limit, so use the object-aware contact window.
+        if (
+            self._contact_position >= self.CLOSED_POS - 0.0005
+            and not self._contact_position_is_plausible(self._contact_position)
+        ):
             self._had_contact = False
-            self._log("Hold: fingers fully closed — no object")
+            self._close_failure_reason = "hold_fully_closed_not_plausible"
+            self._log("Hold: fingers fully closed outside plausible window — no object")
 
         self._state = self.HOLDING
         self._set_drive(
@@ -449,25 +472,32 @@ class Gripper2FG7:
     # ══════════════════════════════════════════════════════════════
 
     def _tick_closing(self):
+        """Advance the closing state machine by one physics tick.
+
+        The gripper uses object-size-aware contact plausibility:
+        - too early stall  -> ignore and keep closing;
+        - plausible stall  -> squeeze then hold;
+        - closed outside expected window -> no object.
+        """
         physx = self._get_physx_positions()
-        cur   = physx if physx else self._get_positions()
-        if not cur:
-            self._closing_ticks += 1
-            return
+        cur = physx if physx else self._get_positions()
 
         self._closing_ticks += 1
 
-        # Added timeout logic: If the simulated drive never
-        # moves enough, we do not want infinite closing.
+        if not cur:
+            return
+
+        min_pos = min(cur)
+        no_obj_limit = self.CLOSED_POS - 0.0005
+
+        # If the simulated drive never reaches plausible contact, stop honestly.
         if (
             not self._squeeze_phase
             and self._closing_ticks > self._max_closing_ticks
         ):
             self._had_contact = False
             self._close_failure_reason = "closing_timeout_no_plausible_contact"
-            self._log(
-                "Closing timeout — no plausible contact detected"
-            )
+            self._log("Closing timeout — no plausible contact detected")
             self.hold()
             return
 
@@ -483,99 +513,110 @@ class Gripper2FG7:
                 )
 
             if self._squeeze_ticks >= settle:
-                self._log(f"Squeeze done → HOLDING")
+                self._log("Squeeze done → HOLDING")
                 self.hold()
             return
 
-        # ── Phase 1: wait min ticks ────────────────────────────────
+        # ── Phase 1: wait minimum ticks before stall reasoning ─────
         if self._closing_ticks <= self._min_closing_ticks:
             self._last_positions = cur
             return
 
-        # ── Phase 1: stall detection ───────────────────────────────
-        if self._last_positions is not None:
-            n     = min(len(cur), len(self._last_positions))
-            moved = any(
-                abs(cur[i] - self._last_positions[i]) > self._stall_threshold
-                for i in range(n)
+        if self._last_positions is None:
+            self._last_positions = cur
+            return
+
+        n = min(len(cur), len(self._last_positions))
+        moved = any(
+            abs(cur[i] - self._last_positions[i]) > self._stall_threshold
+            for i in range(n)
+        )
+
+        if moved:
+            self._stall_count = 0
+        else:
+            self._stall_count += 1
+
+        if self._closing_ticks % 10 == 0:
+            self._log(
+                f"Approach tick={self._closing_ticks}  "
+                f"pos={[f'{p:.5f}' for p in cur]}  "
+                f"stall={self._stall_count}/{self._stall_ticks_required}  "
+                f"src={'physx' if physx else 'drive'}  "
+                f"window={self._contact_position_window()}"
             )
 
-            if moved:
-                self._stall_count = 0
+        # Check full closure every tick. For very small objects, near-full
+        # closure can still be plausible, so test the contact window first.
+        if all(p >= (self.CLOSED_POS - 0.001) for p in cur):
+            if self._contact_position_is_plausible(min_pos):
+                self._start_squeeze_at(min_pos)
             else:
-                self._stall_count += 1
-
-            if self._closing_ticks % 10 == 0:
-                self._log(
-                    f"Approach tick={self._closing_ticks}  "
-                    f"pos={[f'{p:.5f}' for p in cur]}  "
-                    f"stall={self._stall_count}/{self._stall_ticks_required}  "
-                    f"src={'physx' if physx else 'drive'}"
-                )
-
-            if self._stall_count >= self._stall_ticks_required:
-                min_pos = min(cur)
-                no_obj_limit = self.CLOSED_POS - 0.0005
-
-                # If the fingers are essentially fully closed, no object was captured.
-                if min_pos >= no_obj_limit:
-                    self._had_contact = False
-                    self._close_failure_reason = "fully_closed_no_object"
-                    self._log(
-                        f"Fully closed at {min_pos:.5f}m — no object"
-                    )
-                    self.hold()
-                    return
-
-                # Important fix:
-                # A stall near the open position is not necessarily contact.
-                # It may simply mean the simulated drive has not moved enough yet.
-                if not self._contact_position_is_plausible(min_pos):
-                    self._close_failure_reason = "ignored_implausible_early_stall"
-
-                    self._log(
-                        "Ignoring implausible early stall: "
-                        f"joint={min_pos:.5f}m, "
-                        f"expected_contact={self._expected_contact_position}, "
-                        f"expected_dim={self._expected_grip_dim_m}"
-                    )
-
-                    # Reset stall counter and keep closing.
-                    self._stall_count = 0
-                    self._last_positions = cur
-                    return
-
-                # Plausible contact.
-                self._had_contact = True
-                self._close_failure_reason = None
-                self._squeeze_phase = True
-                self._squeeze_ticks = 0
-                self._stall_count = 0
-                self._closing_ticks = 0
-                self._last_positions = None
-
-                squeeze_target = min(
-                    min_pos + 0.001,
-                    self.CLOSED_POS,
-                )
-
-                self._set_drive(
-                    target=squeeze_target,
-                    force=self._close_force,
-                    stiffness=self._squeeze_stiffness,
-                    damping=self._squeeze_damping,
-                    velocity=0.0,
-                )
-                return
-
-            if all(p >= (self.CLOSED_POS - 0.001) for p in cur):
                 self._had_contact = False
                 self._close_failure_reason = "fully_closed_position_check_no_object"
-                self._log("Fully closed (position check) — no object")
+                self._log("Fully closed outside plausible window — no object")
+                self.hold()
+            return
+
+        # Stall reasoning happens as soon as enough consecutive still ticks
+        # accumulate, not only on logging ticks.
+        if self._stall_count >= self._stall_ticks_required:
+            # Case 1: plausible object contact.
+            if self._contact_position_is_plausible(min_pos):
+                self._start_squeeze_at(min_pos)
+                return
+
+            # Case 2: fingers really reached full closure outside window.
+            if min_pos >= no_obj_limit:
+                self._had_contact = False
+                self._close_failure_reason = "fully_closed_no_object"
+                self._log(f"Fully closed at {min_pos:.5f}m — no object")
                 self.hold()
                 return
 
+            # Case 3: implausibly early stall. Keep closing.
+            self._close_failure_reason = "ignored_implausible_early_stall"
+            self._log(
+                "Ignoring implausible early stall: "
+                f"joint={min_pos:.5f}m, "
+                f"expected_contact={self._expected_contact_position}, "
+                f"window={self._contact_position_window()}, "
+                f"expected_dim={self._expected_grip_dim_m}"
+            )
+            self._stall_count = 0
+            self._last_positions = cur
+            return
+
         self._last_positions = cur
+
+    def _start_squeeze_at(self, contact_pos: float):
+        """Enter squeeze phase from a plausible contact position."""
+        contact_pos = max(self.OPEN_POS, min(self.CLOSED_POS, float(contact_pos)))
+        self._contact_position = contact_pos
+        self._had_contact = True
+        self._close_failure_reason = None
+        self._squeeze_phase = True
+        self._squeeze_ticks = 0
+        self._stall_count = 0
+        self._closing_ticks = 0
+        self._last_positions = None
+
+        squeeze_target = min(
+            contact_pos + 0.001,
+            self.CLOSED_POS,
+        )
+
+        self._set_drive(
+            target=squeeze_target,
+            force=self._close_force,
+            stiffness=self._squeeze_stiffness,
+            damping=self._squeeze_damping,
+            velocity=0.0,
+        )
+        self._log(
+            f"Plausible contact at {contact_pos:.5f}m "
+            f"→ squeeze target {squeeze_target:.5f}m"
+        )
 
     def _tick_holding(self):
         """
@@ -633,12 +674,18 @@ class Gripper2FG7:
         physx_pos = self._get_physx_positions()
         if physx_pos:
             current = min(physx_pos)
-            # Use tighter limit — only "no object" if truly slammed shut
+            # Near-full closure can be valid for objects near the lower
+            # configured grip width, so reject only if it is outside the
+            # expected contact window.
             no_obj_limit = self.CLOSED_POS - 0.0005
-            if current >= no_obj_limit:
+            if (
+                current >= no_obj_limit
+                and not self._contact_position_is_plausible(current)
+            ):
                 self._log(
                     f"has_object: fingers at {current:.5f}m "
-                    f"(≥ {no_obj_limit:.5f}) → slipped"
+                    f"outside plausible contact window "
+                    f"{self._contact_position_window()} → no object"
                 )
                 return False
 
@@ -684,5 +731,10 @@ class Gripper2FG7:
             "close_failure_reason": self._close_failure_reason,
             "expected_grip_dim_m": self._expected_grip_dim_m,
             "expected_contact_position_m": self._expected_contact_position,
+            "expected_contact_window_m": (
+                list(self._contact_position_window())
+                if self._expected_contact_position is not None
+                else None
+            ),
             "contact_position_tolerance_m": self._contact_pos_tolerance,
         }

@@ -105,7 +105,7 @@ class RetryPolicy:
             decision["reason"] = "retry_close_failed_geometry_first"
             decision["adjustments"] = {
                 "refresh_object_pose": True,
-                "grasp_z_delta_m": float(
+                "grasp_z_delta_m": 0.0 if thin_object else float(
                     self.config.get("retry_close_fail_grasp_z_delta_m", -0.003)
                 ),
                 # For fragile materials, prefer geometry/speed correction first.
@@ -163,7 +163,7 @@ class RetryPolicy:
             decision["reason"] = "retry_unknown_micro_lift_failure_cautious"
             decision["adjustments"] = {
                 "refresh_object_pose": True,
-                "grasp_z_delta_m": -0.002,
+                "grasp_z_delta_m": 0.0 if thin_object else -0.002,
                 "force_scale": 1.0 if fragile else 1.05,
                 "hold_settle_extra_s": 0.3,
                 "micro_lift_speed_scale": 0.85,

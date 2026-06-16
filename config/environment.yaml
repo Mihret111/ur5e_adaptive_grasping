@@ -196,14 +196,17 @@ retry_partial_slip_hold_extra_s: 0.5
 retry_partial_slip_micro_lift_speed_scale: 0.70
 
 retry_thin_object_height_threshold_m: 0.015
-min_fingertip_table_clearance_m: 0.004
+min_fingertip_table_clearance_m: 0.0015
 
 
 ## Gripper contact plausibility
 gripper_contact_position_tolerance_m: 0.004
 gripper_min_unexpected_contact_joint_pos: 0.0015
-gripper_max_closing_ticks: 180
 
+#TODO according to dataset gripper_contact_position_upper_tolerance_m:± 0.1 mm , so tighten it later
+gripper_contact_position_upper_tolerance_m: 0.004 #the gripper accepts contact within: expected ± 4 mm 
+
+gripper_max_closing_ticks: 180
 gripper_min_closing_ticks: 15
 gripper_stall_ticks: 8
 
