@@ -213,3 +213,14 @@ gripper_stall_ticks: 8
 # Gripper close resolution guard
 gripper_close_wait_timeout_s: 6.0
 gripper_close_wait_updates_per_second: 60.0
+
+
+# Contact-aware retry policy additions
+retry_near_table_extra_clearance_threshold_m: 0.003
+retry_early_stall_raise_z_delta_m: 0.002
+retry_close_fail_force_scale: 1.05
+retry_close_fail_hold_extra_s: 0.3
+retry_plausible_no_follow_grasp_z_delta_m: -0.001
+retry_plausible_partial_slip_grasp_z_delta_m: 0.0
+gripper_joint_open_pos_m: 0.0
+gripper_joint_closed_pos_m: 0.019
