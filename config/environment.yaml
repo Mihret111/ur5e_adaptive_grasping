@@ -102,7 +102,7 @@ post_run_hold_seconds: 0.0
 
 # Keep grasp contact intent in control. Alternate gripper yaws are NOT tried
 # unless explicitly enabled later by the grasp-strategy layer.
-grasp_try_alternate_orientations: false
+grasp_try_alternate_orientations: true
 
 # Tier 1: only after the intuitive nominal chain fails, retry the COMPLETE
 # chain from at most two deterministic elbow-up warm-start hypotheses.
@@ -207,8 +207,8 @@ gripper_min_unexpected_contact_joint_pos: 0.0015
 gripper_contact_position_upper_tolerance_m: 0.004 #the gripper accepts contact within: expected ± 4 mm 
 
 gripper_max_closing_ticks: 180
-gripper_min_closing_ticks: 15
-gripper_stall_ticks: 8
+# gripper_min_closing_ticks: 15
+# gripper_stall_ticks: 8
 
 # Gripper close resolution guard
 gripper_close_wait_timeout_s: 6.0

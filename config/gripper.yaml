@@ -7,7 +7,7 @@
 # 1. GRIP MODE
 # ═══════════════════════════════════════════════════════════════════
 
-grip_mode: "outwards"  # "Outwards" or "Inwards"
+grip_mode: "outwards_grip"  # "Outwards" or "Inwards"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -24,7 +24,7 @@ grip_mode: "outwards"  # "Outwards" or "Inwards"
 #  - External grip range: 1–39 mm
 #  - Internal grip range: 11–49 mm  
 
-outwards:
+outwards_grip:
   flange_to_finger_base:       0.1225
   flange_to_fingertips:        0.1625
   gripper_flange_to_fingertip: 0.1425
@@ -32,7 +32,7 @@ outwards:
   grip_range_min:              0.035
   grip_range_max:              0.073
 
-inwards:
+inwards_grip:
   flange_to_finger_base:       0.1175
   flange_to_fingertips:        0.1625
   gripper_flange_to_fingertip: 0.1400
