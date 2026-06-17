@@ -112,6 +112,12 @@ class Gripper2FG7:
         self._max_allowed_asymmetry = self.config.get(
             "gripper_max_allowed_contact_asymmetry_m", 0.012
         )
+        # Small object-size / contact-model uncertainty allowance.  A contact
+        # that is only slightly above the nominal upper window can still be a
+        # real compressed grasp, especially for spheres and cylinders.
+        self._compressed_contact_grace = self.config.get(
+            "gripper_compressed_contact_grace_m", 0.0015
+        )
 
         self._expected_grip_dim_m = None
         self._expected_contact_position = None
@@ -475,6 +481,11 @@ class Gripper2FG7:
         Therefore contact plausibility should use the average position.
         Asymmetry is tracked separately because a very asymmetric closure can
         mean one finger missed, scraped the table, or pushed the object aside.
+
+        A small overshoot beyond the upper edge is allowed as
+        ``plausible_compressed_high_edge``. This avoids rejecting contacts that
+        are only slightly more closed than the nominal object-size estimate.
+        Micro-lift remains the final proof of capture.
         """
         positions = self._clamp_joint_positions(positions or [])
 
@@ -490,29 +501,45 @@ class Gripper2FG7:
         max_pos = max(positions)
         asym = max_pos - min_pos
         low, high = self._contact_position_window()
+        compressed_high = min(
+            self.CLOSED_POS,
+            high + float(self._compressed_contact_grace),
+        )
 
         avg_in_window = low <= avg <= high
+        avg_in_compressed_grace = high < avg <= compressed_high
+        width = max(1e-9, high - low)
+        alpha = (avg - low) / width
 
         if avg < low:
             quality = "too_open_or_early"
             plausible = False
             clean = False
-        elif avg > high:
+        elif avg_in_window or avg_in_compressed_grace:
+            if asym > self._max_allowed_asymmetry:
+                quality = "too_asymmetric"
+                plausible = False
+                clean = False
+            elif avg_in_compressed_grace:
+                quality = (
+                    "plausible_compressed_but_asymmetric"
+                    if asym > self._max_clean_asymmetry
+                    else "plausible_compressed_high_edge"
+                )
+                plausible = True
+                clean = asym <= self._max_clean_asymmetry
+            elif asym > self._max_clean_asymmetry:
+                quality = "plausible_but_asymmetric"
+                plausible = True
+                clean = False
+            else:
+                quality = "plausible_clean"
+                plausible = True
+                clean = True
+        else:
             quality = "too_closed_or_missed"
             plausible = False
             clean = False
-        elif asym > self._max_allowed_asymmetry:
-            quality = "too_asymmetric"
-            plausible = False
-            clean = False
-        elif asym > self._max_clean_asymmetry:
-            quality = "plausible_but_asymmetric"
-            plausible = True
-            clean = False
-        else:
-            quality = "plausible_clean"
-            plausible = True
-            clean = True
 
         return {
             "quality": quality,
@@ -524,7 +551,11 @@ class Gripper2FG7:
             "max_position_m": max_pos,
             "asymmetry_m": asym,
             "window_m": [low, high],
+            "compressed_high_m": compressed_high,
+            "compressed_contact_grace_m": float(self._compressed_contact_grace),
             "avg_in_window": avg_in_window,
+            "avg_in_compressed_grace": avg_in_compressed_grace,
+            "normalized_avg_in_window": alpha,
             "max_clean_asymmetry_m": self._max_clean_asymmetry,
             "max_allowed_asymmetry_m": self._max_allowed_asymmetry,
         }
@@ -673,12 +704,12 @@ class Gripper2FG7:
         # Near-full closure can still be valid for objects close to the
         # lower grip-width limit, so use the object-aware contact window.
         if (
-            self._contact_position >= self.CLOSED_POS - 0.0005
-            and not self._contact_position_is_plausible(self._contact_position)
+            min(self._contact_positions) >= self.CLOSED_POS - 0.0005
+            and not self._contact_quality.get("plausible", False)
         ):
             self._had_contact = False
             self._close_failure_reason = "hold_fully_closed_not_plausible"
-            self._log("Hold: fingers fully closed outside plausible window — no object")
+            self._log("Hold: fingers fully closed outside pair-aware plausible window — no object")
 
         self._state = self.HOLDING
         self._set_drive_targets(
@@ -946,22 +977,19 @@ class Gripper2FG7:
             )
             return False
 
-        # Secondary: check if object has since slipped out
+        # Secondary: check if the current pair has become an impossible
+        # no-object configuration. Use the same pair-aware logic as closing;
+        # do not fall back to the old scalar min-position test.
         physx_pos = self._get_physx_positions()
         if physx_pos:
-            current = min(physx_pos)
-            # Near-full closure can be valid for objects near the lower
-            # configured grip width, so reject only if it is outside the
-            # expected contact window.
-            no_obj_limit = self.CLOSED_POS - 0.0005
+            pair_quality = self._contact_quality_from_positions(physx_pos)
             if (
-                current >= no_obj_limit
-                and not self._contact_position_is_plausible(current)
+                min(physx_pos) >= self.CLOSED_POS - 0.0005
+                and not pair_quality.get("plausible", False)
             ):
                 self._log(
-                    f"has_object: fingers at {current:.5f}m "
-                    f"outside plausible contact window "
-                    f"{self._contact_position_window()} → no object"
+                    "has_object: current pair is fully closed outside "
+                    f"plausible contact quality ({pair_quality.get('quality')}) → no object"
                 )
                 return False
 
@@ -1026,4 +1054,5 @@ class Gripper2FG7:
                 else None
             ),
             "contact_position_tolerance_m": self._contact_pos_tolerance,
+            "compressed_contact_grace_m": float(self._compressed_contact_grace),
         }

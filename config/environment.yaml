@@ -203,6 +203,15 @@ min_fingertip_table_clearance_m: 0.0015
 gripper_contact_position_tolerance_m: 0.004
 gripper_min_unexpected_contact_joint_pos: 0.0015
 
+# Pair-aware retry + compressed-contact grace additions
+# Allow tiny overshoot beyond the nominal expected contact window.
+# Useful for spheres/cylinders and small object-size/PhysX uncertainty.
+gripper_compressed_contact_grace_m: 0.0015
+
+# Keep the existing pair limits explicit for readability.
+gripper_max_clean_contact_asymmetry_m: 0.006
+gripper_max_allowed_contact_asymmetry_m: 0.012
+
 #TODO according to dataset gripper_contact_position_upper_tolerance_m:± 0.1 mm , so tighten it later
 gripper_contact_position_upper_tolerance_m: 0.004 #the gripper accepts contact within: expected ± 4 mm 
 
@@ -219,7 +228,7 @@ gripper_max_clean_contact_asymmetry_m:   0.006
 gripper_max_allowed_contact_asymmetry_m: 0.012
 
 
-# Contact-aware retry policy additions
+## Contact-aware retry policy additions
 retry_near_table_extra_clearance_threshold_m: 0.003
 retry_early_stall_raise_z_delta_m: 0.002
 retry_close_fail_force_scale: 1.05
@@ -229,18 +238,18 @@ retry_plausible_partial_slip_grasp_z_delta_m: 0.0
 gripper_joint_open_pos_m: 0.0
 gripper_joint_closed_pos_m: 0.019
 
-# If the object moved this much during a failed attempt, retry is treated as
+## If the object moved this much during a failed attempt, retry is treated as
 # fresh re-perception instead of a tiny correction to the previous grasp.
 retry_object_displacement_fresh_pose_threshold_m: 0.015
 retry_object_horizontal_displacement_fresh_pose_threshold_m: 0.015
 
-# Thin-disc low-edge contact rule:
+## Thin-disc low-edge contact rule:
 # when a thin object/disc contacts at the low/open edge and fails micro-lift,
 # raise the next grasp slightly to avoid table-edge/tangential contact artifacts.
 retry_low_edge_thin_raise_z_delta_m: 0.002
 retry_low_edge_contact_alpha: 0.25
 
-# Borderline micro-lift rule:
+## Borderline micro-lift rule:
 # if the object almost passes micro-lift, do not lower the next grasp.
 retry_borderline_lift_delta_margin_m: 0.002
 retry_borderline_following_ratio_margin: 0.08
