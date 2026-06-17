@@ -141,16 +141,22 @@ class RetryPolicy:
         return low, high
 
     def _classify_contact_quality(self, attempt_log: dict) -> dict:
-        """Classify whether the previous close contact looked physically meaningful.
+        """Classify the previous close using gripper-native pair diagnostics.
 
-        This turns low-level gripper readings into a symbolic diagnosis usable by
-        action selection.
+        The balanced gripper already computes a pair-aware contact_quality from
+        mean finger closure, asymmetry, and the expected contact window. The
+        retry policy must not rebuild the diagnosis from the old scalar
+        contact_position, otherwise action selection can disagree with the
+        execution monitor.
         """
         diag = self._get_close_diagnostics(attempt_log)
 
         result = {
             "quality": "unknown",
+            "source": "missing",
             "contact_position_m": None,
+            "avg_position_m": None,
+            "asymmetry_m": None,
             "expected_contact_position_m": diag.get("expected_contact_position_m"),
             "expected_contact_window_m": None,
             "has_object": diag.get("has_object"),
@@ -158,22 +164,52 @@ class RetryPolicy:
             "close_failure_reason": diag.get("close_failure_reason"),
             "opening_m": diag.get("opening_m"),
             "normalized_contact_in_window": None,
+            "gripper_contact_quality_raw": diag.get("contact_quality"),
         }
 
         if not diag:
             result["quality"] = "missing_close_diagnostics"
             return result
 
-        contact = diag.get("contact_position")
         window = self._contact_window(diag)
-
         if window is not None:
             result["expected_contact_window_m"] = [window[0], window[1]]
+
+        # Preferred path: use the balanced gripper's native pair-aware quality.
+        raw_quality = diag.get("contact_quality")
+        if isinstance(raw_quality, dict):
+            q = str(raw_quality.get("quality") or "unknown")
+            result["source"] = "balanced_gripper_pair_quality"
+            result["quality"] = q
+            result["avg_position_m"] = raw_quality.get("avg_position_m")
+            result["asymmetry_m"] = raw_quality.get("asymmetry_m")
+            result["expected_contact_window_m"] = (
+                raw_quality.get("window_m")
+                or result["expected_contact_window_m"]
+            )
+            result["contact_position_m"] = raw_quality.get(
+                "min_position_m",
+                diag.get("contact_position"),
+            )
+            result["normalized_contact_in_window"] = raw_quality.get(
+                "normalized_avg_in_window"
+            )
+            result["pair_plausible"] = raw_quality.get("plausible")
+            result["pair_clean"] = raw_quality.get("clean")
+            result["avg_in_compressed_grace"] = raw_quality.get(
+                "avg_in_compressed_grace"
+            )
+            result["compressed_high_m"] = raw_quality.get("compressed_high_m")
+            return result
+
+        # Backward-compatible fallback for older logs/controllers.
+        contact = diag.get("contact_position")
 
         if contact is None:
             reason = diag.get("close_failure_reason")
             if reason in (
                 "ignored_implausible_early_stall",
+                "ignored_implausible_pair_stall",
                 "closing_timeout_no_plausible_contact",
             ):
                 result["quality"] = "no_plausible_contact_or_early_stall"
@@ -181,14 +217,17 @@ class RetryPolicy:
                 result["quality"] = "no_contact"
             else:
                 result["quality"] = "no_contact_position_logged"
+            result["source"] = "legacy_scalar_no_contact"
             return result
 
         try:
             contact = float(contact)
         except Exception:
             result["quality"] = "invalid_contact_position"
+            result["source"] = "legacy_scalar_invalid"
             return result
 
+        result["source"] = "legacy_scalar_contact_position"
         result["contact_position_m"] = contact
 
         if window is None:
@@ -447,14 +486,17 @@ class RetryPolicy:
             if contact_quality in (
                 "no_plausible_contact_or_early_stall",
                 "contact_too_early_or_not_reached",
+                "too_open_or_early",
+                "too_asymmetric",
             ):
                 z_delta = float(
                     self.config.get("retry_early_stall_raise_z_delta_m", 0.002)
                 ) if (thin_object or near_table) else 0.0
                 decision["reason"] = "retry_close_failed_no_plausible_contact"
-            elif contact_quality == "contact_too_far_closed":
-                # The gripper closed too much compared with the object model:
-                # likely pose/object mismatch. Refresh pose, do not force lower.
+            elif contact_quality in ("contact_too_far_closed", "too_closed_or_missed"):
+                # The pair average closed too much compared with the object model:
+                # likely pose/object mismatch or a compressed/missed contact.
+                # Refresh pose, do not force lower.
                 z_delta = 0.0
                 decision["reason"] = "retry_close_failed_contact_too_far_closed"
             else:
@@ -486,6 +528,8 @@ class RetryPolicy:
                 "no_plausible_contact_or_early_stall",
                 "no_contact",
                 "contact_too_early_or_not_reached",
+                "too_open_or_early",
+                "too_asymmetric",
                 "missing_close_diagnostics",
             )
 
