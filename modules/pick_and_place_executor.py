@@ -257,6 +257,51 @@ class PickAndPlaceExecutor:
             (a[2] - b[2]) ** 2
         )
 
+    def _last_known_object_pos_from_attempt(self, attempt_log: dict):
+        """Return the last object position observed inside a previous attempt."""
+        if not attempt_log:
+            return None
+
+        micro = attempt_log.get("micro_lift_validation") or {}
+        if micro.get("object_pos_after") is not None:
+            return micro.get("object_pos_after")
+
+        close = attempt_log.get("close_validation") or {}
+        if close.get("object_pos_after") is not None:
+            return close.get("object_pos_after")
+
+        if attempt_log.get("actual_object_pos") is not None:
+            return attempt_log.get("actual_object_pos")
+
+        return None
+
+    def _object_retry_displacement_summary(self, current_pos, previous_attempt: dict):
+        """Log how far the object moved between retry attempts."""
+        previous_pos = self._last_known_object_pos_from_attempt(previous_attempt)
+
+        summary = {
+            "previous_last_known_object_pos": previous_pos,
+            "current_refreshed_object_pos": current_pos,
+            "displacement_since_previous_attempt_m": None,
+            "horizontal_displacement_since_previous_attempt_m": None,
+            "retry_used_refreshed_pose": current_pos is not None,
+        }
+
+        if previous_pos is None or current_pos is None:
+            return summary
+
+        summary["displacement_since_previous_attempt_m"] = self._distance(
+            previous_pos,
+            current_pos,
+        )
+        summary["horizontal_displacement_since_previous_attempt_m"] = (
+            (
+                (float(previous_pos[0]) - float(current_pos[0])) ** 2
+                + (float(previous_pos[1]) - float(current_pos[1])) ** 2
+            ) ** 0.5
+        )
+        return summary
+
     # 2. helper to validate grasp just after closing gripper
     def validate_after_close(self, target, object_pos_before_close):
         object_pos_after = self._get_prim_world_pos(target.get("prim_path"))
@@ -589,6 +634,30 @@ class PickAndPlaceExecutor:
             "final_reason": None,
         }
 
+        # ─────────────────────────────────────────────────────────────
+        # Early affordance/range guard.
+        # If the object is clearly outside the hard 2FG7 range, do not spend
+        # time planning and do not pretend a pick primitive is reasonable.
+        # This is action selection rejecting an unavailable motor schema.
+        target_feasibility = trial_log.get("target_feasibility", {}) or {}
+        if (not target_feasibility.get("within_hard_range", True)) or str(
+            target_feasibility.get("grip_feasibility_class", "")
+        ).startswith("infeasible"):
+            print("[Executor] ❌ Target rejected before planning: outside hard gripper range.")
+            trial_log["trial_success"] = False
+            trial_log["final_reason"] = "target_infeasible_for_gripper_range"
+            trial_log["events"].append(
+                make_event(
+                    "target_infeasible_for_gripper_range",
+                    grip_dim_m=target_feasibility.get("estimated_object_grip_dim_m"),
+                    grip_range_min_m=target_feasibility.get("grip_range_min_m"),
+                    grip_range_max_m=target_feasibility.get("grip_range_max_m"),
+                    grip_feasibility_class=target_feasibility.get("grip_feasibility_class"),
+                )
+            )
+            self._last_trial_log = trial_log
+            return False
+
         print("\n[Executor] Robot reset already handled by TrialRunner.")
 
         #-------------------------
@@ -603,6 +672,7 @@ class PickAndPlaceExecutor:
                 "attempt": attempt + 1,
                 "stored_object_pos": json_safe(target.get("world_pos")),
                 "actual_object_pos": None,
+                "object_displacement_since_previous_attempt": None,
                 "target_feasibility": grip_feasibility(target, self.config),
                 "safe_above_ok": False,
                 "pre_grasp_ok": False,
@@ -635,6 +705,25 @@ class PickAndPlaceExecutor:
                 actual_object_pos = target["world_pos"]
 
             attempt_log["actual_object_pos"] = json_safe(actual_object_pos)
+            if attempt > 0 and trial_log.get("attempts"):
+                attempt_log["object_displacement_since_previous_attempt"] = json_safe(
+                    self._object_retry_displacement_summary(
+                        actual_object_pos,
+                        trial_log["attempts"][-1],
+                    )
+                )
+                attempt_log["events"].append(
+                    make_event(
+                        "retry_object_pose_refreshed",
+                        object_displacement_since_previous_attempt_m=(
+                            attempt_log["object_displacement_since_previous_attempt"].get(
+                                "displacement_since_previous_attempt_m"
+                            )
+                            if attempt_log.get("object_displacement_since_previous_attempt")
+                            else None
+                        ),
+                    )
+                )
             attempt_log["snapshots"]["before_planning"] = pose_snapshot(
                 self, target, "before_planning"
             )
@@ -728,6 +817,7 @@ class PickAndPlaceExecutor:
                 actual_object_pos = target["world_pos"]
             
             attempt_log["actual_object_pos"] = json_safe(actual_object_pos)
+            attempt_log["retry_used_refreshed_pose_after_safe_above"] = True
             attempt_log["snapshots"]["after_safe_above_object_refresh"] = pose_snapshot(
                 self, target, "after_safe_above_object_refresh"
             )

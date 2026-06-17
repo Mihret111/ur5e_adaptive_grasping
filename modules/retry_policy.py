@@ -1,3 +1,5 @@
+import math
+
 # modules/retry_policy.py
 
 class RetryPolicy:
@@ -223,6 +225,156 @@ class RetryPolicy:
         return float(requested_delta)
 
     # ------------------------------------------------------------------
+    # Object-motion / retry-context helpers
+    # ------------------------------------------------------------------
+    def _point_distance(self, a, b) -> float:
+        """Euclidean distance between two 3D points, or 0 if unavailable."""
+        if a is None or b is None:
+            return 0.0
+        try:
+            return math.sqrt(
+                (float(a[0]) - float(b[0])) ** 2
+                + (float(a[1]) - float(b[1])) ** 2
+                + (float(a[2]) - float(b[2])) ** 2
+            )
+        except Exception:
+            return 0.0
+
+    def _horizontal_distance(self, a, b) -> float:
+        """Horizontal XY distance between two 3D points, or 0 if unavailable."""
+        if a is None or b is None:
+            return 0.0
+        try:
+            return math.sqrt(
+                (float(a[0]) - float(b[0])) ** 2
+                + (float(a[1]) - float(b[1])) ** 2
+            )
+        except Exception:
+            return 0.0
+
+    def _attempt_object_motion(self, attempt_log: dict) -> dict:
+        """Summarize how much the object moved during the failed attempt.
+
+        This is important because a retry after an object has rolled/slid should
+        be treated as fresh re-perception, not as a tiny correction to the old
+        grasp.
+        """
+        micro = attempt_log.get("micro_lift_validation", {}) or {}
+        close = attempt_log.get("close_validation", {}) or {}
+
+        before = None
+        after = None
+        source = "none"
+
+        if micro.get("object_pos_before") is not None and micro.get("object_pos_after") is not None:
+            before = micro.get("object_pos_before")
+            after = micro.get("object_pos_after")
+            source = "micro_lift_validation"
+        elif close.get("object_pos_before") is not None and close.get("object_pos_after") is not None:
+            before = close.get("object_pos_before")
+            after = close.get("object_pos_after")
+            source = "close_validation"
+
+        total = self._point_distance(before, after)
+        horizontal = self._horizontal_distance(before, after)
+        dz = 0.0
+        try:
+            if before is not None and after is not None:
+                dz = float(after[2]) - float(before[2])
+        except Exception:
+            dz = 0.0
+
+        threshold = float(
+            self.config.get("retry_object_displacement_fresh_pose_threshold_m", 0.015)
+        )
+        horizontal_threshold = float(
+            self.config.get("retry_object_horizontal_displacement_fresh_pose_threshold_m", threshold)
+        )
+
+        significant = (total >= threshold) or (horizontal >= horizontal_threshold)
+
+        return {
+            "source": source,
+            "object_pos_before": before,
+            "object_pos_after": after,
+            "object_displacement_m": total,
+            "object_horizontal_displacement_m": horizontal,
+            "object_delta_z_m": dz,
+            "fresh_pose_threshold_m": threshold,
+            "fresh_pose_horizontal_threshold_m": horizontal_threshold,
+            "significant_object_motion": significant,
+        }
+
+    def _is_plausible_contact_quality(self, quality: str) -> bool:
+        """Return True for both old and balanced-gripper plausible labels."""
+        q = str(quality or "")
+        return q.startswith("plausible_contact") or q.startswith("plausible_")
+
+    def _is_low_edge_contact(self, contact_info: dict) -> bool:
+        """Detect contact at the lower/open edge of the expected contact window."""
+        q = str(contact_info.get("quality", ""))
+        if q == "plausible_contact_low_edge":
+            return True
+
+        alpha = contact_info.get("normalized_contact_in_window")
+        try:
+            return float(alpha) < float(
+                self.config.get("retry_low_edge_contact_alpha", 0.25)
+            )
+        except Exception:
+            return False
+
+    def _is_borderline_micro_lift_failure(self, micro: dict) -> bool:
+        """Detect almost-successful micro-lifts.
+
+        If the object almost followed, lowering the grasp is usually not the
+        right retry. Repeat from refreshed pose, hold longer, and lift slower.
+        """
+        if not micro:
+            return False
+
+        thresholds = micro.get("thresholds", {}) or {}
+        min_dz = float(
+            thresholds.get(
+                "min_success_micro_lift_delta_m",
+                self.config.get("min_success_micro_lift_delta_m", 0.015),
+            )
+        )
+        min_ratio = float(
+            thresholds.get(
+                "min_micro_lift_following_ratio",
+                self.config.get("min_micro_lift_following_ratio", 0.60),
+            )
+        )
+        max_drift = float(
+            thresholds.get(
+                "max_micro_lift_relative_drift_m",
+                self.config.get("max_micro_lift_relative_drift_m", 0.015),
+            )
+        )
+
+        dz = micro.get("object_lift_delta_z_m", 0.0)
+        ratio = micro.get("following_ratio", 0.0)
+        drift = micro.get("relative_grasp_drift_m", 999.0)
+
+        try:
+            dz = float(dz)
+            ratio = float(ratio)
+            drift = float(drift)
+        except Exception:
+            return False
+
+        dz_margin = float(self.config.get("retry_borderline_lift_delta_margin_m", 0.002))
+        ratio_margin = float(self.config.get("retry_borderline_following_ratio_margin", 0.08))
+        drift_margin = float(self.config.get("retry_borderline_drift_margin_m", 0.004))
+
+        near_dz = dz >= (min_dz - dz_margin)
+        near_ratio = ratio >= (min_ratio - ratio_margin)
+        acceptable_drift = drift <= (max_drift + drift_margin)
+
+        return near_dz and near_ratio and acceptable_drift
+
+    # ------------------------------------------------------------------
     # Main policy
     # ------------------------------------------------------------------
     def decide(self, trial_log: dict, attempt_log: dict) -> dict:
@@ -244,6 +396,10 @@ class RetryPolicy:
         near_table = self._is_near_table_grasp(attempt_log)
         contact_info = self._classify_contact_quality(attempt_log)
         contact_quality = contact_info.get("quality")
+        object_motion = self._attempt_object_motion(attempt_log)
+        significant_object_motion = bool(
+            object_motion.get("significant_object_motion", False)
+        )
 
         decision = {
             "retry": False,
@@ -260,6 +416,8 @@ class RetryPolicy:
                 "micro_lift_classification": micro.get("failure_classification"),
                 "contact_quality": contact_quality,
                 "contact_info": contact_info,
+                "object_motion_after_attempt": object_motion,
+                "significant_object_motion": significant_object_motion,
             },
         }
 
@@ -323,7 +481,7 @@ class RetryPolicy:
         if failure_reason == "micro_lift_validation_failed":
             cls = micro.get("failure_classification", "")
 
-            plausible_contact = str(contact_quality).startswith("plausible_contact")
+            plausible_contact = self._is_plausible_contact_quality(contact_quality)
             bad_or_missing_contact = contact_quality in (
                 "no_plausible_contact_or_early_stall",
                 "no_contact",
@@ -337,13 +495,23 @@ class RetryPolicy:
                 if plausible_contact:
                     # The gripper contacted at the expected width, but the object
                     # did not follow. So the next attempt should not blindly lower.
-                    # Prefer stronger/longer/slower capture, with only tiny lowering
-                    # for non-thin, non-table-limited objects.
-                    requested_z = float(
-                        self.config.get("retry_plausible_no_follow_grasp_z_delta_m", -0.001)
-                    )
-                    z_delta = self._safe_z_delta(requested_z, thin_object, near_table)
-                    decision["reason"] = "retry_no_follow_after_plausible_contact"
+                    # For thin discs with low-edge contact, raise slightly: this
+                    # often means the fingers touched a table/edge artifact before
+                    # truly wrapping the object.
+                    if thin_object and self._is_low_edge_contact(contact_info):
+                        z_delta = float(
+                            self.config.get("retry_low_edge_thin_raise_z_delta_m", 0.002)
+                        )
+                        decision["reason"] = "retry_thin_low_edge_contact_raise_grasp"
+                    elif significant_object_motion:
+                        z_delta = 0.0
+                        decision["reason"] = "retry_no_follow_fresh_pose_after_object_motion"
+                    else:
+                        requested_z = float(
+                            self.config.get("retry_plausible_no_follow_grasp_z_delta_m", -0.001)
+                        )
+                        z_delta = self._safe_z_delta(requested_z, thin_object, near_table)
+                        decision["reason"] = "retry_no_follow_after_plausible_contact"
                 elif bad_or_missing_contact:
                     z_delta = float(
                         self.config.get("retry_early_stall_raise_z_delta_m", 0.002)
@@ -376,11 +544,15 @@ class RetryPolicy:
                 decision["retry"] = True
 
                 if plausible_contact:
-                    requested_z = float(
-                        self.config.get("retry_plausible_partial_slip_grasp_z_delta_m", 0.0)
-                    )
-                    z_delta = self._safe_z_delta(requested_z, thin_object, near_table)
-                    decision["reason"] = "retry_partial_slip_after_plausible_contact"
+                    if significant_object_motion:
+                        z_delta = 0.0
+                        decision["reason"] = "retry_partial_slip_fresh_pose_after_object_motion"
+                    else:
+                        requested_z = float(
+                            self.config.get("retry_plausible_partial_slip_grasp_z_delta_m", 0.0)
+                        )
+                        z_delta = self._safe_z_delta(requested_z, thin_object, near_table)
+                        decision["reason"] = "retry_partial_slip_after_plausible_contact"
                 else:
                     z_delta = self._safe_z_delta(
                         float(self.config.get("retry_partial_slip_grasp_z_delta_m", -0.002)),
@@ -405,14 +577,24 @@ class RetryPolicy:
                 return decision
 
             # Unknown micro-lift failure: retry cautiously once.
+            # If the micro-lift almost passed, or the object moved significantly,
+            # do not lower the grasp. Treat the next attempt as fresh perception.
             decision["retry"] = True
-            decision["reason"] = "retry_unknown_micro_lift_failure_cautious"
+            borderline = self._is_borderline_micro_lift_failure(micro)
+            if plausible_contact and (borderline or significant_object_motion):
+                decision["reason"] = "retry_borderline_micro_lift_repeat_fresh_pose"
+                z_delta = 0.0
+            else:
+                decision["reason"] = "retry_unknown_micro_lift_failure_cautious"
+                z_delta = self._safe_z_delta(-0.002, thin_object, near_table)
+
             decision["adjustments"] = {
                 "refresh_object_pose": True,
-                "grasp_z_delta_m": self._safe_z_delta(-0.002, thin_object, near_table),
+                "grasp_z_delta_m": z_delta,
                 "force_scale": 1.0 if fragile else 1.05,
-                "hold_settle_extra_s": 0.3,
-                "micro_lift_speed_scale": 0.85,
+                "hold_settle_extra_s": 0.4 if borderline else 0.3,
+                "micro_lift_speed_scale": 0.80 if borderline else 0.85,
+                "fresh_reperception_retry": bool(borderline or significant_object_motion),
             }
             return decision
 
