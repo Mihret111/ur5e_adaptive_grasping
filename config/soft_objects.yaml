@@ -1,0 +1,56 @@
+# ===================================================================
+# soft_objects.yaml — FoamCube-first benchmark configuration
+# Purpose:
+#   Controlled soft/deformable object benchmark for B2B adaptive grasping.
+#   This file is separate from objects.yaml, which remains the rigid/random
+#   object baseline from the professor.
+# ===================================================================
+
+soft_object_catalog_enabled: true
+soft_object_force_all_targets: true
+soft_asset_missing_fallback_to_proxy: false
+
+# Keep one object active first. After FoamCube works in the full pipeline,
+# add stress_ball / tomato / thin_pad / fragile_proxy here.
+soft_objects:
+  - label: foam_cube
+    asset_type: deformable_usd
+    asset_path: assets/soft_objects/foam_cube/foam_cube_deformable.usd
+
+    # Geometry / physical identity
+    shape: Cube
+    material: foam
+    compliance: soft
+    deformable: true
+    fragility: medium
+    thin_object: false
+
+    # 2FG7 compatibility: outwards external grip range is 35–73 mm.
+    grip_dim_mm: 50
+    height_mm: 50
+
+    # Mass estimate from density * volume:
+    # 150 kg/m^3 * (0.05 m)^3 = 0.01875 kg ≈ 0.02 kg.
+    mass_kg: 0.02
+    density_kg_m3: 150
+    youngs_modulus_pa: 50000
+    poissons_ratio: 0.25
+
+    # Contact metadata used by strategy/logging. USD material owns actual
+    # deformable physics friction; these values keep the cognitive profile explicit.
+    static_friction: 0.90
+    dynamic_friction: 0.75
+    restitution: 0.02
+
+    # Real 2FG7 force range is 20–140 N, so do not command below 20 N.
+    preferred_force_n: 20
+    max_force_n: 28
+
+    # Gentle deformation-aware grasp policy
+    close_speed_scale: 0.45
+    hold_extra_m: 0.0005
+    micro_lift_speed_scale: 0.45
+
+    strategy_hint: delicate_pick
+    validation_profile: soft_deformable
+    fallback_primitive: none
