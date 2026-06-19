@@ -1589,6 +1589,12 @@ class UR5EController:
             "retract":            flange_retract,
             "approach_offset_m":  approach_offset_m,
             "target_force_n":     target_force_n,
+            "gripper_hold_extra_close_m": grasp_plan.get("gripper_hold_extra_close_m") if object_metadata else None,
+            "micro_lift_speed_scale": grasp_plan.get("micro_lift_speed_scale", 1.0) if object_metadata else 1.0,
+            "validation_profile": grasp_plan.get("validation_profile", "standard") if object_metadata else "standard",
+            "object_compliance": grasp_plan.get("compliance", "rigid") if object_metadata else "rigid",
+            "object_deformable": grasp_plan.get("deformable", False) if object_metadata else False,
+            "object_fragile": grasp_plan.get("fragile", False) if object_metadata else False,
             "approach_dir":       (dir_x, dir_y),
             "approach_angle_rad": approach_angle,
             "grasp_strategy":     grasp_strategy,
@@ -1641,30 +1647,73 @@ class UR5EController:
         plan["approach_offset_m"] = min(
             offset_mm / 1000.0, self._max_insertion_depth)
 
-        # ── Grip force (unchanged) ─────────────────────────────────
+        # ── Grip force / compliance-aware regulation ───────────────
+        compliance = str(obj_metadata.get("compliance", "rigid")).lower()
+        deformable = bool(obj_metadata.get("deformable", False))
+        fragile = bool(obj_metadata.get("fragile", False))
+        soft_like = deformable or compliance in ("soft", "deformable", "compliant")
+
         mu            = 0.6
         physics_force = (mass * 9.81 * self._force_safety) / (2 * mu)
         sim_min_force = max(40.0, mass * 200.0)
-        plan["target_force_n"] = max(
-            self._min_grip_force,
-            min(self._max_grip_force,
-                max(physics_force, sim_min_force)),
-        )
+        nominal_force = max(physics_force, sim_min_force)
 
         if shape == "Sphere":
-            plan["target_force_n"] = min(
-                self._max_grip_force,
-                plan["target_force_n"] * 1.5)
+            nominal_force *= 1.5
         elif shape in ("Cylinder", "Disc"):
-            plan["target_force_n"] = min(
-                self._max_grip_force,
-                plan["target_force_n"] * 1.2)
+            nominal_force *= 1.2
 
         obj_height = self._get_object_height(obj_metadata)
         if obj_height > self._finger_grasp_height:
-            plan["target_force_n"] = min(
-                self._max_grip_force,
-                plan["target_force_n"] * 1.3)
+            nominal_force *= 1.3
+
+        plan["target_force_n"] = max(
+            self._min_grip_force,
+            min(self._max_grip_force, nominal_force),
+        )
+
+        # Soft/deformable/fragile objects use a force cap and smaller hold
+        # squeeze.  In simulation we keep at least the configured minimum force
+        # so contact does not numerically slip immediately, but the policy is
+        # explicitly compliance-aware and transferable to the real 2FG7 force API.
+        if soft_like or fragile:
+            preferred = obj_metadata.get("preferred_force_n", None)
+            max_soft_force = obj_metadata.get("max_force_n", None)
+
+            if preferred is not None:
+                plan["target_force_n"] = float(preferred)
+            if max_soft_force is not None:
+                plan["target_force_n"] = min(
+                    plan["target_force_n"],
+                    float(max_soft_force),
+                )
+
+            plan["target_force_n"] = max(
+                self._min_grip_force,
+                min(self._max_grip_force, plan["target_force_n"]),
+            )
+            plan["strategy"] = "delicate_external"
+            plan["compliance"] = compliance
+            plan["deformable"] = deformable
+            plan["fragile"] = fragile
+            plan["gripper_hold_extra_close_m"] = obj_metadata.get(
+                "gripper_hold_extra_close_m",
+                self.config.get("soft_gripper_hold_extra_close_m", 0.0007),
+            )
+            plan["micro_lift_speed_scale"] = obj_metadata.get(
+                "micro_lift_speed_scale",
+                self.config.get("soft_micro_lift_speed_scale", 0.55),
+            )
+            plan["validation_profile"] = obj_metadata.get(
+                "validation_profile", "soft"
+            )
+        else:
+            plan["compliance"] = compliance
+            plan["deformable"] = deformable
+            plan["fragile"] = fragile
+            plan["gripper_hold_extra_close_m"] = None
+            plan["micro_lift_speed_scale"] = 1.0
+            plan["validation_profile"] = "standard"
 
         return plan
 
@@ -3171,6 +3220,12 @@ class UR5EController:
         result = {
             "flange_targets": targets,
             "target_force_n": targets.get("target_force_n", 80.0),
+            "gripper_hold_extra_close_m": targets.get("gripper_hold_extra_close_m"),
+            "micro_lift_speed_scale": targets.get("micro_lift_speed_scale", 1.0),
+            "validation_profile": targets.get("validation_profile", "standard"),
+            "object_compliance": targets.get("object_compliance", "rigid"),
+            "object_deformable": targets.get("object_deformable", False),
+            "object_fragile": targets.get("object_fragile", False),
             "grasp_strategy": targets.get("grasp_strategy", "full_wrap"),
             "object_height":  targets.get("object_height", 0.035),
             "height_info":    targets.get("height_info", {}),

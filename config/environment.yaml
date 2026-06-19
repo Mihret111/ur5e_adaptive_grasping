@@ -84,7 +84,6 @@ park_robot_after_trial: true
 
 startup_home_duration: 4.0
 startup_home_steps: 240
-post_home_settle_seconds: 0.8
 
 park_gripper_open_seconds: 0.8
 park_home_duration: 3.0
@@ -138,9 +137,9 @@ arm_body_clearance: 0.08
 # Do not silently fall back to an unverified calibration motion.
 allow_calibration_fallback_for_pick: false
 
-# Current experiment: plan and execute only through grasp.
-enable_lift_test: true
-plan_retreat_during_pick: true
+# Current soft-object commissioning phase:
+# validate real capture by micro-lift first; enable full lift only after
+# the foam USD passes several stable micro-lift trials.
 
 # ───────────── CALIBRATED PRE-CLOSE GEOMETRY GATE ─────────────
 # Two diagnostic trials with different objects and table locations identified
@@ -208,9 +207,7 @@ gripper_min_unexpected_contact_joint_pos: 0.0015
 # Useful for spheres/cylinders and small object-size/PhysX uncertainty.
 gripper_compressed_contact_grace_m: 0.0015
 
-# Keep the existing pair limits explicit for readability.
-gripper_max_clean_contact_asymmetry_m: 0.006
-gripper_max_allowed_contact_asymmetry_m: 0.012
+# Pair limits are defined below with the close asymmetry guard.
 
 #TODO according to dataset gripper_contact_position_upper_tolerance_m:± 0.1 mm , so tighten it later
 gripper_contact_position_upper_tolerance_m: 0.004 #the gripper accepts contact within: expected ± 4 mm 

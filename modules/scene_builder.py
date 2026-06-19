@@ -18,6 +18,7 @@ Does NOT own:
   - Config loading
 """
 import math
+import os
 import random
 from typing import Optional
 
@@ -692,6 +693,179 @@ class SceneBuilder:
     # RANDOM OBJECT GENERATION
     # ══════════════════════════════════════════════════════════════════
 
+    # ══════════════════════════════════════════════════════════════════
+    # SOFT OBJECT CATALOGUE HELPERS
+    # ══════════════════════════════════════════════════════════════════
+
+    def _project_root(self) -> str:
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _resolve_asset_path(self, asset_path: str) -> str:
+        if not asset_path:
+            return ""
+        expanded = os.path.expanduser(asset_path)
+        if os.path.isabs(expanded):
+            return expanded
+        return os.path.join(self._project_root(), expanded)
+
+    def _select_weighted_entry(self, entries: list) -> dict:
+        weights = [float(e.get("weight", 1.0)) for e in entries]
+        return random.choices(entries, weights=weights, k=1)[0]
+
+    def _material_from_name(self, name: str, fallback: dict = None) -> dict:
+        """Return material dictionary by name from soft or normal material lists."""
+        fallback = fallback or {
+            "name": name or "soft_default",
+            "static_friction": 0.8,
+            "dynamic_friction": 0.7,
+            "restitution": 0.05,
+        }
+        for key in ("soft_physics_materials", "object_physics_materials"):
+            for mat in self.config.get(key, []) or []:
+                if mat.get("name") == name:
+                    return mat
+        return fallback
+
+    def _generate_soft_catalog_object(self, index: int, used_labels: set) -> dict:
+        """Generate one soft/deformable object definition from catalogue.
+
+        This supports two development modes:
+        - primitive_proxy: uses Cube/Rectangle/Cylinder/Sphere primitive geometry.
+        - deformable_usd/usd_reference: references an imported USD asset if it exists.
+
+        The object record always carries compliance/fragility fields so the
+        action-selection layer can choose delicate grasping.
+        """
+        catalog = self.config.get("soft_object_catalog", []) or []
+        if not catalog:
+            return None
+
+        tmpl = dict(self._select_weighted_entry(catalog))
+        shape = tmpl.get("shape", "Cube")
+        obj_def = {"shape": shape}
+
+        grip_dim = float(tmpl.get("grip_dim_mm", 50.0)) / 1000.0
+
+        if shape == "Cube":
+            side = float(tmpl.get("size_mm", tmpl.get("height_mm", tmpl.get("grip_dim_mm", 50.0)))) / 1000.0
+            obj_def["size"] = round(side, 4)
+            grip_mm = grip_dim * 1000
+
+        elif shape == "Rectangle":
+            width = float(tmpl.get("width_mm", tmpl.get("grip_dim_mm", 48.0))) / 1000.0
+            length = float(tmpl.get("length_mm", width * 1000.0 * 1.4)) / 1000.0
+            height = float(tmpl.get("height_mm", 35.0)) / 1000.0
+            obj_def.update({
+                "width": round(width, 4),
+                "length": round(length, 4),
+                "height": round(height, 4),
+            })
+            grip_mm = float(tmpl.get("grip_dim_mm", width * 1000.0))
+
+        elif shape in ("Cylinder", "Disc"):
+            radius = grip_dim / 2.0
+            height = float(tmpl.get("height_mm", 50.0)) / 1000.0
+            obj_def["radius"] = round(radius, 4)
+            obj_def["height"] = round(height, 4)
+            grip_mm = grip_dim * 1000
+
+        elif shape == "Sphere":
+            radius = grip_dim / 2.0
+            obj_def["radius"] = round(radius, 4)
+            grip_mm = grip_dim * 1000
+
+        else:
+            raise ValueError(f"Unknown soft object shape: {shape}")
+
+        if grip_mm < 45:
+            size_cat = "small"
+        elif grip_mm < 58:
+            size_cat = "medium"
+        else:
+            size_cat = "large"
+
+        color = tuple(tmpl.get("color", tmpl.get("visual_color", (0.9, 0.8, 0.4))))
+        # Accept both the old scaffold key (material_name) and the clearer
+        # research-config key (material).
+        material_name = tmpl.get("material_name", tmpl.get("material", "foam"))
+
+        material_fallback = {
+            "name": material_name,
+            "static_friction": float(tmpl.get("static_friction", 0.8)),
+            "dynamic_friction": float(tmpl.get("dynamic_friction", 0.7)),
+            "restitution": float(tmpl.get("restitution", 0.05)),
+        }
+        material = self._material_from_name(material_name, fallback=material_fallback)
+
+        # Accept mass_kg from the scientifically documented soft object profile.
+        mass = float(tmpl.get("mass_kg", tmpl.get("mass", 0.06)))
+
+        base_label = tmpl.get("label", f"{size_cat}_{material_name}_{shape.lower()}")
+        label = base_label
+        suffix = 2
+        while label in used_labels:
+            label = f"{base_label}_{suffix}"
+            suffix += 1
+        used_labels.add(label)
+
+        name = f"{tmpl.get('name', base_label)}_{index}"
+
+        obj_def.update({
+            "name": name,
+            "label": label,
+            "color": color,
+            "mass": mass,
+            "material": material,
+            "material_name": material.get("name", material_name),
+            "static_friction": float(material.get("static_friction", 0.8)),
+            "dynamic_friction": float(material.get("dynamic_friction", 0.7)),
+            "restitution": float(material.get("restitution", 0.05)),
+            "grip_dim_mm": round(float(grip_mm), 1),
+            "size_category": size_cat,
+            "color_name": tmpl.get("color_name", material_name),
+            "asset_type": tmpl.get("asset_type", "primitive_proxy"),
+            "asset_path": tmpl.get("asset_path"),
+            "resolved_asset_path": self._resolve_asset_path(tmpl.get("asset_path", "")),
+            "asset_scale": tmpl.get("asset_scale", None),
+            "asset_reference_height_m": tmpl.get("asset_reference_height_m", 1.0),
+            "asset_origin_z": tmpl.get("asset_origin_z", "auto_bbox"),
+            "spawn_local_xy_m": tmpl.get("spawn_local_xy_m"),
+            "spawn_yaw_deg_fixed": tmpl.get("spawn_yaw_deg"),
+            "compliance": tmpl.get("compliance", "soft"),
+            "deformable": bool(tmpl.get("deformable", True)),
+            "fragile": bool(tmpl.get("fragile", True)),
+            "fragility": tmpl.get("fragility", "medium"),
+            "thin_object": bool(tmpl.get("thin_object", False)),
+            "density_kg_m3": tmpl.get("density_kg_m3"),
+            "youngs_modulus_pa": tmpl.get("youngs_modulus_pa"),
+            "poissons_ratio": tmpl.get("poissons_ratio"),
+            "preferred_force_n": tmpl.get("preferred_force_n"),
+            "max_force_n": tmpl.get("max_force_n"),
+            # Accept both the internal key and the YAML-facing key.
+            "gripper_hold_extra_close_m": tmpl.get(
+                "gripper_hold_extra_close_m", tmpl.get("hold_extra_m")
+            ),
+            "micro_lift_speed_scale": tmpl.get("micro_lift_speed_scale"),
+            "close_speed_scale": tmpl.get("close_speed_scale"),
+            "strategy_hint": tmpl.get("strategy_hint", "delicate_pick"),
+            "validation_profile": tmpl.get("validation_profile", "soft"),
+            "fallback_primitive": tmpl.get("fallback_primitive"),
+            "soft_object": True,
+        })
+
+        # If the USD is authored as a 1-unit object, derive a metres scale from
+        # the scientific height declared in the catalogue.  This prevents a
+        # 50 mm foam cube from being referenced as a 1 metre cube and colliding
+        # with the table/robot during commissioning.
+        if obj_def.get("asset_type") in ("usd_reference", "deformable_usd"):
+            if obj_def.get("asset_scale") is None:
+                declared_height_m = float(tmpl.get("height_mm", tmpl.get("grip_dim_mm", 50.0))) / 1000.0
+                ref_height_m = max(float(obj_def.get("asset_reference_height_m", 1.0) or 1.0), 1e-6)
+                obj_def["asset_scale"] = declared_height_m / ref_height_m
+            obj_def["asset_scale"] = float(obj_def.get("asset_scale", 1.0))
+
+        return obj_def
+
     def _generate_random_object(self, index: int, used_labels: set) -> dict:
         """
         Generate a single random object definition by combining:
@@ -699,6 +873,14 @@ class SceneBuilder:
 
         Returns a dict with all info needed to spawn and label the object.
         """
+        # ── 0. Optional soft/deformable catalogue ─────────────────────
+        if self.config.get("soft_object_catalog_enabled", False):
+            prob = float(self.config.get("soft_object_spawn_probability", 1.0))
+            if random.random() <= prob:
+                soft_obj = self._generate_soft_catalog_object(index, used_labels)
+                if soft_obj is not None:
+                    return soft_obj
+
         # ── 1. Pick shape (weighted) ──────────────────────────────────
         shape_defs = self.config["shapes"]
         weights    = [s.get("weight", 1.0) for s in shape_defs]
@@ -810,6 +992,10 @@ class SceneBuilder:
             "grip_dim_mm":      round(grip_mm, 1),
             "size_category":    size_cat,
             "color_name":       color_name,
+            "soft_object":      False,
+            "compliance":       "rigid",
+            "deformable":       False,
+            "fragile":          material["name"] in ("glass", "ceramic"),
         })
 
         return obj_def
@@ -859,9 +1045,20 @@ class SceneBuilder:
         root = f"{self._trial_root}/Objects"
         UsdGeom.Xform.Define(self.stage, root)
 
-        # ── Generate N random object definitions ────────────────────
-        n_min, n_max = self.config["num_objects_range"]
-        n = random.randint(n_min, n_max)
+        # ── Generate N object definitions ───────────────────────────
+        # During first deformable-object commissioning we force a single
+        # catalogue object.  This removes clutter/randomness while we debug
+        # scale, table contact, and stability of the imported USD.
+        if (
+            self.config.get("soft_object_catalog_enabled", False)
+            and self.config.get("soft_object_commissioning_mode", False)
+            and self.config.get("soft_object_override_num_objects") is not None
+        ):
+            n = int(self.config.get("soft_object_override_num_objects", 1))
+            print(f"  [Objects] Soft commissioning mode: forcing n={n}")
+        else:
+            n_min, n_max = self.config["num_objects_range"]
+            n = random.randint(n_min, n_max)
 
         used_labels = set()
         obj_defs = []
@@ -920,45 +1117,77 @@ class SceneBuilder:
             self._create_object_material(mat_path, material)
 
             # ── Find valid placement position ───────────────────────
-            for attempt in range(80):
-                la = random.uniform(approach_min, approach_max_table)
-                lp = random.uniform(-perp_half, perp_half)
+            # For the first imported deformable asset we use a deterministic
+            # table-local pose. Random placement comes back after the asset is
+            # scaled, table-aligned, and stable.
+            fixed_local = obj_def.get("spawn_local_xy_m")
+            if fixed_local is None and self.config.get("soft_object_commissioning_mode", False):
+                fixed_local = self.config.get("soft_object_spawn_local_xy_m")
 
-                new_radius = self._get_footprint_radius(obj_def)
-                padding    = self.config.get("object_spacing_padding", 0.02)  # extra air gap
+            new_radius = self._get_footprint_radius(obj_def)
+            padding    = self.config.get("object_spacing_padding", 0.02)  # extra air gap
 
-                too_close = False
-                for pa, pp, pr in placed:
-                    required_dist = new_radius + pr + padding
-                    if math.hypot(la - pa, lp - pp) < required_dist:
-                        too_close = True
-                        break
+            if fixed_local is not None:
+                la = float(fixed_local[0])
+                lp = float(fixed_local[1])
+                jitter = float(self.config.get("soft_object_spawn_jitter_m", 0.0) or 0.0)
+                if jitter > 0.0:
+                    la += random.uniform(-jitter, jitter)
+                    lp += random.uniform(-jitter, jitter)
 
-                if too_close:
-                    continue
+                # Clamp to table surface bounds with margin.  This prevents a
+                # bad config from placing the soft object partly off the table.
+                la = max(approach_min + new_radius, min(approach_max_table - new_radius, la))
+                lp = max(-perp_half + new_radius, min(perp_half - new_radius, lp))
 
                 wx = tcx + la * ax + lp * px
                 wy = tcy + la * ay + lp * py
-
-                obj_dist = math.sqrt(
-                    (wx - ur5e_pos[0]) ** 2 +
-                    (wy - ur5e_pos[1]) ** 2
+                obj_dist = math.sqrt((wx - ur5e_pos[0]) ** 2 + (wy - ur5e_pos[1]) ** 2)
+                print(
+                    f"    [SoftSpawn] deterministic local=({la:.3f},{lp:.3f}) "
+                    f"world=({wx:.3f},{wy:.3f}) reach={obj_dist:.3f}m radius={new_radius:.3f}m"
                 )
-
                 if obj_dist > max_reach or obj_dist < min_reach:
+                    print(
+                        f"    ⚠ Deterministic soft spawn is outside reach "
+                        f"[{min_reach:.3f}, {max_reach:.3f}]m; using random fallback"
+                    )
+                    fixed_local = None
+
+            if fixed_local is None:
+                for attempt in range(80):
+                    la = random.uniform(approach_min, approach_max_table)
+                    lp = random.uniform(-perp_half, perp_half)
+
+                    too_close = False
+                    for pa, pp, pr in placed:
+                        required_dist = new_radius + pr + padding
+                        if math.hypot(la - pa, lp - pp) < required_dist:
+                            too_close = True
+                            break
+
+                    if too_close:
+                        continue
+
+                    wx = tcx + la * ax + lp * px
+                    wy = tcy + la * ay + lp * py
+
+                    obj_dist = math.sqrt(
+                        (wx - ur5e_pos[0]) ** 2 +
+                        (wy - ur5e_pos[1]) ** 2
+                    )
+
+                    if obj_dist > max_reach or obj_dist < min_reach:
+                        continue
+
+                    break
+                else:
+                    print(
+                        f"    ⚠ Could not place {obj_def['label']} "
+                        f"within reach")
                     continue
 
-                break
-            else:
-                print(
-                    f"    ⚠ Could not place {obj_def['label']} "
-                    f"within reach")
-                continue
-
             placed.append((la, lp, new_radius))
-
-            wx = tcx + la * ax + lp * px
-            wy = tcy + la * ay + lp * py
 
             # ── Z positioning ───────────────────────────────────────
             half_h    = self._get_half_height(obj_def)
@@ -971,7 +1200,9 @@ class SceneBuilder:
             # Cube: 90° increments + slight randomness (looks natural)
             # Rectangle: full random rotation (gripper reads prim yaw
             #            and always grasps across the short side)
-            if shape == "Sphere":
+            if obj_def.get("spawn_yaw_deg_fixed") is not None:
+                yaw_deg = float(obj_def.get("spawn_yaw_deg_fixed"))
+            elif shape == "Sphere":
                 yaw_deg = 0.0
             elif shape in ("Cylinder", "Disc"):
                 yaw_deg = 0.0
@@ -986,7 +1217,35 @@ class SceneBuilder:
             obj_def["spawn_yaw_deg"] = round(yaw_deg, 1)
 
             # ── Spawn geometry ──────────────────────────────────────
-            if shape == "Cube":
+            spawned_from_asset = False
+            asset_type = str(obj_def.get("asset_type", "primitive_proxy"))
+            asset_path = obj_def.get("resolved_asset_path") or ""
+            if asset_type in ("usd_reference", "deformable_usd") and asset_path:
+                if os.path.exists(asset_path):
+                    spawned_from_asset = self._make_usd_reference_object(
+                        path=prim_path,
+                        asset_path=asset_path,
+                        position=(wx, wy, wz),
+                        scale=obj_def.get("asset_scale", 1.0),
+                        rotation_z_deg=yaw_deg,
+                        align_bottom_z=(
+                            surface_z + float(self.config.get("soft_asset_table_clearance_m", 0.003))
+                            if self.config.get("soft_asset_align_bottom_to_table", True)
+                            else None
+                        ),
+                    )
+                elif not self.config.get("soft_asset_missing_fallback_to_proxy", True):
+                    print(f"    ❌ Missing soft asset: {asset_path}")
+                    continue
+                else:
+                    print(
+                        f"    ⚠ Missing soft asset for {obj_def['label']}; "
+                        "using primitive proxy fallback"
+                    )
+
+            if spawned_from_asset:
+                pass
+            elif shape == "Cube":
                 s = obj_def["size"]
                 self._make_box(
                     path=prim_path, size=(s, s, s),
@@ -1051,9 +1310,18 @@ class SceneBuilder:
                 "horiz_dist":       obj_dist,
             }
 
-            # Pass through all geometry keys
-            for key in ("size", "width", "length", "height",
-                        "radius", "size_xyz"):
+            # Pass through all geometry and semantic/action-selection keys
+            for key in (
+                "size", "width", "length", "height", "radius", "size_xyz",
+                "soft_object", "compliance", "deformable", "fragile",
+                "fragility", "thin_object", "density_kg_m3",
+                "youngs_modulus_pa", "poissons_ratio",
+                "asset_type", "asset_path", "resolved_asset_path", "asset_scale",
+                "preferred_force_n", "max_force_n",
+                "gripper_hold_extra_close_m", "micro_lift_speed_scale",
+                "close_speed_scale", "strategy_hint", "validation_profile",
+                "fallback_primitive",
+            ):
                 if key in obj_def:
                     obj_record[key] = obj_def[key]
 
@@ -1295,6 +1563,72 @@ class SceneBuilder:
             sph.GetPrim().CreateRelationship(
                 "material:binding:physics"
             ).SetTargets([Sdf.Path(physics_mat_path)])
+
+    def _make_usd_reference_object(
+        self,
+        path: str,
+        asset_path: str,
+        position: tuple,
+        scale=1.0,
+        rotation_z_deg: float = 0.0,
+        align_bottom_z=None,
+    ) -> bool:
+        """Reference an imported USD soft/deformable asset at a table pose.
+
+        The referenced asset should already contain its own physics setup
+        if it is truly deformable. This wrapper positions/scales it and,
+        during commissioning, optionally uses the composed USD bounding box to
+        align the lowest point just above the table. This is more robust than
+        assuming the imported asset origin is at its centre or bottom.
+        """
+        prim = self.stage.DefinePrim(Sdf.Path(path), "Xform")
+        if not prim.IsValid():
+            return False
+
+        prim.GetReferences().AddReference(asset_path)
+        xf = UsdGeom.Xformable(prim)
+        xf.ClearXformOpOrder()
+        translate_op = xf.AddTranslateOp()
+        translate = Gf.Vec3d(*position)
+        translate_op.Set(translate)
+        if rotation_z_deg != 0.0:
+            xf.AddRotateZOp().Set(rotation_z_deg)
+        if isinstance(scale, (int, float)):
+            scale_vec = Gf.Vec3f(float(scale), float(scale), float(scale))
+            xf.AddScaleOp().Set(scale_vec)
+        elif isinstance(scale, (list, tuple)) and len(scale) == 3:
+            scale_vec = Gf.Vec3f(float(scale[0]), float(scale[1]), float(scale[2]))
+            xf.AddScaleOp().Set(scale_vec)
+        else:
+            scale_vec = Gf.Vec3f(1.0, 1.0, 1.0)
+
+        bbox_msg = ""
+        if align_bottom_z is not None:
+            try:
+                bbox_cache = UsdGeom.BBoxCache(
+                    Usd.TimeCode.Default(),
+                    [UsdGeom.Tokens.default_, UsdGeom.Tokens.render],
+                    useExtentsHint=False,
+                )
+                world_bound = bbox_cache.ComputeWorldBound(prim)
+                box = world_bound.ComputeAlignedBox()
+                mn = box.GetMin()
+                mx = box.GetMax()
+                dz = float(align_bottom_z) - float(mn[2])
+                translate = Gf.Vec3d(translate[0], translate[1], translate[2] + dz)
+                translate_op.Set(translate)
+                bbox_msg = (
+                    f" bbox_before_min_z={float(mn[2]):.4f} "
+                    f"bbox_before_max_z={float(mx[2]):.4f} dz_align={dz:.4f}"
+                )
+            except Exception as e:
+                bbox_msg = f" bbox_align_failed={e}"
+
+        print(
+            f"    [SoftAsset] Referenced USD asset: {asset_path} "
+            f"scale={tuple(round(float(v), 5) for v in scale_vec)}{bbox_msg}"
+        )
+        return True
 
     def _apply_display_color(self, prim, color: tuple):
         gprim = UsdGeom.Gprim(prim)

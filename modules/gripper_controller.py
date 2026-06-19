@@ -64,6 +64,7 @@ class Gripper2FG7:
         self._hold_damping     = self.config.get("gripper_hold_damping",     2000.0)
         # How far PAST contact to target (positive = more closed)
         self._hold_extra_close = self.config.get("gripper_hold_extra_close", 0.002)
+        self._active_hold_extra_close = self._hold_extra_close
         # Hold at full close force — no reduction
         self._hold_force_ratio = self.config.get("gripper_hold_force_ratio", 1.0)
 
@@ -620,6 +621,7 @@ class Gripper2FG7:
         self,
         force_n: Optional[float] = None,
         expected_grip_dim_m: Optional[float] = None,
+        hold_extra_close_m: Optional[float] = None,
     ):
         """
         Close gripper — velocity-controlled approach.
@@ -630,6 +632,11 @@ class Gripper2FG7:
         )
         self._hold_force = self._clamp_force(
             self._close_force * self._hold_force_ratio
+        )
+        self._active_hold_extra_close = (
+            float(hold_extra_close_m)
+            if hold_extra_close_m is not None
+            else self._hold_extra_close
         )
 
         self._state         = self.CLOSING
@@ -696,7 +703,7 @@ class Gripper2FG7:
         )
         self._hold_targets = self._make_balanced_more_closed_targets(
             self._contact_positions,
-            self._hold_extra_close,
+            self._active_hold_extra_close,
         )
         self._hold_target_mode = "balanced_pair_no_opening"
 
@@ -724,7 +731,7 @@ class Gripper2FG7:
             f"          [2FG7] HOLD: contact={self._contact_position:.5f}m  "
             f"contact_positions={[round(p, 5) for p in self._contact_positions]}  "
             f"targets={[round(t, 5) for t in self._hold_targets]}  "
-            f"(+{self._hold_extra_close*1000:.1f}mm per finger)  "
+            f"(+{self._active_hold_extra_close*1000:.1f}mm per finger)  "
             f"F={self._hold_force:.0f}N  K={self._hold_stiffness:.0f}"
         )
 
@@ -926,7 +933,7 @@ class Gripper2FG7:
             )
             self._hold_targets = self._make_balanced_more_closed_targets(
                 self._contact_positions,
-                self._hold_extra_close,
+                self._active_hold_extra_close,
             )
             self._hold_target_mode = "balanced_pair_recovered"
 
@@ -1037,7 +1044,8 @@ class Gripper2FG7:
             "opening_m":        self.get_opening(),
             "close_force_n":    self._close_force,
             "hold_force_n":     self._hold_force,
-            "hold_extra_mm":    self._hold_extra_close * 1000,
+            "hold_extra_mm":    self._active_hold_extra_close * 1000,
+            "base_hold_extra_mm": self._hold_extra_close * 1000,
             "squeeze_phase":    self._squeeze_phase,
             "squeeze_ticks":    self._squeeze_ticks,
             "stall_count":      self._stall_count,

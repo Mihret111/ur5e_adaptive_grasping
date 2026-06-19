@@ -78,6 +78,7 @@ class PickAndPlaceExecutor:
         force_n=None,
         expected_grip_dim_m=None,
         hold_settle_extra_s: float = 0.0,
+        hold_extra_close_m=None,
     ):
         """Close gripper with optional object-size-aware contact expectation.
 
@@ -92,6 +93,7 @@ class PickAndPlaceExecutor:
         self.gripper.close(
             force_n=force_n,
             expected_grip_dim_m=expected_grip_dim_m,
+            hold_extra_close_m=hold_extra_close_m,
         )
 
         # Wait until the gripper leaves CLOSING, or until timeout.
@@ -1061,6 +1063,7 @@ class PickAndPlaceExecutor:
                 hold_settle_extra_s=float(
                     current_retry_adjustments.get("hold_settle_extra_s", 0.0)
                 ),
+                hold_extra_close_m=pick_result.get("gripper_hold_extra_close_m"),
             )
             attempt_log["gripper_close_resolution"] = json_safe(close_resolution)
 
@@ -1190,8 +1193,17 @@ class PickAndPlaceExecutor:
                     )
 
                     print("\n[Executor] Performing micro-lift verification checkpoint...")
-                    micro_lift_speed_scale = float(
+                    plan_micro_lift_speed_scale = float(
+                        pick_result.get("micro_lift_speed_scale", 1.0) or 1.0
+                    )
+                    retry_micro_lift_speed_scale = float(
                         current_retry_adjustments.get("micro_lift_speed_scale", 1.0)
+                    )
+                    # Use the slower/more cautious speed when either the object
+                    # strategy or retry policy requests it.
+                    micro_lift_speed_scale = min(
+                        plan_micro_lift_speed_scale,
+                        retry_micro_lift_speed_scale,
                     )
                     base_micro_lift_duration = float(
                         self.config.get("micro_lift_duration", 2.0)
@@ -1200,6 +1212,12 @@ class PickAndPlaceExecutor:
                         0.1,
                         micro_lift_speed_scale,
                     )
+                    attempt_log["micro_lift_speed_profile"] = json_safe({
+                        "plan_micro_lift_speed_scale": plan_micro_lift_speed_scale,
+                        "retry_micro_lift_speed_scale": retry_micro_lift_speed_scale,
+                        "effective_micro_lift_speed_scale": micro_lift_speed_scale,
+                        "duration_s": micro_lift_duration,
+                    })
 
                     ok = await self.arm.move_to(
                         micro_lift,

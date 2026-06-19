@@ -138,6 +138,7 @@ def load_all_configs(config_dir: Optional[str] = None):
     gripper = _load_yaml(config_dir, "gripper.yaml")
     table   = _load_yaml(config_dir, "table.yaml")
     objects = _load_yaml(config_dir, "objects.yaml")
+    soft_objects = _load_yaml(config_dir, "soft_objects.yaml")
     paths   = _load_yaml(config_dir, "paths.yaml")
 
     # ── Build CONFIG ────────────────────────────────────────────────
@@ -152,9 +153,25 @@ def load_all_configs(config_dir: Optional[str] = None):
         if k not in ("materials", "seat_slots"):
             CONFIG[k] = v
 
-    # Flat merge — objects 
+    # Flat merge — objects
     for k, v in objects.items():
         CONFIG[k] = v
+
+    # Flat merge — optional soft/deformable object catalogue
+    for k, v in soft_objects.items():
+        CONFIG[k] = v
+
+    # Backward/forward compatibility for the soft object catalogue.
+    # The YAML used by the project is intentionally human-readable:
+    #     soft_objects:
+    #       - label: foam_cube
+    # Internally, SceneBuilder expects CONFIG["soft_object_catalog"].
+    # Keep both names valid so the config file stays clear while the code
+    # remains compatible with the earlier scaffold.
+    if ("soft_objects" in CONFIG
+            and "soft_object_catalog" not in CONFIG
+            and isinstance(CONFIG.get("soft_objects"), list)):
+        CONFIG["soft_object_catalog"] = CONFIG["soft_objects"]
 
     # Nested — paths stays as CONFIG["paths"]
     CONFIG["paths"] = paths
@@ -183,6 +200,14 @@ def load_all_configs(config_dir: Optional[str] = None):
             and isinstance(CONFIG["object_physics_materials"], list)):
         _convert_color_entries(CONFIG["object_physics_materials"])
 
+    if ("soft_object_catalog" in CONFIG
+            and isinstance(CONFIG["soft_object_catalog"], list)):
+        _convert_color_entries(CONFIG["soft_object_catalog"])
+
+    if ("soft_physics_materials" in CONFIG
+            and isinstance(CONFIG["soft_physics_materials"], list)):
+        _convert_color_entries(CONFIG["soft_physics_materials"])
+
     # ── Validate required object generation keys ────────────────────
     required_keys = [
         "shapes", "colors", "grip_range_mm",
@@ -198,11 +223,15 @@ def load_all_configs(config_dir: Optional[str] = None):
     n_shapes = len(CONFIG.get("shapes", []))
     n_colors = len(CONFIG.get("colors", []))
     n_mats   = len(CONFIG.get("object_physics_materials", []))
+    n_soft   = len(CONFIG.get("soft_object_catalog", []))
     grip_cfg = CONFIG.get("grip_range_mm", {})
 
     print(f"  [config_loader] Loaded {len(CONFIG)} top-level keys")
     print(f"  [config_loader] Objects: {n_shapes} shapes, "
           f"{n_colors} colors, {n_mats} materials")
+    if n_soft:
+        print(f"  [config_loader] Soft objects: {n_soft} catalogue entries "
+              f"enabled={CONFIG.get('soft_object_catalog_enabled', False)}")
     print(f"  [config_loader] Grip range: "
           f"{grip_cfg.get('min', '?')}–{grip_cfg.get('max', '?')}mm")
     print(f"  [config_loader] Table: "
