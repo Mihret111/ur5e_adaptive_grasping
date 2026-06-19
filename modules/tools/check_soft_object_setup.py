@@ -1,11 +1,9 @@
-#!/usr/bin/env python3
-"""Offline sanity checks for the B2B soft-object phase.
+"""Offline sanity checks for soft-object phase.
 
 Run from the project root:
     python3 tools/check_soft_object_setup.py
 
-This script deliberately avoids Isaac-only imports so it can run in a normal
-terminal before launching Isaac Sim. It checks that the soft object catalogue is
+checks that the soft object catalogue is
 visible, physically plausible for the 2FG7 range, and that referenced USD assets
 exist.
 """

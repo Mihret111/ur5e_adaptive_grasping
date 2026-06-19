@@ -3,6 +3,7 @@
 from modules.arm_controller import UR5EController
 from modules.gripper_controller import Gripper2FG7
 from modules.micro_lift_validator import MicroLiftValidator
+from modules.soft_object_observer import SoftObjectObserver
 from modules.retry_policy import RetryPolicy
 from modules.trial_diagnostics import (
     compact_pick_result,
@@ -52,6 +53,7 @@ class PickAndPlaceExecutor:
             config=config,
         )
         self.micro_lift_validator = MicroLiftValidator(config)
+        self.soft_observer = SoftObjectObserver(config)
         self.retry_policy = RetryPolicy(config)
         # self.move_home_before_pick = config.get("move_home_before_pick", True)   #
         print("[PickAndPlaceExecutor] Ready.")
@@ -174,6 +176,44 @@ class PickAndPlaceExecutor:
         p = mtx.ExtractTranslation() # extract the translation from the transform
 
         return [float(p[0]), float(p[1]), float(p[2])]
+
+    def _is_soft_target(self, target: dict) -> bool:
+        return self.soft_observer.is_soft_target(target)
+
+    def _observe_target(self, target: dict, stage_name: str = "observe"):
+        """Return live soft-object observation when available.
+
+        For deformable USD objects this is the perceptual state used by
+        planning and validation.  Rigid targets return None and keep the old
+        root-transform behaviour.
+        """
+        if not self._is_soft_target(target):
+            return None
+        obs = self.soft_observer.observe(target)
+        if obs:
+            print(
+                f"[SoftObserver:{stage_name}] "
+                f"source={obs.get('pose_source')} "
+                f"center=({obs['center'][0]:.4f},{obs['center'][1]:.4f},{obs['center'][2]:.4f}) "
+                f"bottom_z={obs.get('bottom_z'):.4f} top_z={obs.get('top_z'):.4f} "
+                f"h={obs.get('height_m'):.4f} table_gap={obs.get('table_gap_m')} "
+                f"warnings={obs.get('warnings', [])}"
+            )
+        else:
+            print(f"[SoftObserver:{stage_name}] unavailable; falling back to root transform")
+        return obs
+
+    def _get_observed_object_pos(self, target: dict, stage_name: str = "object"):
+        """Return grasp-relevant object centre.
+
+        Soft objects use SoftObjectObserver's visible-bbox centre.  Rigid
+        objects use the original root transform.
+        """
+        obs = self._observe_target(target, stage_name=stage_name)
+        if obs and obs.get("center") is not None:
+            return list(obs["center"])
+        prim_path = target.get("prim_path") if isinstance(target, dict) else None
+        return self._get_prim_world_pos(prim_path)
 
     # ─────────────────────────────────────────────────────────────────────
     # Helper to always  reset robot before the trial starts
@@ -331,14 +371,17 @@ class PickAndPlaceExecutor:
 
     # 2. helper to validate grasp just after closing gripper
     def validate_after_close(self, target, object_pos_before_close):
-        object_pos_after = self._get_prim_world_pos(target.get("prim_path"))
+        object_pos_after = self._get_observed_object_pos(target, stage_name="after_close")
         flange_pos = self.arm.get_flange_world_pos()
+        soft_obs_after = self._observe_target(target, stage_name="after_close_validation")
 
         result = {
             "stage": "after_close",
+            "validation_mode": "soft_bbox" if self._is_soft_target(target) else "rigid_root",
             "gripper_has_object": self.gripper.has_object(),
             "object_pos_before": object_pos_before_close,
             "object_pos_after": object_pos_after,
+            "soft_observation_after": soft_obs_after,
             "flange_pos": flange_pos,
             "object_shift": None,
             "flange_object_distance": None,
@@ -356,6 +399,15 @@ class PickAndPlaceExecutor:
         result["object_shift"] = shift
         result["flange_object_distance"] = dist
 
+        if self._is_soft_target(target) and soft_obs_after:
+            result["soft_metrics"] = {
+                "height_m": soft_obs_after.get("height_m"),
+                "deformation_ratio_z": soft_obs_after.get("deformation_ratio_z"),
+                "table_gap_m": soft_obs_after.get("table_gap_m"),
+                "collision_visible_bottom_offset_m": soft_obs_after.get("collision_visible_bottom_offset_m"),
+                "warnings": soft_obs_after.get("warnings", []),
+            }
+
         max_shift = float(self.config.get("max_object_shift_during_close_m", 0.03))
         max_dist = float(self.config.get("max_object_flange_distance_after_close_m", 0.25))
 
@@ -372,19 +424,30 @@ class PickAndPlaceExecutor:
                 f"object too far from flange after close: {dist:.3f} > {max_dist:.3f}"
             )
 
+        if self._is_soft_target(target) and soft_obs_after:
+            max_table_gap = float(self.config.get("max_soft_table_gap_m", 0.003))
+            table_gap = soft_obs_after.get("table_gap_m")
+            if table_gap is not None and table_gap > max_table_gap:
+                result["reasons"].append(
+                    f"soft object not in table/contact-consistent pose: table_gap={table_gap:.4f} > {max_table_gap:.4f}"
+                )
+
         result["success"] = len(result["reasons"]) == 0
         return result
 
     # 3. helper to validate grasp after lift
     def validate_after_lift(self, target, object_pos_before_lift, table_height):
-        object_pos_after = self._get_prim_world_pos(target.get("prim_path"))
+        object_pos_after = self._get_observed_object_pos(target, stage_name="after_full_lift")
         flange_pos = self.arm.get_flange_world_pos()
+        soft_obs_after = self._observe_target(target, stage_name="after_full_lift_validation")
 
         result = {
             "stage": "after_lift",
+            "validation_mode": "soft_bbox" if self._is_soft_target(target) else "rigid_root",
             "gripper_has_object": self.gripper.has_object(),
             "object_pos_before_lift": object_pos_before_lift,
             "object_pos_after_lift": object_pos_after,
+            "soft_observation_after": soft_obs_after,
             "flange_pos": flange_pos,
             "object_lift_delta_z": None,
             "flange_object_distance": None,
@@ -646,6 +709,7 @@ class PickAndPlaceExecutor:
                 "prim_path": target.get("prim_path", "unknown"),
             },
             "target_full": json_safe(target),
+            "initial_soft_observation": json_safe(self._observe_target(target, stage_name="trial_start")),
             "target_feasibility": grip_feasibility(target, self.config),
             "table_info": json_safe(table_info),
             "config_snapshot": selected_config_snapshot(self.config),
@@ -726,7 +790,7 @@ class PickAndPlaceExecutor:
                 float(current_retry_adjustments.get("grasp_z_delta_m", 0.0))
             )
 
-            actual_object_pos = self._get_prim_world_pos(target.get("prim_path"))
+            actual_object_pos = self._get_observed_object_pos(target, stage_name="before_planning")
 
             if actual_object_pos is None:
                 actual_object_pos = target["world_pos"]
@@ -839,7 +903,7 @@ class PickAndPlaceExecutor:
             attempt_log["events"].append(make_event("safe_above_reached"))
 
             ## read actual object pose again 
-            actual_object_pos = self._get_prim_world_pos(target.get("prim_path"))
+            actual_object_pos = self._get_observed_object_pos(target, stage_name="after_safe_above")
             if actual_object_pos is None:
                 actual_object_pos = target["world_pos"]
             
@@ -936,8 +1000,8 @@ class PickAndPlaceExecutor:
             # We do not reject a grasp yet.  First verify the professor USD's
             # actual flange-to-finger axis convention using measured evidence.
             if self.config.get("enable_preclose_diagnostics", True):
-                preclose_object_pos = self._get_prim_world_pos(
-                    target.get("prim_path")
+                preclose_object_pos = self._get_observed_object_pos(
+                    target, stage_name="preclose"
                 )
 
                 if preclose_object_pos is not None:
@@ -1062,7 +1126,7 @@ class PickAndPlaceExecutor:
             print("\n[Executor] Closing gripper at grasp pose...")
 
             # Object pose just before closing; used for close/contact validation, NOT lift validation.
-            object_pos_before_close = self._get_prim_world_pos(target.get("prim_path"))
+            object_pos_before_close = self._get_observed_object_pos(target, stage_name="before_close")
 
             # TODO: use the same approach as in compute_pick_joints to get target force
             target_force = pick_result.get("target_force_n", None)
@@ -1210,8 +1274,8 @@ class PickAndPlaceExecutor:
                         self._last_trial_log = trial_log
                         return False
 
-                    object_before_micro = self._get_prim_world_pos(
-                        target.get("prim_path")
+                    object_before_micro = self._get_observed_object_pos(
+                        target, stage_name="before_micro_lift"
                     )
                     geometry_before_micro = (
                         self.arm.get_calibrated_capture_geometry_world()
@@ -1264,8 +1328,8 @@ class PickAndPlaceExecutor:
                         float(self.config.get("post_micro_lift_settle_seconds", 0.4))
                     )
 
-                    object_after_micro = self._get_prim_world_pos(
-                        target.get("prim_path")
+                    object_after_micro = self._get_observed_object_pos(
+                        target, stage_name="after_micro_lift"
                     )
                     geometry_after_micro = (
                         self.arm.get_calibrated_capture_geometry_world()
@@ -1365,7 +1429,7 @@ class PickAndPlaceExecutor:
 
                 # Object pose immediately before lift.
                 # This is the reference for lift delta.
-                object_pos_before_lift = self._get_prim_world_pos(target.get("prim_path"))
+                object_pos_before_lift = self._get_observed_object_pos(target, stage_name="before_full_lift")
 
                 print("\n[Executor] Lifting object...")
 

@@ -96,6 +96,13 @@ def selected_config_snapshot(config: dict) -> Dict[str, Any]:
         "arm_body_clearance",
         "planner_path_sample_count",
         "planner_link_sample_count",
+        "max_soft_table_gap_m",
+        "max_soft_visible_collision_bottom_offset_m",
+        "soft_observer_table_top_path",
+        "soft_asset_contact_offset_m",
+        "soft_asset_rest_offset_m",
+        "table_contact_offset_m",
+        "table_rest_offset_m",
     ]
     snap = {k: config.get(k) for k in keys if k in config}
 
@@ -228,10 +235,20 @@ def pose_snapshot(executor: Any, target: dict, stage: str) -> Dict[str, Any]:
     """Capture a compact state snapshot for diagnosis."""
     prim_path = target.get("prim_path") if target else None
     object_pos = None
+    soft_observation = None
     try:
-        object_pos = executor._get_prim_world_pos(prim_path)
+        if hasattr(executor, "_get_observed_object_pos"):
+            object_pos = executor._get_observed_object_pos(target, stage_name=f"snapshot_{stage}")
+        else:
+            object_pos = executor._get_prim_world_pos(prim_path)
     except Exception as e:
         object_pos = f"unavailable: {e}"
+
+    try:
+        if hasattr(executor, "_observe_target"):
+            soft_observation = executor._observe_target(target, stage_name=f"snapshot_{stage}")
+    except Exception as e:
+        soft_observation = {"error": str(e)}
 
     capture = None
     try:
