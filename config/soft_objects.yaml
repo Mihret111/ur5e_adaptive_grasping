@@ -1,11 +1,16 @@
 # ===================================================================
-# soft_objects.yaml — first real soft-object commissioning profile
-# Active object: foam_cube_green
+# soft_objects.yaml — Green foam deformable commissioning configuration
+# ===================================================================
+# Purpose:
+#   Commission exactly one real deformable foam cube in the B2B pipeline.
+#   The asset is authored at 40 mm side length, with root frame at bottom centre:
 #
-# Scientific purpose:
-#   Commission a single real deformable foam cube before enabling
-#   randomized soft-object batches. The cube is authored as a 40 mm object:
-#   Object Half Scale = 2 cm, mesh local z = 0.02 m, bottom at z=0.
+#       /World/FoamCube_Green          root at bottom centre
+#       /World/FoamCube_Green/CubeSoft_10 translate z = 0.02 m
+#
+#   Therefore SceneBuilder must place the asset root at the table surface,
+#   not at table + height/2. A tiny negative penetration is allowed to cancel
+#   visible contact-offset hovering during commissioning.
 # ===================================================================
 
 soft_object_catalog_enabled: true
@@ -13,32 +18,45 @@ soft_object_spawn_probability: 1.0
 soft_object_force_all_targets: true
 soft_asset_missing_fallback_to_proxy: false
 
-# Commissioning mode: spawn exactly one object at one safe table-local pose.
+# Commissioning mode: deterministic single object, no random clutter.
 soft_object_commissioning_mode: true
 soft_object_override_num_objects: 1
 soft_object_spawn_local_xy_m: [-0.07, 0.0]
 soft_object_spawn_jitter_m: 0.0
 
-# The asset root is authored bottom-centered; still align using bbox as a safety net.
+# USD placement policy.
 soft_asset_align_bottom_to_table: true
-soft_asset_table_clearance_m: 0.003
+soft_asset_table_clearance_m: 0.0
+
+# Small visual/contact-offset compensation.
+# If the cube still visibly floats, increase magnitude gradually: 0.001 -> 0.002 -> 0.003.
+# Do not go below -0.004 m for the 40 mm foam cube unless we inspect the log.
+soft_asset_table_penetration_m: 0.0
+
+# Contact offset commissioning.
+# A 40 mm deformable object cannot tolerate default ~20 mm contact shells.
+# Keep table and soft-object contact offsets small so collision geometry rests
+# where the visible object appears.
+table_contact_offset_m: 0.001
+table_rest_offset_m: 0.0
+soft_asset_contact_offset_m: 0.001
+soft_asset_rest_offset_m: 0.0
+print_contact_offset_errors: false
 
 soft_physics_materials:
-  - name: foam
-    static_friction: 0.90
-    dynamic_friction: 0.75
+  - name: foam_green
+    static_friction: 1.0
+    dynamic_friction: 1.0
     restitution: 0.02
 
 soft_objects:
   - label: foam_cube_green
-    name: foam_cube_green
     asset_type: deformable_usd
-    asset_path: assets/soft_objects/foam_cube/foam_cube_green_deformable.usd
+    asset_path: assets/soft_objects/foam_cube/foam_cube_green_aligned_v3_deformable.usd
+    asset_prim_path: /World/FoamCube_Green
 
-    # The USD is already authored at real metric size:
-    # Cube side = 0.04 m, root frame at bottom centre, mesh local z = 0.02 m.
+    # The USD is already authored in metres as a 40 mm cube. Do NOT rescale.
     asset_scale: 1.0
-    asset_reference_height_m: 0.04
     asset_origin_z: bottom_center
     spawn_pose_mode: bottom_on_table
 
@@ -46,29 +64,28 @@ soft_objects:
     spawn_yaw_deg: 0.0
 
     shape: Cube
-    material: foam
+    material: foam_green
     compliance: soft
     deformable: true
     fragility: medium
-    fragile: true
     thin_object: false
 
-    # Must match the actual authored geometry. Do not use 50 mm for this asset.
+    # Authored dimensions: half-scale 0.02 m -> full side 0.04 m.
     grip_dim_mm: 40.0
     height_mm: 40.0
     size_mm: 40.0
 
-    # density * volume = 150 * 0.04^3 = 0.0096 kg. Use 0.010 kg first.
+    # Mass estimate: 150 kg/m^3 * (0.04 m)^3 = 0.0096 kg.
     mass_kg: 0.010
     density_kg_m3: 150.0
     youngs_modulus_pa: 50000.0
     poissons_ratio: 0.25
     elasticity_damping: 0.08
+
+    static_friction: 1.0
     dynamic_friction: 1.0
-    static_friction: 0.90
     restitution: 0.02
 
-    # 2FG7 lower limit is about 20 N, so we use the minimum real command.
     preferred_force_n: 20.0
     max_force_n: 28.0
 
@@ -76,12 +93,6 @@ soft_objects:
     hold_extra_m: 0.0005
     micro_lift_speed_scale: 0.45
 
-    validation_profile: soft_deformable
     strategy_hint: delicate_pick
+    validation_profile: soft_deformable
     fallback_primitive: none
-
-# Keep future objects documented but inactive until green foam commissioning passes.
-inactive_soft_objects:
-  - label: foam_cube_yellow_r8
-    asset_path: assets/soft_objects/foam_cube/foam_cube_deformable_yellow_r8.usd
-    note: "Resolution-8 yellow/orange material variant; add to soft_objects after green cube is stable."

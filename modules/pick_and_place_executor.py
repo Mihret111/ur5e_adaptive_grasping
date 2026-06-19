@@ -137,13 +137,38 @@ class PickAndPlaceExecutor:
             
     # helper to get object position from prim path
     def _get_prim_world_pos(self, prim_path: str):
-        stage = omni.usd.get_context().get_stage()    # get the stage 
+        stage = omni.usd.get_context().get_stage()    # get the stage
         prim = stage.GetPrimAtPath(Sdf.Path(prim_path)) # get the prim from prim path
 
         if not prim.IsValid(): # if the prim is not valid, print an error message and return None
             print(f"[Executor] ⚠️ Prim not found: {prim_path}")
             return None
-        
+
+        # Imported deformable USD assets are wrapped in an Xform whose root
+        # transform is bottom-centre, not object-centre.  Their visual/simulation
+        # mesh can also deform without a rigid-body pose update.  For these
+        # targets we use the composed bounding-box centre as the best available
+        # runtime observation.
+        try:
+            pose_attr = prim.GetAttribute("b2b:poseSource")
+            pose_source = pose_attr.Get() if pose_attr and pose_attr.IsValid() else None
+            if pose_source == "bbox_center":
+                bbox_cache = UsdGeom.BBoxCache(
+                    Usd.TimeCode.Default(),
+                    [UsdGeom.Tokens.default_, UsdGeom.Tokens.render],
+                    useExtentsHint=False,
+                )
+                box = bbox_cache.ComputeWorldBound(prim).ComputeAlignedBox()
+                mn = box.GetMin()
+                mx = box.GetMax()
+                return [
+                    float((mn[0] + mx[0]) / 2.0),
+                    float((mn[1] + mx[1]) / 2.0),
+                    float((mn[2] + mx[2]) / 2.0),
+                ]
+        except Exception as e:
+            print(f"[Executor] ⚠️ bbox_center pose read failed for {prim_path}: {e}")
+
         xf = UsdGeom.Xformable(prim) # get the xformable interface from the prim
         mtx = xf.ComputeLocalToWorldTransform(Usd.TimeCode.Default()) # compute the local to world transform
         p = mtx.ExtractTranslation() # extract the translation from the transform

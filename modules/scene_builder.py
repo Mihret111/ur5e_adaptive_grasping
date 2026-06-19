@@ -17,6 +17,7 @@ Does NOT own:
   - Pick sequencing
   - Config loading
 """
+from logging import root
 import math
 import os
 import random
@@ -619,6 +620,12 @@ class SceneBuilder:
         top_prim = self.stage.GetPrimAtPath(Sdf.Path(top_path))
         if top_prim.IsValid():
             self._apply_table_material(top_prim, table_mat)
+            self._apply_physx_contact_offsets_recursive(
+                top_prim,
+                contact_offset_m=float(self.config.get("table_contact_offset_m", 0.001)),
+                rest_offset_m=float(self.config.get("table_rest_offset_m", 0.0)),
+                label="table_top",
+            )
 
         # ── Legs ───────────────────────────────────────────────────────
         leg_r   = self.config["table_leg_radius"]
@@ -1090,7 +1097,14 @@ class SceneBuilder:
         approach_max_table =  depth_edge / 2 - margin
         perp_half          =  facing_edge / 2 - margin
 
-        surface_z  = th + 0.002
+        # Rigid primitive objects are usually spawned by their centre, so a
+        # tiny positive clearance is useful.  Imported deformable USD assets
+        # are different: the green foam asset is authored with its ROOT at
+        # the bottom-centre, so its root must be placed directly at the
+        # physical table surface (optionally with a tiny negative penetration
+        # to compensate deformable contact-offset visual hovering).
+        table_surface_z = th
+        primitive_surface_z = th + 0.002
         max_reach  = effective_reach
         min_reach  = arm_min_reach + reach_safety
 
@@ -1191,7 +1205,38 @@ class SceneBuilder:
 
             # ── Z positioning ───────────────────────────────────────
             half_h    = self._get_half_height(obj_def)
-            wz        = surface_z + half_h
+            asset_type = str(obj_def.get("asset_type", "primitive_proxy"))
+            is_usd_asset = asset_type in ("usd_reference", "deformable_usd") and bool(obj_def.get("resolved_asset_path"))
+            bottom_center_asset = (
+                is_usd_asset
+                and (
+                    str(obj_def.get("spawn_pose_mode", "")).lower() == "bottom_on_table"
+                    or str(obj_def.get("asset_origin_z", "")).lower() == "bottom_center"
+                )
+            )
+
+            if bottom_center_asset:
+                soft_clearance = float(self.config.get("soft_asset_table_clearance_m", 0.0) or 0.0)
+                soft_penetration = float(self.config.get("soft_asset_table_penetration_m", 0.0) or 0.0)
+
+                # Root is bottom-centre: place ROOT at table surface, not at
+                # table + height/2.  The object centre used by grasp planning
+                # is still table + height/2.
+                spawn_root_z = table_surface_z + soft_clearance - soft_penetration
+                wz = spawn_root_z + half_h
+            else:
+                spawn_root_z = primitive_surface_z + half_h
+                wz = spawn_root_z
+            print(
+                f"    [SoftSpawnZ] label={obj_def.get('label')} "
+                f"asset_type={obj_def.get('asset_type')} "
+                f"bottom_center_asset={bottom_center_asset} "
+                f"table_surface_z={table_surface_z:.4f} "
+                f"half_h={half_h:.4f} "
+                f"spawn_root_z={spawn_root_z:.4f} "
+                f"world_center_z={wz:.4f} "
+                f"penetration={float(self.config.get('soft_asset_table_penetration_m', 0.0) or 0.0):.4f}"
+            )
             prim_path = f"{root}/{obj_def['name']}"
 
             # ── Random yaw rotation ─────────────────────────────────
@@ -1222,17 +1267,28 @@ class SceneBuilder:
             asset_path = obj_def.get("resolved_asset_path") or ""
             if asset_type in ("usd_reference", "deformable_usd") and asset_path:
                 if os.path.exists(asset_path):
+                    # For the commissioned green foam USD, the asset root is
+                    # authored at the bottom centre.  Therefore we place the
+                    # referenced root directly at spawn_root_z and DO NOT run
+                    # bbox realignment.  BBox realignment can be unreliable for
+                    # nested/defaultPrim referenced deformables and can leave the
+                    # record pose inconsistent with the actual asset pose.
+                    align_bottom = None
+                    asset_position = (wx, wy, spawn_root_z if bottom_center_asset else wz)
+                    if (not bottom_center_asset) and self.config.get("soft_asset_align_bottom_to_table", True):
+                        align_bottom = (
+                            table_surface_z
+                            + float(self.config.get("soft_asset_table_clearance_m", 0.0))
+                            - float(self.config.get("soft_asset_table_penetration_m", 0.0))
+                        )
+
                     spawned_from_asset = self._make_usd_reference_object(
                         path=prim_path,
                         asset_path=asset_path,
-                        position=(wx, wy, wz),
+                        position=asset_position,
                         scale=obj_def.get("asset_scale", 1.0),
                         rotation_z_deg=yaw_deg,
-                        align_bottom_z=(
-                            surface_z + float(self.config.get("soft_asset_table_clearance_m", 0.003))
-                            if self.config.get("soft_asset_align_bottom_to_table", True)
-                            else None
-                        ),
+                        align_bottom_z=align_bottom,
                     )
                 elif not self.config.get("soft_asset_missing_fallback_to_proxy", True):
                     print(f"    ❌ Missing soft asset: {asset_path}")
@@ -1296,7 +1352,14 @@ class SceneBuilder:
                 "label":            obj_def["label"],
                 "shape":            shape,
                 "prim_path":        prim_path,
+                # world_pos is the grasp-relevant object CENTRE, not
+                # necessarily the USD root.  For bottom-centre deformable
+                # assets the root is on/near the table, while the centre is
+                # table + height/2.
                 "world_pos":        (wx, wy, wz),
+                "spawn_root_pos":   (wx, wy, spawn_root_z),
+                "table_surface_z":  table_surface_z,
+                "bottom_center_asset": bool(bottom_center_asset),
                 "mass":             mass,
                 "material_name":    obj_def["material_name"],
                 "static_friction":  obj_def["static_friction"],
@@ -1586,6 +1649,29 @@ class SceneBuilder:
             return False
 
         prim.GetReferences().AddReference(asset_path)
+
+        # Shrink the contact shell for the imported soft-object subtree.
+        # Without this, default contact offsets can make the deformable
+        # collision mesh rest ~20 mm above a 40 mm object/table contact.
+        self._apply_physx_contact_offsets_recursive(
+            prim,
+            contact_offset_m=float(self.config.get("soft_asset_contact_offset_m", 0.001)),
+            rest_offset_m=float(self.config.get("soft_asset_rest_offset_m", 0.0)),
+            label="soft_asset_reference",
+        )
+
+        # B2B deformable/USD asset convention:
+        # - The wrapper Xform pose is the asset root/spawn frame, often bottom-centre.
+        # - The grasp-relevant object pose is the composed visual/collision extent.
+        # Therefore downstream execution monitors should observe this object using
+        # the wrapper bounding-box centre, not the wrapper translation.
+        try:
+            attr = prim.CreateAttribute("b2b:poseSource", Sdf.ValueTypeNames.String)
+            attr.Set("bbox_center")
+            prim.CreateAttribute("b2b:assetPath", Sdf.ValueTypeNames.String).Set(str(asset_path))
+        except Exception as e:
+            print(f"    ⚠ Could not annotate referenced asset pose source: {e}")
+
         xf = UsdGeom.Xformable(prim)
         xf.ClearXformOpOrder()
         translate_op = xf.AddTranslateOp()
@@ -1619,7 +1705,7 @@ class SceneBuilder:
                 translate_op.Set(translate)
                 bbox_msg = (
                     f" bbox_before_min_z={float(mn[2]):.4f} "
-                    f"bbox_before_max_z={float(mx[2]):.4f} dz_align={dz:.4f}"
+                    f"bbox_before_max_z={float(mx[2]):.4f} align_bottom_z={float(align_bottom_z):.4f} dz_align={dz:.4f}"
                 )
             except Exception as e:
                 bbox_msg = f" bbox_align_failed={e}"
@@ -1630,7 +1716,75 @@ class SceneBuilder:
         )
         return True
 
+    def _apply_physx_contact_offsets_recursive(
+        self,
+        prim,
+        contact_offset_m: float,
+        rest_offset_m: float,
+        label: str = "",
+    ):
+        """Apply small PhysX contact/rest offsets to a prim subtree.
+
+        Why this exists:
+        Default PhysX contact offsets can be surprisingly large relative to a
+        40 mm deformable object.  A ~20 mm inflated contact shell made the foam
+        collision_mesh rest visibly above the table even when the render mesh
+        was correctly placed.  For the B2B soft-object commissioning phase we
+        explicitly shrink the contact shell on both the table collider and the
+        imported soft object collision subtree.
+        """
+        if prim is None or not prim.IsValid():
+            return
+
+        try:
+            from pxr import PhysxSchema
+        except Exception as e:
+            print(f"    ⚠ PhysxSchema unavailable; cannot set contact offsets for {label}: {e}")
+            return
+
+        contact_offset_m = float(contact_offset_m)
+        rest_offset_m = float(rest_offset_m)
+        applied = []
+        errors = []
+
+        def visit(p):
+            # Apply only to geometry-ish prims plus wrapper; harmless failures
+            # are collected and not fatal.
+            type_name = p.GetTypeName()
+            should_try = type_name in ("Mesh", "Cube", "Sphere", "Cylinder", "Capsule", "TetMesh", "Xform")
+            if should_try:
+                try:
+                    api = PhysxSchema.PhysxCollisionAPI.Apply(p)
+                    api.CreateContactOffsetAttr().Set(contact_offset_m)
+                    api.CreateRestOffsetAttr().Set(rest_offset_m)
+                    applied.append(str(p.GetPath()))
+                except Exception as e:
+                    errors.append((str(p.GetPath()), str(e)))
+            for c in p.GetChildren():
+                visit(c)
+
+        visit(prim)
+
+        if applied:
+            print(
+                f"    [ContactOffset] {label}: contact={contact_offset_m:.4f}m "
+                f"rest={rest_offset_m:.4f}m applied_to={len(applied)} prims"
+            )
+            for path in applied[:8]:
+                print(f"      - {path}")
+            if len(applied) > 8:
+                print(f"      ... {len(applied)-8} more")
+        else:
+            print(f"    ⚠ ContactOffset {label}: no prims accepted PhysxCollisionAPI")
+
+        if errors and bool(self.config.get("print_contact_offset_errors", False)):
+            for path, err in errors[:8]:
+                print(f"      [ContactOffset error] {path}: {err}")
+
     def _apply_display_color(self, prim, color: tuple):
         gprim = UsdGeom.Gprim(prim)
         if gprim:
             gprim.CreateDisplayColorAttr().Set([Gf.Vec3f(*color)])
+
+
+            
