@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import math
 
 import omni.usd
-from pxr import Usd, UsdGeom, Sdf
+from pxr import Usd, UsdGeom, Sdf, Gf
 
 
 Vec3 = List[float]
@@ -79,12 +79,44 @@ class SoftObjectObserver:
         simulation_path = self._find_child_path_by_name(stage, prim_path, ("simulation_mesh",))
 
         wrapper_bbox = self._bbox(stage, prim_path)
-        visible_bbox = self._bbox(stage, visible_path) if visible_path else None
-        collision_bbox = self._bbox(stage, collision_path) if collision_path else None
 
-        # For grasp planning/validation, prefer visible geometry.  It is the
-        # grasp-relevant object in the viewport and stays stable for our foam USD.
-        pose_bbox = visible_bbox or collision_bbox or wrapper_bbox
+        # IMPORTANT FOR DEFORMABLES:
+        # UsdGeom.BBoxCache can remain static for deformable bodies, while the
+        # runtime point state on simulation_mesh / collision_mesh / render mesh
+        # actually moves.  Therefore we compute point-based world bboxes first
+        # and only fall back to BBoxCache when points are unavailable.
+        simulation_points_bbox = self._point_bbox(stage, simulation_path) if simulation_path else None
+        collision_points_bbox = self._point_bbox(stage, collision_path) if collision_path else None
+        visible_points_bbox = self._point_bbox(stage, visible_path) if visible_path else None
+
+        visible_bbox = visible_points_bbox or (self._bbox(stage, visible_path) if visible_path else None)
+        collision_bbox = collision_points_bbox or (self._bbox(stage, collision_path) if collision_path else None)
+        simulation_bbox = simulation_points_bbox
+
+        # Source priority for soft/deformable motion:
+        #   1) simulation_mesh.points: actual deformable state cloud when available
+        #   2) collision_mesh.points: contact geometry point state
+        #   3) visible mesh points: render point state
+        #   4) BBoxCache fallback: useful for static spawn checks only
+        if simulation_points_bbox is not None:
+            pose_bbox = simulation_points_bbox
+            pose_source = "simulation_mesh_points"
+        elif collision_points_bbox is not None:
+            pose_bbox = collision_points_bbox
+            pose_source = "collision_mesh_points"
+        elif visible_points_bbox is not None:
+            pose_bbox = visible_points_bbox
+            pose_source = "visible_mesh_points"
+        elif visible_bbox is not None:
+            pose_bbox = visible_bbox
+            pose_source = "visible_bbox"
+        elif collision_bbox is not None:
+            pose_bbox = collision_bbox
+            pose_source = "collision_bbox"
+        else:
+            pose_bbox = wrapper_bbox
+            pose_source = "wrapper_bbox"
+
         if pose_bbox is None:
             return None
 
@@ -116,10 +148,14 @@ class SoftObjectObserver:
         obs = {
             "observer": "SoftObjectObserver",
             "prim_path": prim_path,
-            "pose_source": "visible_bbox" if visible_bbox else ("collision_bbox" if collision_bbox else "wrapper_bbox"),
+            "pose_source": pose_source,
             "visible_mesh_path": visible_path,
             "collision_mesh_path": collision_path,
             "simulation_mesh_path": simulation_path,
+            "simulation_bbox": simulation_bbox,
+            "simulation_points_bbox": simulation_points_bbox,
+            "collision_points_bbox": collision_points_bbox,
+            "visible_points_bbox": visible_points_bbox,
             "center": pose_bbox["center"],
             "bottom_z": pose_bbox["min"][2],
             "top_z": pose_bbox["max"][2],
@@ -160,6 +196,80 @@ class SoftObjectObserver:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    def _point_bbox(self, stage, path: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Compute a world-space bbox directly from a prim's live points attr.
+
+        This is the key observer for PhysX deformables.  For deformable bodies,
+        the live state is often visible in the point arrays of simulation_mesh,
+        collision_mesh, or render mesh even when UsdGeom.BBoxCache gives a stale
+        authored/static bbox.
+        """
+        if not path:
+            return None
+        prim = stage.GetPrimAtPath(Sdf.Path(path))
+        if not prim or not prim.IsValid():
+            return None
+        try:
+            attr = prim.GetAttribute("points")
+            if not attr:
+                return None
+            pts = attr.Get()
+            if not pts:
+                return None
+
+            # Points are local to the prim. Convert them to world coordinates.
+            try:
+                xform = UsdGeom.Xformable(prim)
+                M = xform.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+            except Exception:
+                M = Gf.Matrix4d(1.0)
+
+            xs: List[float] = []
+            ys: List[float] = []
+            zs: List[float] = []
+
+            for p in pts:
+                wp = M.Transform(Gf.Vec3d(float(p[0]), float(p[1]), float(p[2])))
+                xs.append(float(wp[0]))
+                ys.append(float(wp[1]))
+                zs.append(float(wp[2]))
+
+            if not xs:
+                return None
+
+            min_v = [min(xs), min(ys), min(zs)]
+            max_v = [max(xs), max(ys), max(zs)]
+            vals = min_v + max_v
+            if any((not math.isfinite(v)) for v in vals):
+                return None
+            if any(abs(v) > 1.0e6 for v in vals):
+                return None
+
+            size = [max_v[i] - min_v[i] for i in range(3)]
+            if any(v < 0.0 for v in size):
+                return None
+            center = [(min_v[i] + max_v[i]) / 2.0 for i in range(3)]
+
+            # Also store centroid; bbox center is better for table/top/bottom tests,
+            # centroid is useful later for deformation statistics.
+            centroid = [sum(xs) / len(xs), sum(ys) / len(ys), sum(zs) / len(zs)]
+
+            return {
+                "path": path,
+                "source": "points",
+                "prim_type": prim.GetTypeName(),
+                "num_points": len(xs),
+                "min": min_v,
+                "max": max_v,
+                "size": size,
+                "center": center,
+                "centroid": centroid,
+            }
+        except Exception as exc:
+            if self.config.get("soft_observer_verbose_errors", False):
+                print(f"[SoftObserver] point-bbox failed for {path}: {exc}")
+            return None
+
     def _bbox(self, stage, path: Optional[str]) -> Optional[Dict[str, Any]]:
         if not path:
             return None
