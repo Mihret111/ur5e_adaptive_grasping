@@ -523,6 +523,20 @@ class RetryPolicy:
         if failure_reason == "micro_lift_validation_failed":
             cls = micro.get("failure_classification", "")
 
+            if cls == "SOFT_OBJECT_MOTION_OBSERVER_UNRELIABLE":
+                # Fail closed.  A retry should not drive back to a stale USD-bbox
+                # pose after a deformable object has visibly moved but cannot be
+                # reacquired by the current observer.  This is a perception
+                # limitation, not a manipulation retry condition.
+                decision["retry"] = False
+                decision["reason"] = "no_retry_soft_object_pose_observer_unreliable"
+                decision["adjustments"] = {
+                    "refresh_object_pose": False,
+                    "requires_reacquisition": True,
+                    "recommended_next_step": "use runtime deformable/vision observer or reset object before retry",
+                }
+                return decision
+
             plausible_contact = self._is_plausible_contact_quality(contact_quality)
             bad_or_missing_contact = contact_quality in (
                 "no_plausible_contact_or_early_stall",

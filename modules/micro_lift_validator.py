@@ -36,6 +36,7 @@ class MicroLiftValidator:
         grasp_centre_before: Optional[Sequence[float]],
         grasp_centre_after: Optional[Sequence[float]],
         gripper_has_object: bool,
+        observer_reliability: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Return structured evidence for the micro-lift checkpoint.
 
@@ -60,6 +61,7 @@ class MicroLiftValidator:
             "success": False,
             "failure_classification": None,
             "reasons": [],
+            "observer_reliability": observer_reliability or {},
         }
 
         required = {
@@ -125,6 +127,19 @@ class MicroLiftValidator:
             "max_micro_lift_relative_drift_m": max_relative_drift,
         }
 
+        observer_motion_reliable = True
+        observer_status = None
+        if observer_reliability:
+            observer_motion_reliable = bool(observer_reliability.get("motion_reliable", True))
+            observer_status = observer_reliability.get("observer_status")
+
+        if not observer_motion_reliable:
+            result["reasons"].append(
+                "soft object motion observer unreliable: " + str(observer_status)
+            )
+            for r in observer_reliability.get("reasons", []) or []:
+                result["reasons"].append(str(r))
+
         if not gripper_has_object:
             result["reasons"].append("gripper_has_object false after micro-lift")
 
@@ -134,21 +149,22 @@ class MicroLiftValidator:
                 f"{min_flange_dz:.4f} m"
             )
 
-        if object_dz < min_object_dz:
+        if observer_motion_reliable and object_dz < min_object_dz:
             result["reasons"].append(
                 f"object did not follow micro-lift: dz={object_dz:.4f} m < "
                 f"{min_object_dz:.4f} m"
             )
 
-        if following_ratio is None:
-            result["reasons"].append("following ratio unavailable: flange dz is zero")
-        elif following_ratio < min_following_ratio:
-            result["reasons"].append(
-                f"object following ratio too small: {following_ratio:.3f} < "
-                f"{min_following_ratio:.3f}"
-            )
+        if observer_motion_reliable:
+            if following_ratio is None:
+                result["reasons"].append("following ratio unavailable: flange dz is zero")
+            elif following_ratio < min_following_ratio:
+                result["reasons"].append(
+                    f"object following ratio too small: {following_ratio:.3f} < "
+                    f"{min_following_ratio:.3f}"
+                )
 
-        if relative_drift > max_relative_drift:
+        if observer_motion_reliable and relative_drift > max_relative_drift:
             result["reasons"].append(
                 f"object drifted relative to grasp centre: {relative_drift:.4f} m > "
                 f"{max_relative_drift:.4f} m"
@@ -158,6 +174,8 @@ class MicroLiftValidator:
 
         if result["success"]:
             result["failure_classification"] = None
+        elif not observer_motion_reliable:
+            result["failure_classification"] = "SOFT_OBJECT_MOTION_OBSERVER_UNRELIABLE"
         elif not gripper_has_object:
             result["failure_classification"] = "GRIPPER_LOST_OBJECT"
         elif flange_dz < min_flange_dz:

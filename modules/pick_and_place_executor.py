@@ -215,6 +215,143 @@ class PickAndPlaceExecutor:
         prim_path = target.get("prim_path") if isinstance(target, dict) else None
         return self._get_prim_world_pos(prim_path)
 
+    @staticmethod
+    def _vec_delta_z(after, before):
+        try:
+            return float(after[2]) - float(before[2])
+        except Exception:
+            return None
+
+    @staticmethod
+    def _point_dist(a, b):
+        try:
+            return float(((float(a[0]) - float(b[0])) ** 2 + (float(a[1]) - float(b[1])) ** 2 + (float(a[2]) - float(b[2])) ** 2) ** 0.5)
+        except Exception:
+            return None
+
+    def _make_soft_micro_lift_step_callback(self, target: dict, trace: list):
+        """Return a step callback that updates the gripper and samples soft state.
+
+        This is intentionally diagnostic.  For PhysX deformables, USD BBoxCache
+        may remain static while the object visibly moves.  Sampling during the
+        motion lets the log prove whether our current observation source is
+        dynamically updating or not.
+        """
+        sample_every = max(1, int(self.config.get("soft_motion_trace_sample_every_steps", 10)))
+        counter = {"i": 0}
+
+        def _callback():
+            self.gripper.update()
+            i = counter["i"]
+            counter["i"] += 1
+            if i % sample_every != 0:
+                return
+
+            obs = None
+            try:
+                obs = self._observe_target(target, stage_name=f"micro_lift_trace_{i}")
+            except Exception as e:
+                obs = {"error": str(e)}
+
+            capture = None
+            try:
+                capture = self.arm.get_calibrated_capture_geometry_world()
+            except Exception as e:
+                capture = {"error": str(e)}
+
+            gripper_diag = None
+            try:
+                gripper_diag = self.gripper.get_diagnostics()
+            except Exception as e:
+                gripper_diag = {"error": str(e)}
+
+            trace.append(json_safe({
+                "step": i,
+                "soft_center": (obs or {}).get("center") if isinstance(obs, dict) else None,
+                "soft_bottom_z": (obs or {}).get("bottom_z") if isinstance(obs, dict) else None,
+                "soft_top_z": (obs or {}).get("top_z") if isinstance(obs, dict) else None,
+                "pose_source": (obs or {}).get("pose_source") if isinstance(obs, dict) else None,
+                "capture_geometry": capture,
+                "gripper_has_object": self.gripper.has_object(),
+                "gripper_diagnostics": gripper_diag,
+            }))
+
+        return _callback
+
+    def _assess_soft_motion_observer_reliability(
+        self,
+        *,
+        target: dict,
+        soft_obs_before: dict,
+        soft_obs_after: dict,
+        geometry_before: dict,
+        geometry_after: dict,
+        gripper_has_object: bool,
+        trace: list,
+    ) -> dict:
+        """Classify whether USD-bbox motion observation is usable for soft objects."""
+        is_soft = self._is_soft_target(target)
+        object_before = (soft_obs_before or {}).get("center")
+        object_after = (soft_obs_after or {}).get("center")
+        flange_before = (geometry_before or {}).get("flange_world_pos")
+        flange_after = (geometry_after or {}).get("flange_world_pos")
+        grasp_before = (geometry_before or {}).get("grasp_centre_world_pos")
+        grasp_after = (geometry_after or {}).get("grasp_centre_world_pos")
+
+        object_dz = self._vec_delta_z(object_after, object_before)
+        flange_dz = self._vec_delta_z(flange_after, flange_before)
+        grasp_dz = self._vec_delta_z(grasp_after, grasp_before)
+
+        centers = [s.get("soft_center") for s in trace if isinstance(s, dict) and s.get("soft_center") is not None]
+        trace_z_values = []
+        for c in centers:
+            try:
+                trace_z_values.append(float(c[2]))
+            except Exception:
+                pass
+        trace_z_span = (max(trace_z_values) - min(trace_z_values)) if trace_z_values else None
+
+        min_commanded = float(self.config.get("min_commanded_micro_lift_delta_m", 0.015))
+        static_eps = float(self.config.get("soft_observer_static_motion_epsilon_m", 0.0015))
+        reliable = True
+        status = "RELIABLE_OR_NOT_SOFT"
+        reasons = []
+
+        if is_soft:
+            status = "USD_BBOX_MOTION_OBSERVER_OK"
+            if object_before is None or object_after is None:
+                reliable = False
+                status = "SOFT_OBJECT_OBSERVER_MISSING_MEASUREMENTS"
+                reasons.append("soft object observation before/after micro-lift is missing")
+            elif flange_dz is not None and flange_dz >= min_commanded:
+                if object_dz is not None and abs(object_dz) <= static_eps:
+                    # The gripper/flange moved, but USD bbox did not.  When the gripper
+                    # also reports object capture, treat this as an observer limitation
+                    # rather than physical proof that the object failed to follow.
+                    reliable = False
+                    status = "SOFT_USD_BBOX_STATIC_DURING_LIFT"
+                    reasons.append(
+                        f"soft USD bbox dz={object_dz:.4f} m while flange dz={flange_dz:.4f} m"
+                    )
+                    if gripper_has_object:
+                        reasons.append("gripper_has_object true while USD bbox remained static")
+                if trace_z_span is not None and trace_z_span <= static_eps:
+                    reasons.append(f"soft motion trace z-span {trace_z_span:.4f} m indicates static USD bbox source")
+
+        return json_safe({
+            "is_soft_target": is_soft,
+            "motion_reliable": reliable,
+            "observer_status": status,
+            "reasons": reasons,
+            "object_dz_m": object_dz,
+            "flange_dz_m": flange_dz,
+            "grasp_centre_dz_m": grasp_dz,
+            "trace_sample_count": len(trace or []),
+            "trace_z_span_m": trace_z_span,
+            "static_motion_epsilon_m": static_eps,
+            "min_commanded_micro_lift_delta_m": min_commanded,
+        })
+
     # ─────────────────────────────────────────────────────────────────────
     # Helper to always  reset robot before the trial starts
     # ─────────────────────────────────────────────────────────────────────
@@ -1274,12 +1411,18 @@ class PickAndPlaceExecutor:
                         self._last_trial_log = trial_log
                         return False
 
-                    object_before_micro = self._get_observed_object_pos(
-                        target, stage_name="before_micro_lift"
+                    soft_obs_before_micro = self._observe_target(
+                        target, stage_name="before_micro_lift_observation"
+                    )
+                    object_before_micro = (
+                        list(soft_obs_before_micro["center"])
+                        if soft_obs_before_micro and soft_obs_before_micro.get("center") is not None
+                        else self._get_observed_object_pos(target, stage_name="before_micro_lift")
                     )
                     geometry_before_micro = (
                         self.arm.get_calibrated_capture_geometry_world()
                     )
+                    attempt_log["soft_observation_before_micro_lift"] = json_safe(soft_obs_before_micro)
 
                     print("\n[Executor] Performing micro-lift verification checkpoint...")
                     plan_micro_lift_speed_scale = float(
@@ -1308,13 +1451,21 @@ class PickAndPlaceExecutor:
                         "duration_s": micro_lift_duration,
                     })
 
+                    soft_motion_trace = []
+                    step_callback = (
+                        self._make_soft_micro_lift_step_callback(target, soft_motion_trace)
+                        if self._is_soft_target(target)
+                        else self.gripper.update
+                    )
+
                     ok = await self.arm.move_to(
                         micro_lift,
                         duration=micro_lift_duration,
                         steps=int(self.config.get("micro_lift_steps", 120)),
                         check_table_collision=True,
-                        step_callback=self.gripper.update,
+                        step_callback=step_callback,
                     )
+                    attempt_log["soft_motion_trace"] = json_safe(soft_motion_trace)
 
                     if not ok:
                         print("[Executor] ❌ Micro-lift motion failed.")
@@ -1328,12 +1479,53 @@ class PickAndPlaceExecutor:
                         float(self.config.get("post_micro_lift_settle_seconds", 0.4))
                     )
 
-                    object_after_micro = self._get_observed_object_pos(
-                        target, stage_name="after_micro_lift"
+                    soft_obs_after_micro = self._observe_target(
+                        target, stage_name="after_micro_lift_observation"
+                    )
+                    object_after_micro = (
+                        list(soft_obs_after_micro["center"])
+                        if soft_obs_after_micro and soft_obs_after_micro.get("center") is not None
+                        else self._get_observed_object_pos(target, stage_name="after_micro_lift")
                     )
                     geometry_after_micro = (
                         self.arm.get_calibrated_capture_geometry_world()
                     )
+                    attempt_log["soft_observation_after_micro_lift"] = json_safe(soft_obs_after_micro)
+
+                    if object_before_micro is not None and object_after_micro is not None:
+                        dz_obj = float(object_after_micro[2]) - float(object_before_micro[2])
+                        attempt_log["soft_micro_lift_motion"] = json_safe({
+                            "object_center_before": object_before_micro,
+                            "object_center_after": object_after_micro,
+                            "object_center_dz_m": dz_obj,
+                            "bottom_z_before": (soft_obs_before_micro or {}).get("bottom_z"),
+                            "bottom_z_after": (soft_obs_after_micro or {}).get("bottom_z"),
+                            "bottom_z_delta_m": (
+                                float((soft_obs_after_micro or {}).get("bottom_z"))
+                                - float((soft_obs_before_micro or {}).get("bottom_z"))
+                                if soft_obs_before_micro and soft_obs_after_micro
+                                and soft_obs_before_micro.get("bottom_z") is not None
+                                and soft_obs_after_micro.get("bottom_z") is not None
+                                else None
+                            ),
+                            "height_before_m": (soft_obs_before_micro or {}).get("height_m"),
+                            "height_after_m": (soft_obs_after_micro or {}).get("height_m"),
+                            "deformation_ratio_z_before": (soft_obs_before_micro or {}).get("deformation_ratio_z"),
+                            "deformation_ratio_z_after": (soft_obs_after_micro or {}).get("deformation_ratio_z"),
+                            "table_gap_before_m": (soft_obs_before_micro or {}).get("table_gap_m"),
+                            "table_gap_after_m": (soft_obs_after_micro or {}).get("table_gap_m"),
+                        })
+
+                    soft_motion_observer_reliability = self._assess_soft_motion_observer_reliability(
+                        target=target,
+                        soft_obs_before=soft_obs_before_micro,
+                        soft_obs_after=soft_obs_after_micro,
+                        geometry_before=geometry_before_micro,
+                        geometry_after=geometry_after_micro,
+                        gripper_has_object=self.gripper.has_object(),
+                        trace=attempt_log.get("soft_motion_trace", []),
+                    )
+                    attempt_log["soft_motion_observer_reliability"] = json_safe(soft_motion_observer_reliability)
 
                     micro_validation = self.micro_lift_validator.evaluate(
                         object_pos_before=object_before_micro,
@@ -1343,6 +1535,7 @@ class PickAndPlaceExecutor:
                         grasp_centre_before=geometry_before_micro["grasp_centre_world_pos"],
                         grasp_centre_after=geometry_after_micro["grasp_centre_world_pos"],
                         gripper_has_object=self.gripper.has_object(),
+                        observer_reliability=soft_motion_observer_reliability,
                     )
 
                     print("\n[Executor] Micro-lift validation:")

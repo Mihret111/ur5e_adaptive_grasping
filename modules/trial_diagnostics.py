@@ -273,6 +273,7 @@ def pose_snapshot(executor: Any, target: dict, stage: str) -> Dict[str, Any]:
             "stage": stage,
             "t_unix": time.time(),
             "object_world_pos": object_pos,
+            "soft_observation": soft_observation,
             "capture_geometry": capture,
             "arm_status": arm_status,
             "gripper_diagnostics": gripper_diag,
