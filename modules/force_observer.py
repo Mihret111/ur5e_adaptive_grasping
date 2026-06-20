@@ -6,12 +6,12 @@ Current validated backend:
   - measured joint effort from the UR5e articulation that also contains the
     2FG7 prismatic finger joints.
 
-Important naming convention:
   - This is NOT direct fingertip ContactSensor force.
   - This is measured articulation/joint effort. For the 2FG7 prismatic finger
     joints it is force-like and useful as a simulation-side squeeze-feedback
-    signal, but it should be logged as ``measured_joint_effort_sim`` until a
-    Newton calibration is performed.
+    signal,
+  - It will be logged as ``measured_joint_effort_sim`` until a Newton calibration 
+    is performed.
 
 COGAR mapping:
   - ForceObserver = proprioceptive/tactile perceptual schema.
@@ -450,7 +450,7 @@ class ArticulationEffortForceObserver:
             "available": True,
             "stage": stage_name,
             "force_source": self.BACKEND_NAME,
-            "units": "sim_prismatic_joint_effort_not_calibrated_newtons",
+            "units": "measured_prismatic_joint_effort_N_not_fingertip_calibrated",
             "root_path": self.root_path,
             "articulation_class": self._art_module,
             "name_source": self._name_source,

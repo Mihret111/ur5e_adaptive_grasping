@@ -138,7 +138,7 @@ class PickAndPlaceExecutor:
 
         adaptive_effort_regulation = None
         if bool(self.config.get("adaptive_effort_control_enabled", False)):
-            adaptive_effort_regulation = await self._regulate_gripper_effort_after_close()
+            adaptive_effort_regulation = await self._regulate_gripper_effort_after_close(target=target)
 
         force_after_hold = None
         if hasattr(self, "force_observer"):
@@ -195,6 +195,13 @@ class PickAndPlaceExecutor:
         fingertip ContactSensor force.
         """
         app = omni.kit.app.get_app()
+        # Keep the object target separate from the effort target.  In Phase 3.0
+        # this function accidentally reused the name ``target`` for the scalar
+        # effort setpoint, so the safety monitor tried to observe a float rather
+        # than the soft object.  That made soft_observation_for_safety null.
+        # target_obj is the spawned object dictionary; target_effort is the scalar
+        # gripper effort setpoint.
+        target_obj = target
 
         controller_mode = str(
             self.config.get("adaptive_effort_controller_mode", "scalar_admittance")
@@ -205,7 +212,7 @@ class PickAndPlaceExecutor:
             "controller": "scalar_gripper_joint_effort_admittance",
             "controller_mode": controller_mode,
             "force_source": "measured_joint_effort_sim",
-            "units": "sim_prismatic_joint_effort_not_calibrated_newtons",
+            "units": "measured_prismatic_joint_effort_N_not_fingertip_calibrated",
             "formal_model": "M*x_ddot + D*x_dot + K*x = G*(F_target - F_measured)",
             "state_meaning": "x is a small correction of gripper HOLDING targets; positive closes, negative opens",
             "safety_layer": "AdaptiveSafetyMonitor combines measured effort with soft-object deformation/motion observations",
@@ -226,7 +233,7 @@ class PickAndPlaceExecutor:
             summary["state"] = self.gripper.get_state()
             return summary
 
-        target = float(
+        target_effort = float(
             self.config.get(
                 "adaptive_effort_target_sim",
                 self.config.get("force_observer_target_effort_sim", 0.35),
@@ -273,7 +280,7 @@ class PickAndPlaceExecutor:
 
         summary.update({
             "ran": True,
-            "target_effort_sim": target,
+            "target_effort_sim": target_effort,
             "target_band_sim": band,
             "deadband_sim": deadband,
             "max_effort_sim": max_effort,
@@ -292,6 +299,9 @@ class PickAndPlaceExecutor:
             "safety_monitor_enabled": safety_enabled,
             "safety_abort_on_unsafe": safety_abort_on_unsafe,
             "safety_soft_sample_stride": safety_soft_sample_stride,
+            "target_obj_available_for_safety": target_obj is not None,
+            "target_obj_label_for_safety": (target_obj.get("label") if isinstance(target_obj, dict) else None),
+            "target_obj_prim_path_for_safety": (target_obj.get("prim_path") if isinstance(target_obj, dict) else None),
         })
 
         # Admittance state. x=0 means keep the original hold target.
@@ -330,7 +340,7 @@ class PickAndPlaceExecutor:
 
             if obs.get("available"):
                 effort = float(obs.get("grip_effort_sim", 0.0) or 0.0)
-                effort_error = target - effort
+                effort_error = target_effort - effort
 
                 # Safety/perception layer: combine force-like effort with live
                 # deformable object shape.  This is the COGAR reactive inhibitor:
@@ -338,10 +348,10 @@ class PickAndPlaceExecutor:
                 # a soft object too much.  It is deliberately conservative and
                 # monitor-first; abort is optional and off by default.
                 if safety_enabled and hasattr(self, "safety_monitor"):
-                    if target is not None and ((frame % safety_soft_sample_stride) == 0):
+                    if target_obj is not None and ((frame % safety_soft_sample_stride) == 0):
                         try:
                             soft_obs_for_safety = self._observe_target(
-                                target,
+                                target_obj,
                                 stage_name=f"adaptive_safety_frame_{frame + 1}",
                             )
                         except Exception as e:
@@ -355,7 +365,7 @@ class PickAndPlaceExecutor:
                             effort_obs=obs,
                             context={
                                 "frame": frame + 1,
-                                "target_effort_sim": target,
+                                "target_effort_sim": target_effort,
                                 "max_effort_sim": max_effort,
                                 "controller_phase": "scalar_admittance",
                             },
