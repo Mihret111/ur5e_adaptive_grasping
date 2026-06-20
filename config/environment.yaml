@@ -265,7 +265,7 @@ force_observer_right_finger_joint_name: right_finger_joint
 
 # These are NOT Newtons yet; they are Isaac measured prismatic-joint effort units.
 # V10 observed ≈0 before contact and roughly 0.38–1.18 while holding foam.
-force_observer_target_effort_sim: 0.45
+force_observer_target_effort_sim: 0.350000
 force_observer_max_effort_sim: 1.20
 force_observer_contact_effort_threshold_sim: 0.05
 force_observer_target_band_sim: 0.10
@@ -286,7 +286,7 @@ adaptive_effort_control_enabled: true
 
 # First integrated successful run showed stable lift around grip_effort_sim≈0.33.
 # We therefore target a gentle effort around 0.35 rather than chasing high squeeze.
-adaptive_effort_target_sim: 0.35
+adaptive_effort_target_sim: 0.350000
 adaptive_effort_target_band_sim: 0.08
 adaptive_effort_max_sim: 1.20
 
@@ -305,7 +305,7 @@ adaptive_effort_required_stable_samples: 3
 #   M*x_ddot + D*x_dot + K*x = G*(F_target - F_measured)
 # where F_measured is measured prismatic finger-joint effort from Isaac.
 adaptive_effort_controller_mode: scalar_admittance
-force_observer_target_effort_sim: 0.35
+force_observer_target_effort_sim: 0.350000
 force_observer_target_band_sim: 0.08
 force_observer_audit_rich_joint_signals: true
 
@@ -323,7 +323,7 @@ adaptive_admittance_max_delta_per_update_m: 0.00010
 # It does not replace scalar admittance; it acts as a reactive inhibitor that can
 # request gentle relaxation if effort/deformation becomes unsafe.
 adaptive_safety_monitor_enabled: true
-adaptive_safety_abort_on_unsafe: false      # monitor/relax first; hard abort can be enabled after validation
+adaptive_safety_abort_on_unsafe: false
 adaptive_safety_soft_sample_stride: 5
 adaptive_safety_warn_effort_sim: 0.95
 adaptive_safety_max_effort_sim: 1.20
@@ -342,5 +342,22 @@ adaptive_safety_nominal_depth_m: 0.040
 adaptive_safety_nominal_height_m: 0.040
 adaptive_safety_warn_height_ratio: 0.85
 adaptive_safety_warn_lateral_expansion_ratio: 1.20
-adaptive_safety_warn_deformation_score: 0.60
-adaptive_safety_max_deformation_score: 1.00
+adaptive_safety_warn_deformation_score: 0.600000
+adaptive_safety_max_deformation_score: 1.000000
+adaptive_safety_warn_combined_risk_score: 0.750000
+adaptive_safety_max_combined_risk_score: 0.900000
+adaptive_safety_reaction_test_mode: normal
+
+
+# ───────────── PHASE 3.5: SAFETY-AWARE RETRY POLICY ─────────────
+# If the deformation-aware safety monitor requests reactive relaxation, the
+# executor stops the current attempt instead of continuing to micro-lift.
+# RetryPolicy then selects a safer second attempt.
+retry_adaptive_safety_allow_retry: true
+retry_adaptive_safety_force_scale: 0.90
+retry_adaptive_safety_fragile_force_scale: 0.85
+retry_adaptive_safety_effort_target_scale: 0.85
+retry_adaptive_safety_hold_extra_delta_m: -0.00025
+retry_adaptive_safety_hold_settle_extra_s: 0.5
+retry_adaptive_safety_micro_lift_speed_scale: 0.70
+retry_adaptive_safety_reacquire_pose: true

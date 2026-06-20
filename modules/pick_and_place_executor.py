@@ -86,6 +86,7 @@ class PickAndPlaceExecutor:
         hold_settle_extra_s: float = 0.0,
         hold_extra_close_m=None,
         target=None,
+        adaptive_effort_target_override_sim=None,
     ):
         """Close gripper with optional object-size-aware contact expectation.
 
@@ -138,7 +139,10 @@ class PickAndPlaceExecutor:
 
         adaptive_effort_regulation = None
         if bool(self.config.get("adaptive_effort_control_enabled", False)):
-            adaptive_effort_regulation = await self._regulate_gripper_effort_after_close(target=target)
+            adaptive_effort_regulation = await self._regulate_gripper_effort_after_close(
+                target=target,
+                target_effort_override_sim=adaptive_effort_target_override_sim,
+            )
 
         force_after_hold = None
         if hasattr(self, "force_observer"):
@@ -172,7 +176,7 @@ class PickAndPlaceExecutor:
         
         return close_resolution
 
-    async def _regulate_gripper_effort_after_close(self, target=None) -> dict:
+    async def _regulate_gripper_effort_after_close(self, target=None, target_effort_override_sim=None) -> dict:
         """Scalar measured-effort admittance for the 2FG7 gripper.
 
         Phase 2 used a deadband rule: if effort was too low, close a fixed
@@ -234,7 +238,9 @@ class PickAndPlaceExecutor:
             return summary
 
         target_effort = float(
-            self.config.get(
+            target_effort_override_sim
+            if target_effort_override_sim is not None
+            else self.config.get(
                 "adaptive_effort_target_sim",
                 self.config.get("force_observer_target_effort_sim", 0.35),
             )
@@ -281,6 +287,7 @@ class PickAndPlaceExecutor:
         summary.update({
             "ran": True,
             "target_effort_sim": target_effort,
+            "target_effort_override_sim": target_effort_override_sim,
             "target_band_sim": band,
             "deadband_sim": deadband,
             "max_effort_sim": max_effort,
@@ -1029,6 +1036,62 @@ class PickAndPlaceExecutor:
     # Method to get last trial log as .json file and write it to the output directory with a timestamp and create the dir if not exists
     def get_last_trial_log(self):
         return json_safe(getattr(self, "_last_trial_log", None))
+
+    def _adaptive_safety_outcome_from_close_resolution(self, close_resolution: dict) -> dict:
+        """Classify whether adaptive safety requested attempt termination.
+
+        Phase 3.4 proved that unsafe deformation can trigger reactive
+        relaxation.  Phase 3.5 turns that event into supervisory control:
+        once safety has actively opened/relaxed the gripper, the current
+        attempt must not continue to micro-lift as if a secure grasp still
+        existed.
+        """
+        close_resolution = close_resolution or {}
+        reg = close_resolution.get("adaptive_effort_regulation") or {}
+        safety_summary = reg.get("adaptive_safety_summary") or {}
+        trace = reg.get("trace") or []
+
+        unsafe_rows = []
+        warning_rows = []
+        relax_rows = []
+        for row in trace:
+            assess = row.get("safety_assessment") or {}
+            state = assess.get("safety_state")
+            rec = assess.get("recommended_action")
+            action = row.get("action")
+            if state == "unsafe":
+                unsafe_rows.append(row)
+            if state == "warning":
+                warning_rows.append(row)
+            if (rec and str(rec).startswith("relax_open")) or (action and str(action).startswith("safety_relax")):
+                relax_rows.append(row)
+
+        final_reason = reg.get("final_reason")
+        safety_open_limit = final_reason == "safety_open_limit_reached"
+        safety_abort = final_reason == "safety_abort_requested"
+        requires_stop = bool(unsafe_rows or relax_rows or safety_open_limit or safety_abort)
+
+        return {
+            "phase": "3.5_safety_aware_termination",
+            "available": bool(reg),
+            "requires_attempt_stop": requires_stop,
+            "reason": (
+                "adaptive_safety_relaxation_or_unsafe_state"
+                if requires_stop else
+                "no_safety_termination_requested"
+            ),
+            "regulation_final_reason": final_reason,
+            "unsafe_count": len(unsafe_rows),
+            "warning_count": len(warning_rows),
+            "relax_action_count": len(relax_rows),
+            "safety_summary": safety_summary,
+            "last_unsafe_assessment": (unsafe_rows[-1].get("safety_assessment") if unsafe_rows else None),
+            "last_relax_action": (relax_rows[-1].get("action") if relax_rows else None),
+            "supervisory_policy": (
+                "If unsafe deformation/relaxation occurs after close, stop the current attempt, "
+                "recover safely, and let RetryPolicy choose a safer retry instead of proceeding to micro-lift."
+            ),
+        }
     
     def _apply_retry_adjustments_to_pick_result(
         self,
@@ -1062,6 +1125,18 @@ class PickAndPlaceExecutor:
         pick_result["target_force_n_before_retry_scale"] = old_force
         pick_result["retry_force_scale"] = force_scale
         pick_result["target_force_n"] = new_force
+
+        # Phase 3.5: safety-aware retry may ask for a less aggressive hold
+        # target after an unsafe deformation relaxation.  This affects the
+        # gripper contact geometry directly, while scalar admittance target
+        # scaling is passed separately to close_gripper.
+        if "hold_extra_close_delta_m" in adjustments:
+            old_extra = float(pick_result.get("gripper_hold_extra_close_m", 0.0) or 0.0)
+            delta_extra = float(adjustments.get("hold_extra_close_delta_m", 0.0) or 0.0)
+            new_extra = max(0.0, old_extra + delta_extra)
+            pick_result["gripper_hold_extra_close_m_before_retry_delta"] = old_extra
+            pick_result["retry_hold_extra_close_delta_m"] = delta_extra
+            pick_result["gripper_hold_extra_close_m"] = new_extra
 
         return pick_result
 
@@ -1698,6 +1773,23 @@ class PickAndPlaceExecutor:
                 f"{expected_grip_dim_m}"
             )
 
+            adaptive_effort_target_override = None
+            if "adaptive_effort_target_scale" in current_retry_adjustments or "adaptive_effort_target_delta_sim" in current_retry_adjustments:
+                base_effort_target = float(
+                    self.config.get(
+                        "adaptive_effort_target_sim",
+                        self.config.get("force_observer_target_effort_sim", 0.35),
+                    )
+                )
+                adaptive_effort_target_override = (
+                    base_effort_target * float(current_retry_adjustments.get("adaptive_effort_target_scale", 1.0))
+                    + float(current_retry_adjustments.get("adaptive_effort_target_delta_sim", 0.0))
+                )
+                adaptive_effort_target_override = max(
+                    0.05,
+                    min(float(self.config.get("adaptive_effort_max_sim", 1.20)), adaptive_effort_target_override),
+                )
+
             close_resolution = await self.close_gripper(
                 force_n=target_force,
                 expected_grip_dim_m=expected_grip_dim_m,
@@ -1706,8 +1798,39 @@ class PickAndPlaceExecutor:
                 ),
                 hold_extra_close_m=pick_result.get("gripper_hold_extra_close_m"),
                 target=target,
+                adaptive_effort_target_override_sim=adaptive_effort_target_override,
             )
             attempt_log["gripper_close_resolution"] = json_safe(close_resolution)
+
+            adaptive_safety_outcome = self._adaptive_safety_outcome_from_close_resolution(close_resolution)
+            attempt_log["adaptive_safety_outcome"] = json_safe(adaptive_safety_outcome)
+
+            # Phase 3.5 supervisory stop: if the reactive safety layer had to
+            # relax/open because deformation was unsafe, do not continue to
+            # close validation + micro-lift as if the grasp were still secure.
+            if adaptive_safety_outcome.get("requires_attempt_stop", False):
+                print("[Executor] ⚠️ Adaptive safety requested attempt stop before micro-lift.")
+                attempt_log["failure_reason"] = "adaptive_safety_relaxation_triggered"
+                attempt_log["adaptive_safety_failure_reason"] = adaptive_safety_outcome.get("reason")
+
+                decision = self.retry_policy.decide(trial_log, attempt_log)
+                attempt_log["retry_decision"] = json_safe(decision)
+                trial_log["attempts"].append(attempt_log)
+
+                if decision.get("retry") and attempt < max_attempts - 1:
+                    print(f"[Executor] RetryPolicy: {decision['reason']}")
+                    current_retry_adjustments = decision.get("adjustments", {})
+                    await self._recover_to_safe_for_retry(
+                        pre_grasp=pre_grasp,
+                        safe_above=safe_above,
+                        from_micro_lift=False,
+                    )
+                    continue
+
+                trial_log["trial_success"] = False
+                trial_log["final_reason"] = "adaptive_safety_relaxation_triggered"
+                self._last_trial_log = trial_log
+                return False
 
             # get diagnostics from the gripper after close
             diag = self.gripper.get_diagnostics()

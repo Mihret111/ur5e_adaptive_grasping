@@ -414,6 +414,28 @@ class RetryPolicy:
         return near_dz and near_ratio and acceptable_drift
 
     # ------------------------------------------------------------------
+    # Adaptive safety interpretation helpers
+    # ------------------------------------------------------------------
+    def _adaptive_safety_outcome(self, attempt_log: dict) -> dict:
+        """Return compact adaptive-safety diagnosis from close regulation."""
+        outcome = attempt_log.get("adaptive_safety_outcome") or {}
+        if outcome:
+            return outcome
+
+        resolution = attempt_log.get("gripper_close_resolution") or {}
+        reg = resolution.get("adaptive_effort_regulation") or {}
+        summary = reg.get("adaptive_safety_summary") or {}
+        return {
+            "available": bool(reg),
+            "requires_attempt_stop": reg.get("final_reason") in (
+                "safety_open_limit_reached",
+                "safety_abort_requested",
+            ),
+            "regulation_final_reason": reg.get("final_reason"),
+            "safety_summary": summary,
+        }
+
+    # ------------------------------------------------------------------
     # Main policy
     # ------------------------------------------------------------------
     def decide(self, trial_log: dict, attempt_log: dict) -> dict:
@@ -457,12 +479,54 @@ class RetryPolicy:
                 "contact_info": contact_info,
                 "object_motion_after_attempt": object_motion,
                 "significant_object_motion": significant_object_motion,
+                "adaptive_safety_outcome": self._adaptive_safety_outcome(attempt_log),
             },
         }
 
         # Impossible gripper range: do not repeat the same pick primitive.
         if str(grip_class).startswith("infeasible"):
             decision["reason"] = "object_not_grippable_with_current_2fg7_range"
+            return decision
+
+        if failure_reason == "adaptive_safety_relaxation_triggered":
+            safety = self._adaptive_safety_outcome(attempt_log)
+
+            if not bool(self.config.get("retry_adaptive_safety_allow_retry", True)):
+                decision["retry"] = False
+                decision["reason"] = "no_retry_adaptive_safety_retry_disabled"
+                decision["diagnosis"]["adaptive_safety_outcome"] = safety
+                return decision
+
+            decision["retry"] = True
+            decision["reason"] = "retry_after_adaptive_safety_relaxation_safer_grasp"
+
+            # Unsafe deformation means the robot already had to relax/open.
+            # The next attempt should be less aggressive and should reacquire
+            # pose, because relaxation may leave the object shifted.
+            force_scale_key = (
+                "retry_adaptive_safety_fragile_force_scale"
+                if (fragile or bool(target.get("fragile", False)))
+                else "retry_adaptive_safety_force_scale"
+            )
+            decision["adjustments"] = {
+                "refresh_object_pose": bool(self.config.get("retry_adaptive_safety_reacquire_pose", True)),
+                "grasp_z_delta_m": 0.0,
+                "force_scale": float(self.config.get(force_scale_key, 0.90)),
+                "adaptive_effort_target_scale": float(
+                    self.config.get("retry_adaptive_safety_effort_target_scale", 0.85)
+                ),
+                "hold_extra_close_delta_m": float(
+                    self.config.get("retry_adaptive_safety_hold_extra_delta_m", -0.00025)
+                ),
+                "hold_settle_extra_s": float(
+                    self.config.get("retry_adaptive_safety_hold_settle_extra_s", 0.5)
+                ),
+                "micro_lift_speed_scale": float(
+                    self.config.get("retry_adaptive_safety_micro_lift_speed_scale", 0.70)
+                ),
+                "safety_recovery_retry": True,
+            }
+            decision["diagnosis"]["adaptive_safety_outcome"] = safety
             return decision
 
         if failure_reason == "preclose_geometry_gate_failed":
