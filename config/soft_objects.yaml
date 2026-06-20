@@ -21,7 +21,7 @@ soft_asset_missing_fallback_to_proxy: false
 # Commissioning mode: deterministic single object, no random clutter.
 soft_object_commissioning_mode: true
 soft_object_override_num_objects: 1
-soft_object_spawn_local_xy_m: [-0.07, 0.0]
+soft_object_spawn_local_xy_m: [-0.07, -0.20]
 soft_object_spawn_jitter_m: 0.0
 
 # USD placement policy.
@@ -60,7 +60,7 @@ soft_objects:
     asset_origin_z: bottom_center
     spawn_pose_mode: bottom_on_table
 
-    spawn_local_xy_m: [-0.07, 0.0]
+    spawn_local_xy_m: [-0.07, -0.20]
     spawn_yaw_deg: 0.0
 
     shape: Cube
@@ -96,3 +96,8 @@ soft_objects:
     strategy_hint: delicate_pick
     validation_profile: soft_deformable
     fallback_primitive: none
+
+# The commissioned foam cube spawn_local_xy_m is intentionally aligned with
+# environment.table_zones.pickup_zone.local_xy_m so the object starts on the
+# smaller blue pickup marker. The green place marker is separated farther away and used later by the gentle
+# place/release primitive.

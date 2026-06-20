@@ -103,6 +103,11 @@ def selected_config_snapshot(config: dict) -> Dict[str, Any]:
         "soft_asset_rest_offset_m",
         "table_contact_offset_m",
         "table_rest_offset_m",
+        "table_zones_enabled",
+        "table_zone_marker_collision_enabled",
+        "table_zone_marker_thickness_m",
+        "table_zone_marker_z_offset_m",
+        "table_zones",
     ]
     snap = {k: config.get(k) for k in keys if k in config}
 

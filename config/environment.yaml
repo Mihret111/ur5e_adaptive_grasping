@@ -361,3 +361,36 @@ retry_adaptive_safety_hold_extra_delta_m: -0.00025
 retry_adaptive_safety_hold_settle_extra_s: 0.5
 retry_adaptive_safety_micro_lift_speed_scale: 0.70
 retry_adaptive_safety_reacquire_pose: true
+
+# ───────────── PHASE 4.0: SEMANTIC TABLE ZONES / MARKERS ─────────────
+# Visual-only table stickers used to make pick-and-place reproducible.
+# Coordinates are table-local:
+#   local x = approach/depth direction
+#   local y = sideways/perpendicular direction
+# For the current fixed table, pickup world is approximately [1.03, -0.20]
+# and place world is approximately [1.03, 0.25].
+table_zones_enabled: true
+table_zone_marker_collision_enabled: false   # keep markers visual-only; do not change soft contact physics
+table_zone_marker_thickness_m: 0.0002   # 0.2 mm visual sticker; effectively flat
+table_zone_marker_z_offset_m: 0.00015   # just above table to avoid z-fighting; no collision
+table_zone_crosshair_enabled: true
+
+table_zones:
+  pickup_zone:
+    label: pickup_zone
+    role: object_spawn_and_pickup
+    local_xy_m: [-0.07, -0.20]
+    size_xy_m: [0.08, 0.08]
+    color: [0.10, 0.35, 1.00]
+    cross_color: [1.00, 1.00, 1.00]
+    crosshair: true
+    crosshair_strip_width_m: 0.004
+
+  place_zone:
+    label: place_zone
+    role: target_placement_region
+    local_xy_m: [-0.07, 0.25]
+    size_xy_m: [0.08, 0.08]
+    color: [0.10, 0.80, 0.20]
+    cross_color: [1.00, 1.00, 1.00]
+    crosshair: true

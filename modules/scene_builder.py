@@ -72,6 +72,13 @@ class SceneBuilder:
         table_center = table_info["center"]
         table_slot   = table_info["slot"]
 
+        # Phase 4.0: semantic table zones for reproducible pick-and-place.
+        # These are visual/semantic markers only; by default they have no
+        # collision so they behave like stickers on the table, not obstacles.
+        table_zones = self._create_table_zones(table_info)
+        if table_zones:
+            table_info["zones"] = table_zones
+
         objects = self._spawn_objects(
             table_center=table_center,
             table_info=table_info,
@@ -158,6 +165,7 @@ class SceneBuilder:
             "table_center":     table_center,
             "table_slot":       table_slot,
             "table_info":       table_info,
+            "table_zones":      table_info.get("zones", {}),
             "table_material":   table_mat_name,           
             "table_height":     table_info["table_size"][2],
             "pan_to_table_deg": pan_to_object,
@@ -695,6 +703,180 @@ class SceneBuilder:
             "table_material": table_mat,
             "leg_material":   leg_mat,
         }
+
+    # ══════════════════════════════════════════════════════════════════
+    # PHASE 4.0 — SEMANTIC TABLE ZONES / VISUAL MARKERS
+    # ══════════════════════════════════════════════════════════════════
+
+    def _create_table_zones(self, table_info: dict) -> dict:
+        """Create visual pickup/place zones on the table.
+
+        The zones are semantic/environment markers for the pick-and-place task.
+        By default they are *visual only*: no collision, no rigid body, no mass.
+        This keeps them equivalent to stickers/tape on a real table and avoids
+        changing the contact physics of the soft object.
+
+        Coordinates are expressed in table-local axes:
+          local_x = approach/depth direction
+          local_y = sideways/perpendicular direction
+        and are converted to world using the same table axes used by object
+        spawning.
+        """
+        if not bool(self.config.get("table_zones_enabled", True)):
+            return {}
+
+        zones_cfg = self.config.get("table_zones", {}) or {}
+        if not zones_cfg:
+            # Safe defaults for the current fixed table and 40 mm foam cube.
+            zones_cfg = {
+                "pickup_zone": {
+                    "label": "pickup_zone",
+                    "local_xy_m": [-0.07, 0.0],
+                    "size_xy_m": [0.12, 0.12],
+                    "color": [0.10, 0.35, 1.00],
+                    "cross_color": [1.00, 1.00, 1.00],
+                },
+                "place_zone": {
+                    "label": "place_zone",
+                    "local_xy_m": [-0.07, 0.20],
+                    "size_xy_m": [0.12, 0.12],
+                    "color": [0.10, 0.80, 0.20],
+                    "cross_color": [1.00, 1.00, 1.00],
+                },
+            }
+
+        root = f"{self._trial_root}/TableZones"
+        UsdGeom.Xform.Define(self.stage, Sdf.Path(root))
+
+        tcx, tcy, _ = table_info["center"]
+        approach_rad = float(table_info.get("approach_rad", 0.0))
+        table_rot_deg = float(table_info.get("table_rot_deg", math.degrees(approach_rad)))
+        ax = math.cos(approach_rad)
+        ay = math.sin(approach_rad)
+        px = -math.sin(approach_rad)
+        py = math.cos(approach_rad)
+
+        table_surface_z = float(table_info["table_size"][2])
+        marker_thickness = float(self.config.get("table_zone_marker_thickness_m", 0.001))
+        marker_z_offset = float(self.config.get("table_zone_marker_z_offset_m", 0.001))
+        marker_z = table_surface_z + marker_z_offset
+        collision_enabled = bool(self.config.get("table_zone_marker_collision_enabled", False))
+        crosshair_enabled_default = bool(self.config.get("table_zone_crosshair_enabled", True))
+
+        facing_edge = float(table_info.get("facing_edge", table_info["table_size"][0]))
+        depth_edge = float(table_info.get("depth_edge", table_info["table_size"][1]))
+
+        zone_records = {}
+        for zone_key, zone in zones_cfg.items():
+            local_xy = zone.get("local_xy_m", [0.0, 0.0])
+            size_xy = zone.get("size_xy_m", [0.12, 0.12])
+            color = tuple(zone.get("color", [0.2, 0.6, 1.0]))
+            cross_color = tuple(zone.get("cross_color", [1.0, 1.0, 1.0]))
+            label = zone.get("label", zone_key)
+
+            la = float(local_xy[0])
+            lp = float(local_xy[1])
+            sx = float(size_xy[0])
+            sy = float(size_xy[1])
+
+            wx = tcx + la * ax + lp * px
+            wy = tcy + la * ay + lp * py
+
+            inside_table = (
+                abs(la) + sx / 2.0 <= depth_edge / 2.0
+                and abs(lp) + sy / 2.0 <= facing_edge / 2.0
+            )
+
+            zone_root = f"{root}/{zone_key}"
+            UsdGeom.Xform.Define(self.stage, Sdf.Path(zone_root))
+
+            marker_path = f"{zone_root}/Marker"
+            self._make_visual_box(
+                path=marker_path,
+                size=(sx, sy, marker_thickness),
+                position=(wx, wy, marker_z),
+                color=color,
+                rotation_z_deg=table_rot_deg,
+                collision_enabled=collision_enabled,
+            )
+
+            if bool(zone.get("crosshair", crosshair_enabled_default)):
+                strip = float(zone.get("crosshair_strip_width_m", 0.008))
+                strip_z = marker_z + marker_thickness * 0.75
+                self._make_visual_box(
+                    path=f"{zone_root}/Cross_Long",
+                    size=(sx * 0.86, strip, marker_thickness * 1.2),
+                    position=(wx, wy, strip_z),
+                    color=cross_color,
+                    rotation_z_deg=table_rot_deg,
+                    collision_enabled=False,
+                )
+                self._make_visual_box(
+                    path=f"{zone_root}/Cross_Short",
+                    size=(strip, sy * 0.86, marker_thickness * 1.2),
+                    position=(wx, wy, strip_z),
+                    color=cross_color,
+                    rotation_z_deg=table_rot_deg,
+                    collision_enabled=False,
+                )
+
+            zone_records[zone_key] = {
+                "key": zone_key,
+                "label": label,
+                "local_xy_m": [la, lp],
+                "world_center": [wx, wy, marker_z],
+                "table_surface_z": table_surface_z,
+                "marker_path": marker_path,
+                "size_xy_m": [sx, sy],
+                "marker_thickness_m": marker_thickness,
+                "collision_enabled": collision_enabled,
+                "inside_table": inside_table,
+                "role": zone.get("role", zone_key),
+            }
+
+            print(
+                f"  [TableZone] {label}: local=({la:.3f},{lp:.3f}) "
+                f"world=({wx:.3f},{wy:.3f},{marker_z:.4f}) "
+                f"size=({sx:.3f},{sy:.3f}) collision={collision_enabled} "
+                f"inside_table={inside_table}"
+            )
+
+            if not inside_table:
+                print(
+                    f"  [TableZone] ⚠ {label} marker may extend outside table bounds; "
+                    f"depth_edge={depth_edge:.3f}, facing_edge={facing_edge:.3f}"
+                )
+
+        return zone_records
+
+    def _make_visual_box(
+        self,
+        path: str,
+        size: tuple,
+        position: tuple,
+        color: tuple,
+        rotation_z_deg: float = 0.0,
+        collision_enabled: bool = False,
+    ):
+        """Make a visual cube marker, optionally with collision.
+
+        Used for table stickers/semantic zones.  Unlike _make_box(), this does
+        not automatically apply CollisionAPI, because markers should normally
+        not change soft-object contact physics.
+        """
+        cube = UsdGeom.Cube.Define(self.stage, Sdf.Path(path))
+        cube.GetSizeAttr().Set(1.0)
+
+        xf = UsdGeom.Xformable(cube.GetPrim())
+        xf.ClearXformOpOrder()
+        xf.AddTranslateOp().Set(Gf.Vec3d(*position))
+        if rotation_z_deg != 0.0:
+            xf.AddRotateZOp().Set(rotation_z_deg)
+        xf.AddScaleOp().Set(Gf.Vec3f(*size))
+
+        self._apply_display_color(cube.GetPrim(), color)
+        if collision_enabled:
+            UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
 
     # ══════════════════════════════════════════════════════════════════
     # RANDOM OBJECT GENERATION

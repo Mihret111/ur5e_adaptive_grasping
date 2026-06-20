@@ -1339,6 +1339,7 @@ class PickAndPlaceExecutor:
             "initial_soft_observation": json_safe(self._observe_target(target, stage_name="trial_start")),
             "target_feasibility": grip_feasibility(target, self.config),
             "table_info": json_safe(table_info),
+            "table_zones": json_safe(scene_info.get("table_zones", table_info.get("zones", {}))),
             "config_snapshot": selected_config_snapshot(self.config),
             "events": [
                 make_event(
