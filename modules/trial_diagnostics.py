@@ -108,6 +108,14 @@ def selected_config_snapshot(config: dict) -> Dict[str, Any]:
         "table_zone_marker_thickness_m",
         "table_zone_marker_z_offset_m",
         "table_zones",
+        "enable_place_transport_test",
+        "place_transport_duration",
+        "place_transport_steps",
+        "post_place_transport_settle_seconds",
+        "place_transport_xy_tolerance_m",
+        "max_object_flange_distance_after_transport_m",
+        "min_object_above_table_after_transport_m",
+        "place_default_object_height_m",
     ]
     snap = {k: config.get(k) for k in keys if k in config}
 

@@ -928,8 +928,10 @@ class PickAndPlaceExecutor:
             "flange_pos": flange_pos,
             "object_shift": None,
             "flange_object_distance": None,
+            "transport_shape_safety": None,
             "success": False,
             "reasons": [],
+            "warnings": [],
         }
 
         if object_pos_before_close is None or object_pos_after is None:
@@ -1029,6 +1031,209 @@ class PickAndPlaceExecutor:
             result["reasons"].append(
                 f"object too far from flange after lift: {dist:.3f} > {max_dist:.3f}"
             )
+
+        result["success"] = len(result["reasons"]) == 0
+        return result
+
+    def _get_table_zone(self, scene_info: dict, zone_key: str) -> dict:
+        """Return a semantic table zone record from SceneBuilder output.
+
+        Phase 4 uses the zone as a goal region for placing, not as the grasp
+        target.  Grasping remains object-observation based through
+        SoftObjectObserver / simulation_mesh points.
+        """
+        if not isinstance(scene_info, dict):
+            return {}
+        zones = scene_info.get("table_zones") or (scene_info.get("table_info") or {}).get("zones") or {}
+        return zones.get(zone_key, {}) if isinstance(zones, dict) else {}
+
+    def _estimate_object_height_for_place(self, target: dict) -> float:
+        """Estimate object height for center-on-table placement target."""
+        obs = self._observe_target(target, stage_name="place_height_estimate")
+        if obs and obs.get("height_m") is not None:
+            return float(obs.get("height_m"))
+        for key in ("height", "height_m", "size"):
+            if isinstance(target, dict) and target.get(key) is not None:
+                try:
+                    return float(target.get(key))
+                except Exception:
+                    pass
+        return float(self.config.get("place_default_object_height_m", 0.04))
+
+    def _compute_place_object_center(self, scene_info: dict, target: dict, table_height: float) -> dict:
+        """Compute the desired object-center position over the place zone.
+
+        The place zone is a semantic goal region.  The desired final object
+        center uses the place marker XY and the current/estimated object height.
+        """
+        place_zone = self._get_table_zone(scene_info, "place_zone")
+        if not place_zone:
+            return {
+                "available": False,
+                "reason": "missing_place_zone",
+                "place_zone": {},
+                "place_object_center": None,
+            }
+
+        world_center = place_zone.get("world_center") or place_zone.get("world_center_m")
+        if not world_center or len(world_center) < 2:
+            return {
+                "available": False,
+                "reason": "place_zone_missing_world_center",
+                "place_zone": place_zone,
+                "place_object_center": None,
+            }
+
+        object_height = self._estimate_object_height_for_place(target)
+        place_center = [
+            float(world_center[0]),
+            float(world_center[1]),
+            float(table_height) + 0.5 * object_height,
+        ]
+        return {
+            "available": True,
+            "reason": None,
+            "place_zone": place_zone,
+            "object_height_m": object_height,
+            "place_object_center": place_center,
+            "semantic_note": "place zone defines desired release region; grasp target remains live object pose",
+        }
+
+    def validate_after_place_transport(
+        self,
+        *,
+        target: dict,
+        place_zone: dict,
+        object_pos_before_transport,
+        object_pos_after_transport,
+        table_height: float,
+    ) -> dict:
+        """Validate Phase 4.1 transport while still holding the object.
+
+        This does not validate release yet.  It only verifies that the object is
+        still held and its XY center has moved above/near the place zone.
+        """
+        flange_pos = self.arm.get_flange_world_pos()
+        soft_obs_after = self._observe_target(target, stage_name="after_place_transport_validation")
+        result = {
+            "stage": "after_place_transport",
+            "phase": "4.1_transport_to_place_zone_no_release",
+            "validation_mode": "soft_bbox" if self._is_soft_target(target) else "rigid_root",
+            "gripper_has_object": self.gripper.has_object(),
+            "place_zone": place_zone,
+            "object_pos_before_transport": object_pos_before_transport,
+            "object_pos_after_transport": object_pos_after_transport,
+            "soft_observation_after": soft_obs_after,
+            "flange_pos": flange_pos,
+            "place_zone_xy_error_m": None,
+            "object_transport_xy_delta_m": None,
+            "flange_object_distance": None,
+            "success": False,
+            "reasons": [],
+        }
+
+        if object_pos_after_transport is None:
+            result["reasons"].append("missing object pose after place transport")
+            return result
+
+        world_center = place_zone.get("world_center") or []
+        if len(world_center) < 2:
+            result["reasons"].append("place zone world center unavailable")
+            return result
+
+        dx = float(object_pos_after_transport[0]) - float(world_center[0])
+        dy = float(object_pos_after_transport[1]) - float(world_center[1])
+        xy_err = (dx * dx + dy * dy) ** 0.5
+        result["place_zone_xy_error_m"] = xy_err
+
+        if object_pos_before_transport is not None:
+            tx = float(object_pos_after_transport[0]) - float(object_pos_before_transport[0])
+            ty = float(object_pos_after_transport[1]) - float(object_pos_before_transport[1])
+            result["object_transport_xy_delta_m"] = (tx * tx + ty * ty) ** 0.5
+
+        if flange_pos is not None:
+            result["flange_object_distance"] = self._distance(object_pos_after_transport, flange_pos)
+
+        zone_size = place_zone.get("size_xy_m", [0.08, 0.08])
+        half_zone = min(float(zone_size[0]), float(zone_size[1])) * 0.5 if len(zone_size) >= 2 else 0.04
+        tolerance = float(self.config.get("place_transport_xy_tolerance_m", half_zone + 0.025))
+        max_flange_dist = float(self.config.get("max_object_flange_distance_after_transport_m", 0.28))
+        min_above_table = float(self.config.get("min_object_above_table_after_transport_m", 0.03))
+
+        max_width_ratio = float(self.config.get("place_transport_max_width_ratio", 1.35))
+        max_deformation_score = float(self.config.get("place_transport_max_deformation_score", 0.25))
+        fail_on_deformation = bool(self.config.get("place_transport_fail_on_excessive_deformation", True))
+        result["thresholds"].update({
+            "place_transport_max_width_ratio": max_width_ratio,
+            "place_transport_max_deformation_score": max_deformation_score,
+            "place_transport_fail_on_excessive_deformation": fail_on_deformation,
+        })
+
+        # Phase 4.1b: transport is not only about XY arrival.  The object can
+        # reach the place zone while being stretched/slipped in the gripper.
+        # Therefore check the live deformable mesh after transport.
+        if isinstance(soft_obs_after, dict):
+            wx_ratio = soft_obs_after.get("width_ratio_x")
+            wy_ratio = soft_obs_after.get("width_ratio_y")
+            height = soft_obs_after.get("height_m")
+            nominal_h = float(self.config.get("adaptive_safety_nominal_height_m", 0.040))
+            height_ratio = None
+            try:
+                if height is not None and nominal_h > 1.0e-9:
+                    height_ratio = float(height) / nominal_h
+            except Exception:
+                height_ratio = None
+
+            ratios = []
+            for v in (wx_ratio, wy_ratio, height_ratio):
+                try:
+                    if v is not None:
+                        ratios.append(float(v))
+                except Exception:
+                    pass
+            max_ratio = max(ratios) if ratios else None
+            deformation_score = soft_obs_after.get("deformation_score")
+            if deformation_score is None and ratios:
+                deformation_score = max(abs(r - 1.0) for r in ratios)
+
+            result["transport_shape_safety"] = {
+                "width_ratio_x": wx_ratio,
+                "width_ratio_y": wy_ratio,
+                "height_ratio": height_ratio,
+                "max_dimension_ratio": max_ratio,
+                "deformation_score_proxy": deformation_score,
+                "interpretation": "large ratios during transport indicate soft-object stretch/slip/oscillation while held",
+            }
+            if max_ratio is not None and max_ratio > max_width_ratio:
+                msg = f"soft object stretched during transport: max_ratio={max_ratio:.3f} > {max_width_ratio:.3f}"
+                if fail_on_deformation:
+                    result["reasons"].append(msg)
+                else:
+                    result["warnings"].append(msg)
+            if deformation_score is not None:
+                try:
+                    ds = float(deformation_score)
+                    if ds > max_deformation_score:
+                        msg = f"transport deformation score high: {ds:.3f} > {max_deformation_score:.3f}"
+                        if fail_on_deformation:
+                            result["reasons"].append(msg)
+                        else:
+                            result["warnings"].append(msg)
+                except Exception:
+                    pass
+
+        if not result["gripper_has_object"]:
+            result["reasons"].append("gripper_has_object false after place transport")
+        if xy_err > tolerance:
+            result["reasons"].append(
+                f"object not above place zone: xy_error={xy_err:.3f} > {tolerance:.3f}"
+            )
+        if result["flange_object_distance"] is not None and result["flange_object_distance"] > max_flange_dist:
+            result["reasons"].append(
+                f"object too far from flange after transport: {result['flange_object_distance']:.3f} > {max_flange_dist:.3f}"
+            )
+        if float(object_pos_after_transport[2]) < float(table_height) + min_above_table:
+            result["reasons"].append("object not safely above table after transport")
 
         result["success"] = len(result["reasons"]) == 0
         return result
@@ -1403,6 +1608,8 @@ class PickAndPlaceExecutor:
                 "close_validation": None,
                 "micro_lift_validation": None,
                 "lift_validation": None,
+                "place_transport_plan": None,
+                "place_transport_validation": None,
                 "gripper_diagnostics_after_close": None,
                 "gripper_diagnostics_after_micro_lift": None,
                 "gripper_diagnostics_after_lift": None,
@@ -2199,6 +2406,143 @@ class PickAndPlaceExecutor:
 
                 if lift_validation["success"]:
                     print("[Executor] ✅ Validated lift: object moved with gripper.")
+
+                    # ──── Phase 4.1: transport held object above the semantic place zone ────
+                    if bool(self.config.get("enable_place_transport_test", False)):
+                        print("\n[Executor] Phase 4.1: transporting held object to place zone...")
+                        place_goal = self._compute_place_object_center(
+                            scene_info=scene_info,
+                            target=target,
+                            table_height=table_height,
+                        )
+                        place_plan_log = {
+                            "phase": "4.1_transport_to_place_zone_no_release",
+                            "place_goal": place_goal,
+                            "planning_failed": False,
+                            "reason": None,
+                            "waypoint_names": [],
+                            "joints": None,
+                        }
+                        attempt_log["place_transport_plan"] = json_safe(place_plan_log)
+
+                        if not place_goal.get("available"):
+                            print("[Executor] ❌ Place zone unavailable for transport.")
+                            attempt_log["failure_reason"] = "place_zone_unavailable"
+                            place_plan_log["planning_failed"] = True
+                            place_plan_log["reason"] = place_goal.get("reason")
+                            attempt_log["place_transport_plan"] = json_safe(place_plan_log)
+                            trial_log["attempts"].append(attempt_log)
+                            trial_log["final_reason"] = "place_zone_unavailable"
+                            self._last_trial_log = trial_log
+                            return False
+
+                        place_joints = self.arm.compute_place_joints(
+                            place_world_pos=place_goal["place_object_center"],
+                            pan_to_place_deg=pan_to_object_deg,
+                            table_height=table_height,
+                            object_metadata=target,
+                        ) or {}
+                        place_plan_log["waypoint_names"] = list(place_joints.keys())
+                        place_plan_log["joints"] = place_joints
+                        attempt_log["place_transport_plan"] = json_safe(place_plan_log)
+
+                        # Phase 4.1b: avoid unnecessary safe_above lift during
+                        # transport.  The previous target used safe_above, which lifted
+                        # the object roughly 10 cm more while moving laterally; that can
+                        # stretch/slide a deformable object.  Default to the place "lift"
+                        # waypoint, closer to the current carrying height, and move more
+                        # slowly.
+                        transport_waypoint_name = str(
+                            self.config.get("place_transport_waypoint", "lift")
+                        )
+                        place_transport_target = place_joints.get(transport_waypoint_name)
+                        if place_transport_target is None:
+                            place_transport_target = place_joints.get("safe_above")
+                            transport_waypoint_name = "safe_above_fallback"
+
+                        place_plan_log["transport_waypoint_name"] = transport_waypoint_name
+                        place_plan_log["use_safe_height_wrapper"] = bool(
+                            self.config.get("place_transport_use_safe_height_wrapper", False)
+                        )
+                        attempt_log["place_transport_plan"] = json_safe(place_plan_log)
+
+                        if place_transport_target is None:
+                            print("[Executor] ❌ Place transport planning failed: missing transport waypoint.")
+                            attempt_log["failure_reason"] = "place_transport_planning_failed"
+                            place_plan_log["planning_failed"] = True
+                            place_plan_log["reason"] = "missing_place_transport_waypoint"
+                            attempt_log["place_transport_plan"] = json_safe(place_plan_log)
+                            trial_log["attempts"].append(attempt_log)
+                            trial_log["final_reason"] = "place_transport_planning_failed"
+                            self._last_trial_log = trial_log
+                            return False
+
+                        object_pos_before_transport = self._get_observed_object_pos(
+                            target, stage_name="before_place_transport"
+                        )
+                        if bool(self.config.get("place_transport_use_safe_height_wrapper", False)):
+                            ok = await self.arm.move_via_safe_height(
+                                place_transport_target,
+                                duration=float(self.config.get("place_transport_duration", 8.0)),
+                                steps=int(self.config.get("place_transport_steps", 480)),
+                                step_callback=self.gripper.update,
+                            )
+                        else:
+                            ok = await self.arm.move_to(
+                                place_transport_target,
+                                duration=float(self.config.get("place_transport_duration", 8.0)),
+                                steps=int(self.config.get("place_transport_steps", 480)),
+                                check_table_collision=True,
+                                step_callback=self.gripper.update,
+                            )
+                        if not ok:
+                            print("[Executor] ❌ Place transport motion failed.")
+                            attempt_log["failure_reason"] = "place_transport_motion_failed"
+                            trial_log["attempts"].append(attempt_log)
+                            trial_log["final_reason"] = "place_transport_motion_failed"
+                            self._last_trial_log = trial_log
+                            return False
+
+                        await self._step_gripper_for_seconds(
+                            float(self.config.get("post_place_transport_settle_seconds", 0.5))
+                        )
+                        object_pos_after_transport = self._get_observed_object_pos(
+                            target, stage_name="after_place_transport"
+                        )
+                        place_transport_validation = self.validate_after_place_transport(
+                            target=target,
+                            place_zone=place_goal.get("place_zone", {}),
+                            object_pos_before_transport=object_pos_before_transport,
+                            object_pos_after_transport=object_pos_after_transport,
+                            table_height=table_height,
+                        )
+                        print("\n[Executor] Place transport validation:")
+                        print(place_transport_validation)
+                        attempt_log["place_transport_validation"] = json_safe(place_transport_validation)
+                        attempt_log["events"].append(
+                            make_event(
+                                "place_transport_validation_done",
+                                success=place_transport_validation.get("success"),
+                                reasons=place_transport_validation.get("reasons", []),
+                            )
+                        )
+
+                        if not place_transport_validation.get("success"):
+                            print("[Executor] ❌ Place transport validation failed.")
+                            attempt_log["failure_reason"] = "place_transport_validation_failed"
+                            trial_log["attempts"].append(attempt_log)
+                            trial_log["final_reason"] = "place_transport_validation_failed"
+                            self._last_trial_log = trial_log
+                            return False
+
+                        print("[Executor] ✅ Phase 4.1 transport passed: object held above place zone.")
+                        attempt_log["success"] = True
+                        trial_log["trial_success"] = True
+                        trial_log["final_reason"] = "place_transport_validation_passed_release_disabled"
+                        trial_log["attempts"].append(attempt_log)
+                        self._last_trial_log = trial_log
+                        return True
+
                     attempt_log["success"] = True
                     trial_log["trial_success"] = True
                     trial_log["final_reason"] = "lift_validation_passed"

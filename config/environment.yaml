@@ -394,3 +394,30 @@ table_zones:
     color: [0.10, 0.80, 0.20]
     cross_color: [1.00, 1.00, 1.00]
     crosshair: true
+
+# ───────────── PHASE 4.1: HELD-OBJECT TRANSPORT TO PLACE ZONE ─────────────
+# Transport the object after validated full lift, but do not release yet.
+# This validates the transport part of delicate pick-and-place while preserving
+# the already-tested grasp/release safety work for the next phase.
+enable_place_transport_test: true
+place_transport_duration: 5.0
+place_transport_steps: 300
+post_place_transport_settle_seconds: 0.5
+place_transport_xy_tolerance_m: 0.070
+max_object_flange_distance_after_transport_m: 0.28
+min_object_above_table_after_transport_m: 0.03
+place_default_object_height_m: 0.04
+
+# ───────────── PHASE 4.1b: TRANSPORT STABILITY TUNING ─────────────
+# Phase 4.1 showed successful arrival above the place zone, but the object
+# visibly slipped/stretched during sideways motion.  Stabilize transport by
+# using a lower carrying waypoint, slower interpolation, and explicit soft-shape
+# validation after transport.
+place_transport_waypoint: lift
+place_transport_use_safe_height_wrapper: false
+place_transport_duration: 8.0
+place_transport_steps: 480
+post_place_transport_settle_seconds: 0.8
+place_transport_max_width_ratio: 1.35
+place_transport_max_deformation_score: 0.25
+place_transport_fail_on_excessive_deformation: true
