@@ -332,3 +332,15 @@ adaptive_safety_max_compression_ratio: 0.25
 adaptive_safety_min_height_ratio: 0.70
 adaptive_safety_max_lateral_expansion_ratio: 1.40
 adaptive_safety_max_table_penetration_m: 0.006
+
+# ───────────── PHASE 3.3: DEFORMATION SEVERITY INDEX ─────────────
+# The safety monitor now computes height_ratio, compression_x/y, height_loss,
+# lateral expansion, estimated volume ratio, deformation_score, and combined risk.
+# Defaults assume the current benchmark foam cube is approximately 40 mm per side.
+adaptive_safety_nominal_width_m: 0.040
+adaptive_safety_nominal_depth_m: 0.040
+adaptive_safety_nominal_height_m: 0.040
+adaptive_safety_warn_height_ratio: 0.85
+adaptive_safety_warn_lateral_expansion_ratio: 1.20
+adaptive_safety_warn_deformation_score: 0.60
+adaptive_safety_max_deformation_score: 1.00

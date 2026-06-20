@@ -463,6 +463,52 @@ class PickAndPlaceExecutor:
                 final_reason = "safety_open_limit_reached"
                 break
 
+        # Compact Phase-3.3 safety summary for log analysis and reports.
+        safety_states = {}
+        safety_actions = {}
+        deformation_scores = []
+        combined_risk_scores = []
+        max_compressions = []
+        height_ratios = []
+        soft_obs_count = 0
+        for row in summary.get("trace", []):
+            assess = row.get("safety_assessment") or {}
+            if assess.get("soft_observation_available"):
+                soft_obs_count += 1
+            state = assess.get("safety_state")
+            action_safety = assess.get("recommended_action")
+            if state:
+                safety_states[state] = safety_states.get(state, 0) + 1
+            if action_safety:
+                safety_actions[action_safety] = safety_actions.get(action_safety, 0) + 1
+            for key, store in (
+                ("deformation_score", deformation_scores),
+                ("combined_risk_score", combined_risk_scores),
+                ("compression_ratio_est", max_compressions),
+                ("height_ratio", height_ratios),
+            ):
+                try:
+                    val = assess.get(key)
+                    if val is not None:
+                        store.append(float(val))
+                except Exception:
+                    pass
+
+        safety_summary = {
+            "phase": "3.3_deformation_severity_index",
+            "soft_observation_count": soft_obs_count,
+            "safety_state_counts": safety_states,
+            "safety_action_counts": safety_actions,
+            "max_deformation_score": max(deformation_scores) if deformation_scores else None,
+            "max_combined_risk_score": max(combined_risk_scores) if combined_risk_scores else None,
+            "max_compression_ratio_est": max(max_compressions) if max_compressions else None,
+            "min_height_ratio": min(height_ratios) if height_ratios else None,
+            "interpretation": (
+                "summary of AdaptiveSafetyMonitor decisions during scalar admittance; "
+                "safe means effort and live deformable shape stayed inside configured thresholds"
+            ),
+        }
+
         summary.update({
             "final_reason": final_reason,
             "final_x_m": x,
@@ -470,6 +516,7 @@ class PickAndPlaceExecutor:
             "final_x_dot_mps": x_dot,
             "frames_used": (summary["trace"][-1]["frame"] if summary["trace"] else 0),
             "trace_len": len(summary["trace"]),
+            "adaptive_safety_summary": safety_summary,
         })
         return summary
 
