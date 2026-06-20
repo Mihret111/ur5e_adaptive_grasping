@@ -740,6 +740,83 @@ class Gripper2FG7:
         self.open()
         self._log("→ RELEASE")
 
+    def adjust_hold_targets(
+        self,
+        delta_close_m: float,
+        reason: str = "adaptive_effort_regulation",
+        force_n: Optional[float] = None,
+    ) -> dict:
+        """Small closed-loop correction of HOLDING targets.
+
+        Positive ``delta_close_m`` closes the fingers more.
+        Negative ``delta_close_m`` opens the fingers slightly.
+
+        This method is intentionally tiny and conservative: it does not replace
+        the normal contact/stall logic. It only adjusts the already-established
+        HOLDING targets after the gripper has a plausible grasp. This gives the
+        higher-level effort controller a safe actuator interface:
+
+            measured effort too low  -> positive delta -> squeeze slightly
+            measured effort too high -> negative delta -> relax slightly
+
+        The returned dictionary is JSON-friendly so the trial log can prove
+        what the controller actually commanded.
+        """
+        if self._state != self.HOLDING:
+            return {
+                "applied": False,
+                "reason": "gripper_not_holding",
+                "state": self._state,
+                "requested_delta_close_m": float(delta_close_m),
+            }
+
+        delta = float(delta_close_m)
+
+        if self._hold_targets is None:
+            positions = self._get_physx_positions() or self._get_positions()
+            if not positions:
+                return {
+                    "applied": False,
+                    "reason": "no_hold_targets_or_positions",
+                    "state": self._state,
+                    "requested_delta_close_m": delta,
+                }
+            self._hold_targets = self._clamp_joint_positions(positions)
+            self._hold_target_mode = "adaptive_recovered_from_positions"
+
+        before = self._clamp_joint_positions(self._hold_targets)
+        after = self._clamp_joint_positions([p + delta for p in before])
+
+        # If everything is already clamped, still report honestly.
+        applied_delta = [a - b for a, b in zip(after, before)]
+        applied = any(abs(d) > 1.0e-9 for d in applied_delta)
+
+        self._hold_targets = after
+        self._hold_target_mode = "adaptive_effort_regulated"
+
+        active_force = self._hold_force if force_n is None else self._clamp_force(force_n)
+        self._set_drive_targets(
+            targets=self._hold_targets,
+            force=active_force,
+            stiffness=self._hold_stiffness,
+            damping=self._hold_damping,
+            velocity=0.0,
+        )
+
+        return {
+            "applied": bool(applied),
+            "reason": str(reason),
+            "state": self._state,
+            "requested_delta_close_m": delta,
+            "applied_delta_close_m": applied_delta,
+            "hold_targets_before_m": before,
+            "hold_targets_after_m": after,
+            "hold_target_mode": self._hold_target_mode,
+            "hold_force_n": active_force,
+            "stiffness": self._hold_stiffness,
+            "damping": self._hold_damping,
+        }
+
     # ══════════════════════════════════════════════════════════════
     # PUBLIC API — Tick
     # ══════════════════════════════════════════════════════════════

@@ -1,19 +1,23 @@
 """force_observer.py
 
-force-feedback observer for the soft-grasp pipeline
+Scientifically honest force-feedback observer for the B2B soft-grasp pipeline.
 
 Current validated backend:
-  - Measured joint effort from the UR5e articulation that also contains the
+  - measured joint effort from the UR5e articulation that also contains the
     2FG7 prismatic finger joints.
-  - NOT direct fingertip ContactSensor force.
-  - Measured articulation/joint effort. For the 2FG7 prismatic finger
-    joints it is force-like and useful as a simulation-side squeeze-feedback
-    signal
-  - Logged as "measured_joint_effort_sim" until a Newton calibration is performed
 
+Important naming convention:
+  - This is NOT direct fingertip ContactSensor force.
+  - This is measured articulation/joint effort. For the 2FG7 prismatic finger
+    joints it is force-like and useful as a simulation-side squeeze-feedback
+    signal, but it should be logged as ``measured_joint_effort_sim`` until a
+    Newton calibration is performed.
+
+COGAR mapping:
   - ForceObserver = proprioceptive/tactile perceptual schema.
-  - The controller/action-selection layer will consume this interface rather
-    than directly reading Isaac APIs.
+  - The controller/action-selection layer must consume this interface rather
+    than directly reading Isaac APIs. This keeps sim and real robot backends
+    replaceable.
 """
 
 from __future__ import annotations
@@ -135,10 +139,22 @@ class ArticulationEffortForceObserver:
             self.config.get("force_observer_baseline_abs_deadband", 1.0e-4)
         )
         self.target_effort_sim = float(
-            self.config.get("force_observer_target_effort_sim", 0.45)
+            self.config.get(
+                "force_observer_target_effort_sim",
+                self.config.get("adaptive_effort_target_sim", 0.35),
+            )
         )
         self.max_effort_sim = float(
-            self.config.get("force_observer_max_effort_sim", 1.20)
+            self.config.get("force_observer_max_effort_sim", self.config.get("adaptive_effort_max_sim", 1.20))
+        )
+        self.target_band_sim = float(
+            self.config.get(
+                "force_observer_target_band_sim",
+                self.config.get("adaptive_effort_target_band_sim", 0.08),
+            )
+        )
+        self.audit_rich_joint_signals = bool(
+            self.config.get("force_observer_audit_rich_joint_signals", True)
         )
 
         self._art = None
@@ -227,7 +243,7 @@ class ArticulationEffortForceObserver:
         sources = self._name_sources()
         wanted = {self.left_joint_name, self.right_joint_name}
 
-        # Best case: exact length and both finger names present.
+        # Best: exact length and both finger names present.
         for source, names in sources.items():
             if len(names) == effort_len and wanted.issubset(set(names)):
                 return names, source
@@ -256,6 +272,63 @@ class ArticulationEffortForceObserver:
             return flat, shape, None
         except Exception as e:
             return [], [], repr(e)
+
+    def _safe_articulation_call(self, method_name: str):
+        """Best-effort call for optional articulation force APIs.
+
+        The exact Isaac wrapper differs by version. We do not use these optional
+        signals for control yet; they are logged to explain the difference
+        between measured projected efforts, measured 6D joint forces, and
+        applied/commanded efforts.
+        """
+        if self._art is None or not hasattr(self._art, method_name):
+            return None, f"method_missing:{method_name}"
+        try:
+            return getattr(self._art, method_name)(), None
+        except Exception as e:
+            return None, repr(e)
+
+    def _summarize_optional_signal(self, method_name: str, max_items: int = 12) -> dict:
+        val, err = self._safe_articulation_call(method_name)
+        out = {
+            "method": method_name,
+            "available": err is None,
+            "error": err,
+        }
+        if err is not None:
+            return out
+
+        safe = _to_builtin(val, max_items=200)
+        flat, shape = _flat_float_list(val)
+        out.update({
+            "shape": shape,
+            "flat_count": len(flat),
+            "max_abs": max([abs(v) for v in flat], default=0.0),
+            "sample": _to_builtin(safe, max_items=max_items),
+        })
+
+        # For measured_joint_forces the rows may be 6D spatial force/torque
+        # vectors. The exact row-to-joint mapping can include base/fixed rows,
+        # so we only provide candidate rows near the finger effort indices.
+        if flat and shape and len(shape) >= 2 and shape[-1] in (6,):
+            rows = _to_builtin(val, max_items=200)
+            try:
+                candidates = {}
+                for label, idx in [("left_candidate_row", self._left_idx), ("right_candidate_row", self._right_idx)]:
+                    if idx is None:
+                        continue
+                    for row_idx in [idx, idx + 1]:
+                        if 0 <= row_idx < len(rows):
+                            candidates[f"{label}_{row_idx}"] = rows[row_idx]
+                out["candidate_spatial_rows_near_finger_indices"] = candidates
+                out["spatial_force_note"] = (
+                    "Rows are logged for audit only; row-to-finger mapping may include base/fixed-body offsets. "
+                    "Do not use these as calibrated fingertip forces without a dedicated mapping/calibration test."
+                )
+            except Exception as e:
+                out["candidate_rows_error"] = repr(e)
+
+        return out
 
     def _ensure_ready(self) -> bool:
         if not self.enabled:
@@ -356,9 +429,22 @@ class ArticulationEffortForceObserver:
         # This is an effort-based releaser, not a proof of contact by itself.
         contact_like = grip_effort >= self.contact_threshold
         over_max = grip_effort >= self.max_effort_sim
-        near_target = abs(grip_effort - self.target_effort_sim) <= float(
-            self.config.get("force_observer_target_band_sim", 0.10)
-        )
+        near_target = abs(grip_effort - self.target_effort_sim) <= self.target_band_sim
+
+        optional_joint_signal_audit = None
+        if self.audit_rich_joint_signals:
+            optional_joint_signal_audit = {
+                "measured_joint_efforts_used_for_control": {
+                    "method": "get_measured_joint_efforts",
+                    "left_index": self._left_idx,
+                    "right_index": self._right_idx,
+                    "left_raw": left_raw,
+                    "right_raw": right_raw,
+                    "note": "Projected active force/torque along each DOF; this is the control feedback signal for prismatic finger joints.",
+                },
+                "measured_joint_forces_spatial_audit": self._summarize_optional_signal("get_measured_joint_forces"),
+                "applied_joint_efforts_command_audit": self._summarize_optional_signal("get_applied_joint_efforts"),
+            }
 
         obs = {
             "available": True,
@@ -384,10 +470,18 @@ class ArticulationEffortForceObserver:
             "effort_balance_sim": effort_balance,
             "contact_like_effort": contact_like,
             "target_effort_sim": self.target_effort_sim,
+            "target_band_sim": self.target_band_sim,
             "max_effort_sim": self.max_effort_sim,
             "near_target_effort": near_target,
             "over_max_effort": over_max,
             "direct_contact_sensor_force_available": False,
+            "optional_joint_signal_audit": optional_joint_signal_audit,
+            "signal_taxonomy": {
+                "used_for_control": "get_measured_joint_efforts / projected prismatic finger effort",
+                "not_used_for_control_yet": "get_measured_joint_forces / 6D spatial joint wrench",
+                "not_feedback": "get_applied_joint_efforts / commanded or applied effort",
+                "not_available_for_soft_contact": "ContactSensor.force gave zero for deformable foam contact in our tests",
+            },
             "interpretation": (
                 "Measured articulation effort from 2FG7 prismatic finger DOFs; "
                 "valid as sim-side force-like feedback after baseline and calibration checks."
@@ -426,6 +520,7 @@ class ArticulationEffortForceObserver:
             "baseline_left": self._baseline_left,
             "baseline_right": self._baseline_right,
             "target_effort_sim": self.target_effort_sim,
+            "target_band_sim": self.target_band_sim,
             "max_effort_sim": self.max_effort_sim,
             "contact_threshold": self.contact_threshold,
             "last_observation": self._last_observation,

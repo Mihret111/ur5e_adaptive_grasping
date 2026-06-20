@@ -133,6 +133,10 @@ class PickAndPlaceExecutor:
 
         await self._step_gripper_for_seconds(hold_settle_time)
 
+        adaptive_effort_regulation = None
+        if bool(self.config.get("adaptive_effort_control_enabled", False)):
+            adaptive_effort_regulation = await self._regulate_gripper_effort_after_close()
+
         force_after_hold = None
         if hasattr(self, "force_observer"):
             try:
@@ -145,6 +149,7 @@ class PickAndPlaceExecutor:
                 }
 
         close_resolution["force_observation_before_close"] = force_before_close
+        close_resolution["adaptive_effort_regulation"] = adaptive_effort_regulation
         close_resolution["force_observation_after_hold_settle"] = force_after_hold
         close_resolution["force_observer_diagnostics"] = (
             self.force_observer.get_diagnostics()
@@ -164,7 +169,244 @@ class PickAndPlaceExecutor:
         
         return close_resolution
 
-    # helper to just pause and hold the gripper open or close for inspection 
+    async def _regulate_gripper_effort_after_close(self) -> dict:
+        """Scalar measured-effort admittance for the 2FG7 gripper.
+
+        Phase 2 used a deadband rule: if effort was too low, close a fixed
+        amount; if effort was too high, open a fixed amount. That was useful as
+        a first safe feedback regulator, but it was only admittance-style.
+
+        This Phase 2.5 loop implements an explicit 1D virtual admittance model
+        on the gripper closing coordinate x [m]:
+
+            M*x_ddot + D*x_dot + K*x = G*(F_target - F_measured)
+
+        where F_measured is the measured prismatic finger-joint effort from the
+        ForceObserver. The admittance state x is a small correction around the
+        already-established HOLDING target. Positive x means "close slightly";
+        negative x means "relax/open slightly".
+
+        The effort units are Isaac simulation joint-effort units, not calibrated
+        real Newtons yet. This loop is therefore an actual scalar admittance
+        controller with a measured sim-side effort input, not a claim of direct
+        fingertip ContactSensor force.
+        """
+        app = omni.kit.app.get_app()
+
+        controller_mode = str(
+            self.config.get("adaptive_effort_controller_mode", "scalar_admittance")
+        )
+
+        summary = {
+            "enabled": True,
+            "controller": "scalar_gripper_joint_effort_admittance",
+            "controller_mode": controller_mode,
+            "force_source": "measured_joint_effort_sim",
+            "units": "sim_prismatic_joint_effort_not_calibrated_newtons",
+            "formal_model": "M*x_ddot + D*x_dot + K*x = G*(F_target - F_measured)",
+            "state_meaning": "x is a small correction of gripper HOLDING targets; positive closes, negative opens",
+            "ran": False,
+            "trace": [],
+        }
+
+        if not hasattr(self, "force_observer"):
+            summary["reason"] = "force_observer_missing"
+            return summary
+
+        if not hasattr(self.gripper, "adjust_hold_targets"):
+            summary["reason"] = "gripper_adjust_hold_targets_missing"
+            return summary
+
+        if self.gripper.get_state() != self.gripper.HOLDING:
+            summary["reason"] = "gripper_not_holding"
+            summary["state"] = self.gripper.get_state()
+            return summary
+
+        target = float(
+            self.config.get(
+                "adaptive_effort_target_sim",
+                self.config.get("force_observer_target_effort_sim", 0.35),
+            )
+        )
+        band = float(
+            self.config.get(
+                "adaptive_effort_target_band_sim",
+                self.config.get("force_observer_target_band_sim", 0.06),
+            )
+        )
+        max_effort = float(
+            self.config.get(
+                "adaptive_effort_max_sim",
+                self.config.get("force_observer_max_effort_sim", 1.20),
+            )
+        )
+
+        # Small physical limits around the pre-existing hold target. These keep
+        # the admittance layer from destroying a grasp that the geometric close
+        # stage already made plausible.
+        max_total_close = float(self.config.get("adaptive_effort_max_extra_close_m", 0.00150))
+        max_total_open = float(self.config.get("adaptive_effort_max_relax_open_m", 0.00100))
+        max_delta_per_update = float(self.config.get("adaptive_admittance_max_delta_per_update_m", 0.00010))
+        max_velocity = float(self.config.get("adaptive_admittance_max_velocity_mps", 0.0015))
+
+        # Virtual admittance parameters. They are intentionally conservative and
+        # unit-labelled as simulation gains because the effort signal is not yet
+        # calibrated to real 2FG7 Newtons.
+        virtual_mass = float(self.config.get("adaptive_admittance_virtual_mass", 1.0))
+        virtual_damping = float(self.config.get("adaptive_admittance_virtual_damping", 12.0))
+        virtual_stiffness = float(self.config.get("adaptive_admittance_virtual_stiffness", 35.0))
+        effort_to_accel_gain = float(self.config.get("adaptive_admittance_effort_to_accel_gain", 0.04))
+        deadband = float(self.config.get("adaptive_admittance_deadband_sim", min(0.03, band)))
+        dt = float(self.config.get("adaptive_admittance_dt_s", 1.0 / 60.0))
+
+        sample_stride = max(1, int(self.config.get("adaptive_effort_sample_stride_frames", 5)))
+        max_frames = max(1, int(self.config.get("adaptive_effort_max_frames", 90)))
+        required_stable = max(1, int(self.config.get("adaptive_effort_required_stable_samples", 3)))
+
+        summary.update({
+            "ran": True,
+            "target_effort_sim": target,
+            "target_band_sim": band,
+            "deadband_sim": deadband,
+            "max_effort_sim": max_effort,
+            "max_total_close_m": max_total_close,
+            "max_total_open_m": max_total_open,
+            "max_delta_per_update_m": max_delta_per_update,
+            "max_velocity_mps": max_velocity,
+            "virtual_mass": virtual_mass,
+            "virtual_damping": virtual_damping,
+            "virtual_stiffness": virtual_stiffness,
+            "effort_to_accel_gain": effort_to_accel_gain,
+            "dt_s": dt,
+            "sample_stride_frames": sample_stride,
+            "max_frames": max_frames,
+            "required_stable_samples": required_stable,
+        })
+
+        # Admittance state. x=0 means keep the original hold target.
+        x = 0.0
+        x_dot = 0.0
+        applied_x = 0.0
+        stable_count = 0
+        final_reason = "max_frames_reached"
+
+        for frame in range(max_frames):
+            self.gripper.update()
+            await app.next_update_async()
+
+            if (frame % sample_stride) != 0:
+                continue
+
+            try:
+                obs = self.force_observer.observe(
+                    stage_name=f"adaptive_admittance_frame_{frame + 1}"
+                )
+            except Exception as e:
+                obs = {
+                    "available": False,
+                    "reason": f"force_observer_exception: {e}",
+                }
+
+            action = "hold_no_observation"
+            adjust = {"applied": False, "reason": action, "requested_delta_close_m": 0.0}
+            delta_to_apply = 0.0
+            effort = None
+            effort_error = None
+            force_input = 0.0
+            x_ddot = 0.0
+
+            if obs.get("available"):
+                effort = float(obs.get("grip_effort_sim", 0.0) or 0.0)
+                effort_error = target - effort
+
+                # Safety override: if measured effort is above the maximum safe
+                # value, force a small relaxation independent of the virtual
+                # dynamics. This is the reactive inhibitor layer.
+                if effort >= max_effort:
+                    x = max(x - max_delta_per_update, -max_total_open)
+                    x_dot = min(x_dot, 0.0)
+                    action = "safety_relax_over_max_effort"
+                    stable_count = 0
+                else:
+                    if abs(effort_error) <= deadband:
+                        force_input = 0.0
+                        stable_count += 1
+                    else:
+                        force_input = effort_to_accel_gain * effort_error
+                        stable_count = 0
+
+                    if virtual_mass <= 0.0:
+                        virtual_mass = 1.0
+
+                    # Actual scalar admittance dynamics.
+                    x_ddot = (force_input - virtual_damping * x_dot - virtual_stiffness * x) / virtual_mass
+                    x_dot = x_dot + x_ddot * dt
+                    x_dot = max(-max_velocity, min(max_velocity, x_dot))
+                    x = x + x_dot * dt
+                    x = max(-max_total_open, min(max_total_close, x))
+
+                    if stable_count >= required_stable:
+                        action = "stable_near_target_admittance"
+                        final_reason = "stable_near_target"
+                    elif effort_error is not None and effort_error > deadband:
+                        action = "admittance_close_from_low_effort"
+                    elif effort_error is not None and effort_error < -deadband:
+                        action = "admittance_relax_from_high_effort"
+                    else:
+                        action = "admittance_damped_hold"
+
+                delta_to_apply = x - applied_x
+                if abs(delta_to_apply) > max_delta_per_update:
+                    delta_to_apply = max(-max_delta_per_update, min(max_delta_per_update, delta_to_apply))
+                    x = applied_x + delta_to_apply
+
+                if abs(delta_to_apply) > 1.0e-9:
+                    adjust = self.gripper.adjust_hold_targets(
+                        delta_close_m=delta_to_apply,
+                        reason=action,
+                    )
+                    if adjust.get("applied"):
+                        applied_x += delta_to_apply
+                else:
+                    adjust = {
+                        "applied": False,
+                        "reason": action,
+                        "requested_delta_close_m": 0.0,
+                    }
+
+            summary["trace"].append({
+                "frame": frame + 1,
+                "action": action,
+                "effort_sim": effort,
+                "effort_error_sim": effort_error,
+                "force_input_sim": force_input,
+                "x_m": x,
+                "x_dot_mps": x_dot,
+                "x_ddot_mps2": x_ddot,
+                "delta_close_m": delta_to_apply,
+                "applied_x_m": applied_x,
+                "stable_count": stable_count,
+                "adjustment": adjust,
+                "observation": obs,
+            })
+
+            if final_reason == "stable_near_target":
+                break
+            if action == "safety_relax_over_max_effort" and applied_x <= -max_total_open + 1.0e-9:
+                final_reason = "safety_open_limit_reached"
+                break
+
+        summary.update({
+            "final_reason": final_reason,
+            "final_x_m": x,
+            "applied_x_m": applied_x,
+            "final_x_dot_mps": x_dot,
+            "frames_used": (summary["trace"][-1]["frame"] if summary["trace"] else 0),
+            "trace_len": len(summary["trace"]),
+        })
+        return summary
+
+
     async def _hold_for_inspection(self, seconds: float = None):
         if not self.config.get("debug_hold_after_stage", False):
             return
