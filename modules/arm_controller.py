@@ -1267,11 +1267,35 @@ class UR5EController:
             self.set_joint_targets_deg(list(interp))
             await app.next_update_async()
 
+            callback_result = None
             if step_callback is not None:
                 if asyncio.iscoroutinefunction(step_callback):
-                    await step_callback()
+                    callback_result = await step_callback()
                 else:
-                    step_callback()
+                    callback_result = step_callback()
+
+            # Phase 4.1e: allow a reactive transport monitor to stop the arm.
+            # This is intentionally fail-closed: if the held soft object begins
+            # to slip/fall during transport, the gripper/soft-object monitor can
+            # request an abort instead of letting the scripted trajectory continue.
+            abort_requested = False
+            abort_reason = None
+            if callback_result is False:
+                abort_requested = True
+                abort_reason = "step_callback_returned_false"
+            elif isinstance(callback_result, str) and callback_result.lower() in ("abort", "stop", "halt"):
+                abort_requested = True
+                abort_reason = callback_result
+            elif isinstance(callback_result, dict) and callback_result.get("abort"):
+                abort_requested = True
+                abort_reason = callback_result.get("reason", "step_callback_abort")
+
+            if abort_requested:
+                print(f"  [ABORT] Step callback requested arm stop at step {i}/{steps}: {abort_reason}")
+                self.set_joint_targets_deg(list(last_safe))
+                for _ in range(20):
+                    await app.next_update_async()
+                return False
 
             if check_table_collision and self._table_info is not None:
                 if self._check_full_collision():

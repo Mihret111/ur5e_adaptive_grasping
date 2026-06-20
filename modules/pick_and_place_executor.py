@@ -528,6 +528,1050 @@ class PickAndPlaceExecutor:
         return summary
 
 
+    # ─────────────────────────────────────────────────────────────
+    # Phase 4.1f: shear/load observability during held-object transport
+    # ─────────────────────────────────────────────────────────────
+    @staticmethod
+    def _vsub(a, b):
+        try:
+            return [float(a[0]) - float(b[0]), float(a[1]) - float(b[1]), float(a[2]) - float(b[2])]
+        except Exception:
+            return None
+
+    @staticmethod
+    def _vdot(a, b):
+        try:
+            return float(a[0]) * float(b[0]) + float(a[1]) * float(b[1]) + float(a[2]) * float(b[2])
+        except Exception:
+            return None
+
+    @staticmethod
+    def _vnorm(a):
+        try:
+            return float((float(a[0]) ** 2 + float(a[1]) ** 2 + float(a[2]) ** 2) ** 0.5)
+        except Exception:
+            return None
+
+    @classmethod
+    def _vunit(cls, a):
+        n = cls._vnorm(a)
+        if n is None or n <= 1.0e-12:
+            return None
+        return [float(a[0]) / n, float(a[1]) / n, float(a[2]) / n]
+
+    @classmethod
+    def _vscale(cls, a, k):
+        try:
+            return [float(a[0]) * float(k), float(a[1]) * float(k), float(a[2]) * float(k)]
+        except Exception:
+            return None
+
+    @classmethod
+    def _vtangent_to_axis(cls, vec, axis_unit):
+        """Return tangential component of vec with respect to candidate contact normal axis."""
+        if vec is None or axis_unit is None:
+            return None
+        d = cls._vdot(vec, axis_unit)
+        if d is None:
+            return None
+        normal = cls._vscale(axis_unit, d)
+        return cls._vsub(vec, normal)
+
+    def _flange_local_axis_world(self, local_axis_label: str):
+        """Return a unit world vector for a flange-local axis label such as '+X' or '-Y'."""
+        try:
+            label = str(local_axis_label or '+X').strip().upper()
+            sign = -1.0 if label.startswith('-') else 1.0
+            axis_name = label[-1]
+            basis = {'X': [1.0, 0.0, 0.0], 'Y': [0.0, 1.0, 0.0], 'Z': [0.0, 0.0, 1.0]}.get(axis_name)
+            if basis is None:
+                return None
+            p0 = self.arm._transform_flange_local_point_to_world([0.0, 0.0, 0.0])
+            p1 = self.arm._transform_flange_local_point_to_world([sign * basis[0], sign * basis[1], sign * basis[2]])
+            return self._vunit(self._vsub(p1, p0))
+        except Exception:
+            return None
+
+    def _transport_object_mass_kg(self, target: dict):
+        """Best-effort mass estimate used only for shear/load audit calculations."""
+        cfg_mass = self.config.get('place_transport_shear_audit_object_mass_kg', None)
+        for candidate in (cfg_mass,
+                          (target or {}).get('mass_kg') if isinstance(target, dict) else None,
+                          (target or {}).get('mass') if isinstance(target, dict) else None):
+            try:
+                if candidate is not None:
+                    value = float(candidate)
+                    if value > 0.0:
+                        return value
+            except Exception:
+                pass
+        return float(self.config.get('place_transport_default_object_mass_kg', 0.010))
+
+    def _estimate_required_normal_force_for_axes(self, *, mass_kg, accel_world, mu_candidates, safety_factor):
+        """Estimate shear demand and required per-finger normal force for candidate flange axes.
+
+        This is an observability model, not a calibrated force controller.  It asks:
+        if this flange axis were the dominant contact-normal direction, what shear
+        load would the grasp have to resist during the current transport sample?
+        """
+        g = float(self.config.get('place_transport_shear_audit_gravity_mps2', 9.81))
+        gravity_world = [0.0, 0.0, -g]
+        total_specific_load = [
+            float(gravity_world[0]) - float(accel_world[0]),
+            float(gravity_world[1]) - float(accel_world[1]),
+            float(gravity_world[2]) - float(accel_world[2]),
+        ]
+        labels = ['+X', '-X', '+Y', '-Y', '+Z', '-Z']
+        assumed = str(self.config.get('place_transport_shear_audit_assumed_normal_axis_local', self.config.get('finger_capture_axis_local', '+X'))).upper()
+        results = {}
+        for label in labels:
+            axis = self._flange_local_axis_world(label)
+            tan = self._vtangent_to_axis(total_specific_load, axis)
+            tan_accel_mag = self._vnorm(tan)
+            if tan_accel_mag is None:
+                continue
+            f_shear = float(mass_kg) * float(tan_accel_mag)
+            req = {}
+            for mu in mu_candidates:
+                try:
+                    mu_f = float(mu)
+                    if mu_f <= 1.0e-9:
+                        continue
+                    # Two-finger parallel grasp: 2 * mu * N >= F_shear.
+                    req[str(mu_f)] = float(safety_factor) * f_shear / (2.0 * mu_f)
+                except Exception:
+                    pass
+            results[label] = {
+                'axis_world_unit': axis,
+                'tangential_specific_load_mps2': tan_accel_mag,
+                'estimated_shear_force_N': f_shear,
+                'required_normal_force_per_finger_N_by_mu': req,
+                'is_assumed_axis': label == assumed,
+            }
+        return {
+            'model': 'two-finger friction grasp audit: 2*mu*N >= F_shear; N_req = safety_factor*F_shear/(2*mu)',
+            'mass_kg': mass_kg,
+            'gravity_mps2': g,
+            'specific_load_world_mps2': total_specific_load,
+            'assumed_normal_axis_local': assumed,
+            'axis_candidates': results,
+        }
+
+    def _compute_transport_shear_reference(self, *, target=None, place_goal=None, transport_duration=None, transport_steps=None):
+        """Compute a shear-aware gripper effort reference before transport.
+
+        Phase 4.1f showed that transport slip is gravity/shear dominated and
+        that changing policy without a load model is wrong.  This function keeps
+        the model explicit:
+
+            2 * mu * N >= F_shear
+            N_req = safety_factor * F_shear / (2 * mu)
+
+        We still do NOT claim that measured Isaac finger effort is calibrated
+        fingertip normal force.  The output is therefore an effort-proxy target:
+        target_effort_proxy = bias + proxy_gain * N_req, clamped by config.
+        """
+        enabled = bool(self.config.get("place_transport_shear_compensation_enabled", True))
+        summary = {
+            "enabled": enabled,
+            "phase": "4.1g_calibrated_shear_aware_transport_reference",
+            "model": "two-finger friction grasp: 2*mu*N >= F_shear",
+            "units_warning": "target_effort_sim is a calibrated/empirical joint-effort proxy, not direct fingertip normal force",
+            "success": False,
+        }
+        if not enabled:
+            summary["reason"] = "place_transport_shear_compensation_disabled"
+            return summary
+
+        try:
+            mass_kg = self._transport_object_mass_kg(target)
+            mu_eff = float(self.config.get("place_transport_shear_mu_effective", 0.35))
+            safety_factor = float(self.config.get("place_transport_shear_safety_factor", 2.0))
+            proxy_gain = float(self.config.get("place_transport_proxy_effort_per_newton", 1.0))
+            proxy_bias = float(self.config.get("place_transport_proxy_effort_bias_sim", 0.25))
+            min_target = float(self.config.get("place_transport_shear_target_min_sim", 0.42))
+            max_target = float(self.config.get("place_transport_shear_target_max_sim", 0.62))
+            base_target = float(
+                self.config.get(
+                    "adaptive_effort_target_sim",
+                    self.config.get("force_observer_target_effort_sim", 0.35),
+                )
+            )
+
+            # Estimate a nominal transport acceleration from a smoothstep move.
+            # smoothstep has max normalized acceleration about 6/T^2, so this is
+            # a conservative feed-forward estimate.  Phase 4.1f showed gravity
+            # dominates here, but we keep acceleration in the model for future
+            # heavier/faster objects.
+            cur_obj = self._get_observed_object_pos(target, stage_name="shear_reference_object")
+            place_zone = (place_goal or {}).get("place_zone", {}) if isinstance(place_goal, dict) else {}
+            place_center = place_zone.get("world_center") if isinstance(place_zone, dict) else None
+            transport_vec = None
+            transport_dist = 0.0
+            accel_world = [0.0, 0.0, 0.0]
+            if cur_obj is not None and place_center is not None:
+                transport_vec = [
+                    float(place_center[0]) - float(cur_obj[0]),
+                    float(place_center[1]) - float(cur_obj[1]),
+                    0.0,
+                ]
+                transport_dist = self._vnorm(transport_vec) or 0.0
+                unit = self._vunit(transport_vec)
+                T = max(1.0e-6, float(transport_duration or self.config.get("place_transport_duration", 5.0)))
+                accel_mag = float(self.config.get("place_transport_shear_accel_scale", 6.0)) * transport_dist / (T * T)
+                if unit is not None:
+                    accel_world = self._vscale(unit, accel_mag) or [0.0, 0.0, 0.0]
+
+            mu_candidates = self.config.get("place_transport_shear_audit_mu_candidates", [0.3, 0.5, 0.8])
+            if not isinstance(mu_candidates, (list, tuple)):
+                mu_candidates = [0.3, 0.5, 0.8]
+            if mu_eff not in [float(m) for m in mu_candidates if str(m).strip()]:
+                mu_candidates = list(mu_candidates) + [mu_eff]
+
+            estimate = self._estimate_required_normal_force_for_axes(
+                mass_kg=mass_kg,
+                accel_world=accel_world,
+                mu_candidates=mu_candidates,
+                safety_factor=safety_factor,
+            )
+            axis_candidates = estimate.get("axis_candidates", {}) or {}
+            mode = str(self.config.get("place_transport_contact_normal_axis_mode", "AUTO_HORIZONTAL_MAX_SHEAR")).upper()
+            explicit_axis = str(self.config.get("place_transport_contact_normal_axis_local", "")).upper().strip()
+            max_abs_vertical = float(self.config.get("place_transport_contact_axis_max_abs_vertical_component", 0.75))
+
+            selected_label = None
+            selected = None
+            if explicit_axis in axis_candidates and not explicit_axis.startswith("AUTO"):
+                selected_label = explicit_axis
+                selected = axis_candidates.get(selected_label)
+            else:
+                candidates = []
+                for label, data in axis_candidates.items():
+                    axis = data.get("axis_world_unit") or [0.0, 0.0, 1.0]
+                    try:
+                        abs_z = abs(float(axis[2]))
+                    except Exception:
+                        abs_z = 1.0
+                    if "HORIZONTAL" in mode and abs_z > max_abs_vertical:
+                        continue
+                    candidates.append((float(data.get("estimated_shear_force_N", 0.0)), label, data))
+                if not candidates:
+                    candidates = [
+                        (float(data.get("estimated_shear_force_N", 0.0)), label, data)
+                        for label, data in axis_candidates.items()
+                    ]
+                if candidates:
+                    candidates.sort(reverse=True, key=lambda row: row[0])
+                    _, selected_label, selected = candidates[0]
+
+            f_shear = float((selected or {}).get("estimated_shear_force_N", 0.0))
+            n_required = safety_factor * f_shear / max(2.0 * mu_eff, 1.0e-9)
+            raw_target = proxy_bias + proxy_gain * n_required
+            target_effort = max(base_target, min(max_target, max(min_target, raw_target)))
+
+            summary.update({
+                "success": True,
+                "selected_contact_normal_axis_local": selected_label,
+                "contact_axis_selection_mode": mode,
+                "selected_axis_world_unit": (selected or {}).get("axis_world_unit"),
+                "mass_kg": mass_kg,
+                "transport_vector_xy_m": transport_vec,
+                "transport_distance_xy_m": transport_dist,
+                "nominal_accel_world_mps2": accel_world,
+                "estimated_shear_force_N": f_shear,
+                "mu_effective": mu_eff,
+                "safety_factor": safety_factor,
+                "required_normal_force_per_finger_N": n_required,
+                "proxy_effort_per_newton": proxy_gain,
+                "proxy_effort_bias_sim": proxy_bias,
+                "base_static_target_effort_sim": base_target,
+                "raw_shear_target_effort_sim": raw_target,
+                "target_effort_sim": target_effort,
+                "target_clamp_min_sim": min_target,
+                "target_clamp_max_sim": max_target,
+                "axis_candidates": axis_candidates,
+                "interpretation": (
+                    "Use this as a pre-transport grip effort reference. If slip still grows while this "
+                    "target is reached, the limiting factor is likely contact geometry/friction/deformation, "
+                    "not just scalar normal effort."
+                ),
+            })
+        except Exception as e:
+            summary.update({"success": False, "reason": f"exception: {e}"})
+        return json_safe(summary)
+
+    async def _apply_transport_shear_preload(self, *, target=None, shear_reference=None):
+        """Stationary pre-transport preload using the shear-aware effort target.
+
+        The important change is timing: do not wait until the object has already
+        started sliding.  Build the predicted transport normal effort while the
+        arm is still stationary, then move.
+        """
+        summary = {
+            "enabled": bool(self.config.get("place_transport_shear_preload_enabled", True)),
+            "phase": "4.1g_pre_transport_shear_preload",
+            "ran": False,
+            "shear_reference_target_effort_sim": None,
+        }
+        if not summary["enabled"]:
+            summary["reason"] = "place_transport_shear_preload_disabled"
+            return summary
+        if not isinstance(shear_reference, dict) or not shear_reference.get("success"):
+            summary["reason"] = "missing_or_invalid_shear_reference"
+            summary["shear_reference"] = json_safe(shear_reference)
+            return summary
+        target_effort = shear_reference.get("target_effort_sim")
+        try:
+            target_effort = float(target_effort)
+        except Exception:
+            summary["reason"] = "invalid_target_effort"
+            return summary
+
+        summary["ran"] = True
+        summary["shear_reference_target_effort_sim"] = target_effort
+        try:
+            summary["before_force_observation"] = json_safe(
+                self.force_observer.observe(stage_name="before_transport_shear_preload")
+                if hasattr(self, "force_observer") else None
+            )
+        except Exception as e:
+            summary["before_force_observation"] = {"available": False, "reason": str(e)}
+        try:
+            summary["before_soft_observation"] = json_safe(
+                self._observe_target(target, stage_name="before_transport_shear_preload")
+            )
+        except Exception as e:
+            summary["before_soft_observation"] = {"available": False, "reason": str(e)}
+
+        preload_result = await self._regulate_gripper_effort_after_close(
+            target=target,
+            target_effort_override_sim=target_effort,
+        )
+        summary["regulation"] = json_safe(preload_result)
+
+        settle_s = float(self.config.get("place_transport_shear_preload_settle_seconds", 0.25))
+        if settle_s > 0.0:
+            await self._step_gripper_for_seconds(settle_s)
+        try:
+            summary["after_force_observation"] = json_safe(
+                self.force_observer.observe(stage_name="after_transport_shear_preload")
+                if hasattr(self, "force_observer") else None
+            )
+        except Exception as e:
+            summary["after_force_observation"] = {"available": False, "reason": str(e)}
+        try:
+            summary["after_soft_observation"] = json_safe(
+                self._observe_target(target, stage_name="after_transport_shear_preload")
+            )
+        except Exception as e:
+            summary["after_soft_observation"] = {"available": False, "reason": str(e)}
+        return json_safe(summary)
+
+    def _make_transport_shear_audit_step_callback(self, *, target=None, base_step_callback=None, dt_s=1.0/60.0, place_goal=None) -> tuple:
+        """Create a non-invasive audit callback for shear-aware transport diagnosis.
+
+        It does not change gripper targets.  It samples force proxy, soft-object pose,
+        flange motion, relative object/flange drift, and a simple friction-grasp
+        shear model.  The point is to decide whether the next controller should
+        compensate by grip preload, trajectory acceleration reduction, wrist rotation,
+        or a regrasp/contact-geometry change.
+        """
+        enabled = bool(self.config.get('place_transport_shear_audit_enabled', True))
+        summary = {
+            'enabled': enabled,
+            'phase': '4.1f_shear_force_and_slip_observability_audit',
+            'controller_mode': 'audit_only_no_gripper_policy_change',
+            'design_intent': (
+                'measure the transport shear/load problem before tuning control: '
+                'estimate shear demand from mass + flange acceleration + gravity, '
+                'compare it with measured gripper effort proxy and object/flange drift, '
+                'and log which flange/contact direction is likely weak.'
+            ),
+            'trace': [],
+            'action_counts': {},
+            'ran': False,
+            'reason': None,
+        }
+        if not enabled:
+            summary['reason'] = 'place_transport_shear_audit_disabled'
+            return base_step_callback or self.gripper.update, summary
+
+        sample_stride = max(1, int(self.config.get('place_transport_shear_audit_sample_stride_frames', 6)))
+        max_trace = max(1, int(self.config.get('place_transport_shear_audit_max_trace_samples', 120)))
+        mass_kg = self._transport_object_mass_kg(target)
+        safety_factor = float(self.config.get('place_transport_shear_audit_safety_factor', 2.0))
+        mu_candidates = self.config.get('place_transport_shear_audit_mu_candidates', [0.3, 0.5, 0.8])
+        if not isinstance(mu_candidates, (list, tuple)):
+            mu_candidates = [0.3, 0.5, 0.8]
+        dt = max(1.0e-6, float(dt_s) * float(sample_stride))
+
+        initial_obj = None
+        initial_flange = None
+        initial_rel = None
+        try:
+            initial_obj = self._get_observed_object_pos(target, stage_name='shear_audit_initial_object')
+            initial_flange = self.arm.get_flange_world_pos()
+            if initial_obj is not None and initial_flange is not None:
+                initial_rel = self._vsub(initial_obj, initial_flange)
+        except Exception as e:
+            summary['initial_relation_error'] = str(e)
+
+        # Initial axis/transport geometry snapshot.
+        local_axis_labels = ['+X', '-X', '+Y', '-Y', '+Z', '-Z']
+        axis_snapshot = {}
+        for label in local_axis_labels:
+            axis_snapshot[label] = self._flange_local_axis_world(label)
+
+        state = {
+            'frame': 0,
+            'samples': 0,
+            'prev_flange': None,
+            'prev_obj': None,
+            'prev_flange_vel': [0.0, 0.0, 0.0],
+            'prev_obj_rel_drift': None,
+            'max_flange_speed_mps': 0.0,
+            'max_flange_accel_mps2': 0.0,
+            'max_object_speed_mps': 0.0,
+            'max_relative_drift_m': 0.0,
+            'max_relative_drift_xy_m': 0.0,
+            'max_slip_velocity_mps': 0.0,
+            'max_effort_proxy': 0.0,
+            'max_width_ratio': None,
+            'max_deformation_score': None,
+            'max_assumed_axis_shear_N': 0.0,
+            'min_proxy_margin_by_mu': {},
+        }
+
+        summary.update({
+            'ran': True,
+            'sample_stride_frames': sample_stride,
+            'dt_per_sample_s': dt,
+            'object_mass_kg_used': mass_kg,
+            'mu_candidates': [float(m) for m in mu_candidates if str(m).strip()],
+            'safety_factor': safety_factor,
+            'initial_object_pos': initial_obj,
+            'initial_flange_pos': initial_flange,
+            'initial_object_flange_relative_pos': initial_rel,
+            'flange_axis_world_snapshot': axis_snapshot,
+            'place_goal': place_goal,
+            'limitations': [
+                'measured gripper effort is a prismatic-joint effort proxy, not calibrated fingertip normal force',
+                'candidate contact-normal axes are audited because the exact finger-pad normal/shear frame is not yet calibrated',
+                'soft-object deformation can convert extra normal effort into extrusion instead of useful friction',
+            ],
+        })
+
+        def _update_count(action: str):
+            counts = summary.setdefault('action_counts', {})
+            counts[action] = counts.get(action, 0) + 1
+
+        def _safe_float(v):
+            try:
+                return float(v)
+            except Exception:
+                return None
+
+        def _callback():
+            base_result = None
+            if base_step_callback is not None:
+                base_result = base_step_callback()
+            else:
+                self.gripper.update()
+
+            state['frame'] += 1
+            frame = state['frame']
+            if (frame % sample_stride) != 0:
+                return base_result
+
+            obs = None
+            soft_obs = None
+            safety = None
+            effort = None
+            try:
+                obs = self.force_observer.observe(stage_name=f'place_transport_shear_audit_frame_{frame}')
+                if obs and obs.get('available'):
+                    effort = _safe_float(obs.get('grip_effort_sim'))
+                    if effort is not None:
+                        state['max_effort_proxy'] = max(state['max_effort_proxy'], effort)
+            except Exception as e:
+                obs = {'available': False, 'reason': f'force_observer_exception: {e}'}
+            try:
+                soft_obs = self._observe_target(target, stage_name=f'place_transport_shear_audit_frame_{frame}')
+            except Exception as e:
+                soft_obs = {'available': False, 'reason': f'soft_observer_exception: {e}'}
+
+            flange = None
+            obj = None
+            flange_vel = None
+            obj_vel = None
+            flange_accel = [0.0, 0.0, 0.0]
+            flange_speed = None
+            flange_accel_mag = None
+            obj_speed = None
+            rel_drift = None
+            rel_drift_xy = None
+            slip_velocity = None
+            transport_dir = None
+            try:
+                flange = self.arm.get_flange_world_pos()
+                obj = (soft_obs or {}).get('center') if isinstance(soft_obs, dict) else None
+                if obj is None:
+                    obj = self._get_observed_object_pos(target, stage_name=f'shear_audit_object_pos_frame_{frame}')
+
+                if state['prev_flange'] is not None and flange is not None:
+                    flange_vel = [
+                        (float(flange[0]) - float(state['prev_flange'][0])) / dt,
+                        (float(flange[1]) - float(state['prev_flange'][1])) / dt,
+                        (float(flange[2]) - float(state['prev_flange'][2])) / dt,
+                    ]
+                    flange_speed = self._vnorm(flange_vel)
+                    if flange_speed is not None:
+                        state['max_flange_speed_mps'] = max(state['max_flange_speed_mps'], flange_speed)
+                    flange_accel = [
+                        (flange_vel[0] - state['prev_flange_vel'][0]) / dt,
+                        (flange_vel[1] - state['prev_flange_vel'][1]) / dt,
+                        (flange_vel[2] - state['prev_flange_vel'][2]) / dt,
+                    ]
+                    flange_accel_mag = self._vnorm(flange_accel)
+                    if flange_accel_mag is not None:
+                        state['max_flange_accel_mps2'] = max(state['max_flange_accel_mps2'], flange_accel_mag)
+                    state['prev_flange_vel'] = flange_vel
+
+                if state['prev_obj'] is not None and obj is not None:
+                    obj_vel = [
+                        (float(obj[0]) - float(state['prev_obj'][0])) / dt,
+                        (float(obj[1]) - float(state['prev_obj'][1])) / dt,
+                        (float(obj[2]) - float(state['prev_obj'][2])) / dt,
+                    ]
+                    obj_speed = self._vnorm(obj_vel)
+                    if obj_speed is not None:
+                        state['max_object_speed_mps'] = max(state['max_object_speed_mps'], obj_speed)
+
+                if initial_rel is not None and obj is not None and flange is not None:
+                    cur_rel = self._vsub(obj, flange)
+                    rel_delta = self._vsub(cur_rel, initial_rel)
+                    if rel_delta is not None:
+                        rel_drift = self._vnorm(rel_delta)
+                        rel_drift_xy = self._vnorm([rel_delta[0], rel_delta[1], 0.0])
+                        state['max_relative_drift_m'] = max(state['max_relative_drift_m'], rel_drift or 0.0)
+                        state['max_relative_drift_xy_m'] = max(state['max_relative_drift_xy_m'], rel_drift_xy or 0.0)
+                        if state['prev_obj_rel_drift'] is not None and rel_drift is not None:
+                            slip_velocity = (rel_drift - state['prev_obj_rel_drift']) / dt
+                            state['max_slip_velocity_mps'] = max(state['max_slip_velocity_mps'], abs(slip_velocity))
+                        state['prev_obj_rel_drift'] = rel_drift
+
+                if initial_flange is not None and flange is not None:
+                    transport_dir = self._vunit(self._vsub(flange, initial_flange))
+
+                state['prev_flange'] = list(flange) if flange is not None else state['prev_flange']
+                state['prev_obj'] = list(obj) if obj is not None else state['prev_obj']
+            except Exception as e:
+                summary.setdefault('kinematic_errors', []).append(str(e))
+
+            try:
+                width_ratio_x = _safe_float((soft_obs or {}).get('width_x_m')) / float(self.config.get('adaptive_safety_nominal_width_m', 0.040))
+                width_ratio_y = _safe_float((soft_obs or {}).get('width_y_m')) / float(self.config.get('adaptive_safety_nominal_depth_m', 0.040))
+                max_width_ratio = max(width_ratio_x, width_ratio_y)
+                old = state.get('max_width_ratio')
+                state['max_width_ratio'] = max_width_ratio if old is None else max(old, max_width_ratio)
+            except Exception:
+                width_ratio_x = width_ratio_y = max_width_ratio = None
+
+            try:
+                safety = self.safety_monitor.assess(
+                    soft_obs=soft_obs,
+                    effort_obs=obs,
+                    context={
+                        'frame': frame,
+                        'controller_phase': 'place_transport_shear_audit',
+                        'relative_object_flange_drift_m': rel_drift,
+                        'relative_object_flange_drift_xy_m': rel_drift_xy,
+                    },
+                )
+                ds = _safe_float((safety or {}).get('deformation_score'))
+                if ds is not None:
+                    old = state.get('max_deformation_score')
+                    state['max_deformation_score'] = ds if old is None else max(old, ds)
+            except Exception as e:
+                safety = {'available': False, 'reason': f'safety_monitor_exception: {e}'}
+
+            shear_est = self._estimate_required_normal_force_for_axes(
+                mass_kg=mass_kg,
+                accel_world=flange_accel,
+                mu_candidates=mu_candidates,
+                safety_factor=safety_factor,
+            )
+            assumed = shear_est.get('assumed_normal_axis_local')
+            assumed_entry = (shear_est.get('axis_candidates') or {}).get(assumed)
+            assumed_shear = None
+            assumed_req = None
+            if isinstance(assumed_entry, dict):
+                assumed_shear = _safe_float(assumed_entry.get('estimated_shear_force_N'))
+                assumed_req = assumed_entry.get('required_normal_force_per_finger_N_by_mu') or {}
+                if assumed_shear is not None:
+                    state['max_assumed_axis_shear_N'] = max(state['max_assumed_axis_shear_N'], assumed_shear)
+                if effort is not None and assumed_shear is not None and assumed_shear > 1.0e-9:
+                    for mu in mu_candidates:
+                        try:
+                            mu_f = float(mu)
+                            # Proxy only: assumes grip_effort_sim behaves like normal force per finger.
+                            margin = (2.0 * mu_f * effort) / assumed_shear
+                            key = str(mu_f)
+                            prev = state['min_proxy_margin_by_mu'].get(key)
+                            state['min_proxy_margin_by_mu'][key] = margin if prev is None else min(prev, margin)
+                        except Exception:
+                            pass
+
+            action = 'audit_sample'
+            if slip_velocity is not None and abs(slip_velocity) > float(self.config.get('place_transport_shear_audit_warn_slip_velocity_mps', 0.003)):
+                action = 'audit_slip_velocity_warning'
+            if rel_drift is not None and rel_drift > float(self.config.get('place_transport_shear_audit_warn_relative_drift_m', 0.004)):
+                action = 'audit_relative_drift_warning'
+            _update_count(action)
+
+            sample = {
+                'frame': frame,
+                'action': action,
+                'flange_pos': flange,
+                'object_pos': obj,
+                'flange_velocity_mps': flange_vel,
+                'flange_speed_mps': flange_speed,
+                'flange_accel_mps2': flange_accel,
+                'flange_accel_mag_mps2': flange_accel_mag,
+                'object_velocity_mps': obj_vel,
+                'object_speed_mps': obj_speed,
+                'transport_dir_world_unit': transport_dir,
+                'relative_object_flange_drift_m': rel_drift,
+                'relative_object_flange_drift_xy_m': rel_drift_xy,
+                'slip_velocity_mps': slip_velocity,
+                'grip_effort_proxy_sim': effort,
+                'width_ratio_x': width_ratio_x,
+                'width_ratio_y': width_ratio_y,
+                'max_width_ratio': max_width_ratio,
+                'soft_observation_table_gap_m': (soft_obs or {}).get('table_gap_m') if isinstance(soft_obs, dict) else None,
+                'shear_estimate': shear_est,
+                'assumed_axis_shear_force_N': assumed_shear,
+                'assumed_axis_required_normal_N_by_mu': assumed_req,
+                'force_observation': obs,
+                'soft_observation': soft_obs,
+                'safety_assessment': safety,
+            }
+            if len(summary['trace']) < max_trace:
+                summary['trace'].append(json_safe(sample))
+            summary.update(json_safe({
+                'frames_seen': state['frame'],
+                'samples': state['samples'] + 1,
+                'max_flange_speed_mps': state['max_flange_speed_mps'],
+                'max_flange_accel_mps2': state['max_flange_accel_mps2'],
+                'max_object_speed_mps': state['max_object_speed_mps'],
+                'max_relative_object_flange_drift_m': state['max_relative_drift_m'],
+                'max_relative_object_flange_drift_xy_m': state['max_relative_drift_xy_m'],
+                'max_slip_velocity_mps': state['max_slip_velocity_mps'],
+                'max_grip_effort_proxy_sim': state['max_effort_proxy'],
+                'max_width_ratio': state['max_width_ratio'],
+                'max_deformation_score': state['max_deformation_score'],
+                'max_assumed_axis_shear_force_N': state['max_assumed_axis_shear_N'],
+                'min_proxy_margin_by_mu': state['min_proxy_margin_by_mu'],
+            }))
+            state['samples'] += 1
+            return base_result
+
+        return _callback, summary
+
+    def _make_transport_admittance_step_callback(self, target=None, target_effort_override_sim=None, shear_reference=None) -> tuple:
+        """Create an active gripper-admittance callback for held-object transport.
+
+        Phase 4.1/4.1b transported the held foam using a fixed gripper HOLD target.
+        That is not enough for soft objects: during sideways motion the object can
+        slip or stretch inside the fingers even if the pre-transport grasp was
+        valid.  This callback keeps the gripper feedback loop alive while the arm
+        moves.
+
+        It is deliberately scalar and conservative:
+          - measured finger-joint effort comes from ForceObserver;
+          - live deformable pose/shape comes from SoftObjectObserver;
+          - AdaptiveSafetyMonitor can request relaxation if deformation is unsafe;
+          - small target corrections are applied through gripper.adjust_hold_targets().
+
+        Positive delta closes the gripper slightly; negative delta relaxes it.
+        The callback is synchronous because UR5EController.move_to() calls the
+        step_callback once per simulation update.
+        """
+        enabled = bool(self.config.get("place_transport_admittance_enabled", True))
+        summary = {
+            "enabled": enabled,
+            "phase": "4.1c_transport_gripper_admittance",
+            "controller": "transport_active_scalar_gripper_admittance",
+            "force_source": "measured_joint_effort_sim",
+            "pose_source": "soft_simulation_mesh_points_when_available",
+            "design_intent": (
+                "keep regulating the gripper during arm transport; increase gentle squeeze "
+                "when effort is low or object/flange relative drift grows; during transport, "
+                "do not open on deformation alone because opening a moving grasp can drop the object; "
+                "instead request an arm abort on critical slip/fall"
+            ),
+            "trace": [],
+            "action_counts": {},
+            "ran": False,
+            "reason": None,
+        }
+        if not enabled:
+            summary["reason"] = "place_transport_admittance_disabled"
+            return self.gripper.update, summary
+        if not hasattr(self, "force_observer"):
+            summary["reason"] = "force_observer_missing"
+            return self.gripper.update, summary
+        if not hasattr(self.gripper, "adjust_hold_targets"):
+            summary["reason"] = "gripper_adjust_hold_targets_missing"
+            return self.gripper.update, summary
+
+        base_target = float(
+            self.config.get(
+                "adaptive_effort_target_sim",
+                self.config.get("force_observer_target_effort_sim", 0.35),
+            )
+        )
+        target_effort = float(
+            target_effort_override_sim
+            if target_effort_override_sim is not None
+            else self.config.get(
+                "place_transport_admittance_target_effort_sim",
+                base_target + float(self.config.get("place_transport_effort_boost_sim", 0.05)),
+            )
+        )
+        max_effort = float(
+            self.config.get(
+                "place_transport_admittance_max_effort_sim",
+                self.config.get("adaptive_effort_max_sim", 1.20),
+            )
+        )
+        deadband = float(self.config.get("place_transport_admittance_deadband_sim", 0.035))
+        sample_stride = max(1, int(self.config.get("place_transport_admittance_sample_stride_frames", 12)))
+        delta_step = float(self.config.get("place_transport_admittance_delta_step_m", 0.00005))
+        max_total_close = float(self.config.get("place_transport_admittance_max_extra_close_m", 0.00075))
+        max_total_open = float(self.config.get("place_transport_admittance_max_relax_open_m", 0.00060))
+        slip_warn_m = float(self.config.get("place_transport_slip_warn_relative_drift_m", 0.0040))
+        slip_close_m = float(self.config.get("place_transport_slip_close_relative_drift_m", 0.0060))
+        slip_critical_m = float(self.config.get("place_transport_slip_critical_relative_drift_m", 0.0120))
+        deformation_warn_score = float(self.config.get("place_transport_admittance_warn_deformation_score", 0.20))
+        disable_relax_during_motion = bool(self.config.get("place_transport_disable_relax_during_motion", True))
+        abort_on_critical_slip = bool(self.config.get("place_transport_abort_on_critical_slip", True))
+        abort_on_effort_loss = bool(self.config.get("place_transport_abort_on_effort_loss", True))
+        abort_on_table_drop = bool(self.config.get("place_transport_abort_on_table_drop", True))
+        effort_loss_threshold = float(self.config.get("place_transport_effort_loss_threshold_sim", 0.10))
+        min_table_gap_during_hold = float(self.config.get("place_transport_min_table_gap_during_hold_m", 0.030))
+        emergency_close_step = float(self.config.get("place_transport_emergency_close_step_m", max(delta_step, 0.00010)))
+
+        # Initial object/flange relation: if this changes during transport, the
+        # object is sliding/stretching relative to the gripper rather than just
+        # moving rigidly with the arm.
+        initial_obj = None
+        initial_flange = None
+        initial_rel = None
+        try:
+            initial_obj = self._get_observed_object_pos(target, stage_name="transport_admittance_initial_object")
+            initial_flange = self.arm.get_flange_world_pos()
+            if initial_obj is not None and initial_flange is not None:
+                initial_rel = [
+                    float(initial_obj[0]) - float(initial_flange[0]),
+                    float(initial_obj[1]) - float(initial_flange[1]),
+                    float(initial_obj[2]) - float(initial_flange[2]),
+                ]
+        except Exception as e:
+            summary["initial_relation_error"] = str(e)
+
+        state = {
+            "frame": 0,
+            "applied_x_m": 0.0,
+            "samples": 0,
+            "max_relative_drift_m": 0.0,
+            "max_relative_drift_xy_m": 0.0,
+            "max_deformation_score": None,
+            "max_combined_risk_score": None,
+            "max_width_ratio": None,
+            "unsafe_seen": False,
+            "warning_seen": False,
+            "slip_warning_seen": False,
+            "slip_critical_seen": False,
+            "effort_loss_seen": False,
+            "table_drop_seen": False,
+            "abort_requested": False,
+            "abort_reason": None,
+        }
+
+        summary.update({
+            "ran": True,
+            "target_effort_sim": target_effort,
+            "target_effort_source": "shear_reference_override" if target_effort_override_sim is not None else "config_or_base_plus_boost",
+            "shear_reference": json_safe(shear_reference),
+            "base_target_effort_sim": base_target,
+            "deadband_sim": deadband,
+            "max_effort_sim": max_effort,
+            "sample_stride_frames": sample_stride,
+            "delta_step_m": delta_step,
+            "max_total_close_m": max_total_close,
+            "max_total_open_m": max_total_open,
+            "slip_warn_relative_drift_m": slip_warn_m,
+            "slip_close_relative_drift_m": slip_close_m,
+            "slip_critical_relative_drift_m": slip_critical_m,
+            "deformation_warn_score": deformation_warn_score,
+            "disable_relax_during_motion": disable_relax_during_motion,
+            "abort_on_critical_slip": abort_on_critical_slip,
+            "abort_on_effort_loss": abort_on_effort_loss,
+            "abort_on_table_drop": abort_on_table_drop,
+            "effort_loss_threshold_sim": effort_loss_threshold,
+            "min_table_gap_during_hold_m": min_table_gap_during_hold,
+            "emergency_close_step_m": emergency_close_step,
+            "initial_object_pos": initial_obj,
+            "initial_flange_pos": initial_flange,
+            "initial_object_flange_relative_pos": initial_rel,
+        })
+
+        def _safe_float(v):
+            try:
+                return float(v)
+            except Exception:
+                return None
+
+        def _update_count(action: str):
+            counts = summary.setdefault("action_counts", {})
+            counts[action] = counts.get(action, 0) + 1
+
+        def _callback():
+            # Always keep the gripper state machine alive.
+            self.gripper.update()
+            state["frame"] += 1
+            frame = state["frame"]
+
+            if (frame % sample_stride) != 0:
+                return None
+
+            obs = None
+            soft_obs = None
+            safety = None
+            effort = None
+            effort_error = None
+            relative_drift = None
+            relative_drift_xy = None
+            width_ratio_x = None
+            width_ratio_y = None
+            max_width_ratio = None
+            deformation_score = None
+            combined_risk_score = None
+            table_gap_m = None
+            action = "hold"
+            requested_delta = 0.0
+            adjust = {"applied": False, "reason": "hold", "requested_delta_close_m": 0.0}
+
+            try:
+                obs = self.force_observer.observe(stage_name=f"place_transport_admittance_frame_{frame}")
+            except Exception as e:
+                obs = {"available": False, "reason": f"force_observer_exception: {e}"}
+
+            try:
+                soft_obs = self._observe_target(target, stage_name=f"place_transport_admittance_frame_{frame}")
+            except Exception as e:
+                soft_obs = {"available": False, "reason": f"soft_observer_exception: {e}"}
+
+            # Relative object/gripper drift.  This is not the absolute transport
+            # distance; it is motion of the held object inside/with respect to the
+            # gripper frame proxy.
+            try:
+                cur_obj = (soft_obs or {}).get("center") if isinstance(soft_obs, dict) else None
+                cur_flange = self.arm.get_flange_world_pos()
+                if initial_rel is not None and cur_obj is not None and cur_flange is not None:
+                    cur_rel = [
+                        float(cur_obj[0]) - float(cur_flange[0]),
+                        float(cur_obj[1]) - float(cur_flange[1]),
+                        float(cur_obj[2]) - float(cur_flange[2]),
+                    ]
+                    dx = cur_rel[0] - initial_rel[0]
+                    dy = cur_rel[1] - initial_rel[1]
+                    dz = cur_rel[2] - initial_rel[2]
+                    relative_drift = (dx * dx + dy * dy + dz * dz) ** 0.5
+                    relative_drift_xy = (dx * dx + dy * dy) ** 0.5
+                    state["max_relative_drift_m"] = max(state["max_relative_drift_m"], relative_drift)
+                    state["max_relative_drift_xy_m"] = max(state["max_relative_drift_xy_m"], relative_drift_xy)
+            except Exception:
+                pass
+
+            try:
+                table_gap_m = _safe_float((soft_obs or {}).get("table_gap_m"))
+            except Exception:
+                table_gap_m = None
+
+            try:
+                width_ratio_x = _safe_float((soft_obs or {}).get("width_x_m")) / float(self.config.get("adaptive_safety_nominal_width_m", 0.040))
+                width_ratio_y = _safe_float((soft_obs or {}).get("width_y_m")) / float(self.config.get("adaptive_safety_nominal_depth_m", 0.040))
+                max_width_ratio = max(width_ratio_x, width_ratio_y)
+                old = state.get("max_width_ratio")
+                state["max_width_ratio"] = max_width_ratio if old is None else max(old, max_width_ratio)
+            except Exception:
+                pass
+
+            if obs and obs.get("available"):
+                effort = _safe_float(obs.get("grip_effort_sim")) or 0.0
+                effort_error = target_effort - effort
+                try:
+                    safety = self.safety_monitor.assess(
+                        soft_obs=soft_obs,
+                        effort_obs=obs,
+                        context={
+                            "frame": frame,
+                            "target_effort_sim": target_effort,
+                            "max_effort_sim": max_effort,
+                            "controller_phase": "place_transport_admittance",
+                            "relative_object_flange_drift_m": relative_drift,
+                            "relative_object_flange_drift_xy_m": relative_drift_xy,
+                        },
+                    )
+                except Exception as e:
+                    safety = {
+                        "available": False,
+                        "safe_to_continue": True,
+                        "recommended_action": "continue",
+                        "reason": f"safety_monitor_exception: {e}",
+                    }
+
+                deformation_score = _safe_float((safety or {}).get("deformation_score"))
+                combined_risk_score = _safe_float((safety or {}).get("combined_risk_score"))
+                if deformation_score is not None:
+                    old = state.get("max_deformation_score")
+                    state["max_deformation_score"] = deformation_score if old is None else max(old, deformation_score)
+                if combined_risk_score is not None:
+                    old = state.get("max_combined_risk_score")
+                    state["max_combined_risk_score"] = combined_risk_score if old is None else max(old, combined_risk_score)
+
+                safety_action = (safety or {}).get("recommended_action")
+                unsafe = bool((safety or {}).get("unsafe", False))
+                warning = bool((safety or {}).get("warning", False))
+                state["unsafe_seen"] = state["unsafe_seen"] or unsafe
+                state["warning_seen"] = state["warning_seen"] or warning
+
+                if relative_drift is not None and relative_drift >= slip_warn_m:
+                    state["slip_warning_seen"] = True
+                if relative_drift is not None and relative_drift >= slip_critical_m:
+                    state["slip_critical_seen"] = True
+
+                # Phase 4.1e decision order: transport is different from static grasping.
+                # Opening while the arm is moving can turn a small slip into a drop.
+                # Therefore critical slip/fall requests an arm abort and emergency hold,
+                # while normal deformation warnings are logged but do not automatically
+                # relax the gripper during transport.
+                effort_loss = bool(effort <= effort_loss_threshold and frame > sample_stride * 3)
+                table_drop = bool(table_gap_m is not None and table_gap_m < min_table_gap_during_hold)
+                critical_slip = bool(relative_drift is not None and relative_drift >= slip_critical_m)
+
+                if effort_loss:
+                    state["effort_loss_seen"] = True
+                if table_drop:
+                    state["table_drop_seen"] = True
+
+                should_abort = (abort_on_critical_slip and critical_slip) or (abort_on_effort_loss and effort_loss) or (abort_on_table_drop and table_drop)
+
+                if should_abort:
+                    state["abort_requested"] = True
+                    if table_drop:
+                        state["abort_reason"] = "object_dropped_or_touched_table_during_transport"
+                    elif effort_loss:
+                        state["abort_reason"] = "transport_effort_loss"
+                    else:
+                        state["abort_reason"] = "critical_relative_slip"
+                    requested_delta = emergency_close_step
+                    action = "transport_abort_emergency_hold"
+                elif effort >= max_effort:
+                    # Too much force while moving: stop squeezing and request abort.
+                    state["abort_requested"] = True
+                    state["abort_reason"] = "transport_effort_over_max"
+                    requested_delta = 0.0
+                    action = "transport_abort_over_effort"
+                elif relative_drift is not None and relative_drift >= slip_close_m:
+                    requested_delta = emergency_close_step
+                    action = "transport_close_from_relative_slip"
+                elif effort_error is not None and effort_error > deadband:
+                    requested_delta = delta_step
+                    action = "transport_close_from_low_effort"
+                elif effort_error is not None and effort_error < -deadband:
+                    if disable_relax_during_motion:
+                        requested_delta = 0.0
+                        action = "transport_hold_high_effort_no_open_while_moving"
+                    else:
+                        requested_delta = -delta_step
+                        action = "transport_relax_from_high_effort"
+                else:
+                    requested_delta = 0.0
+                    action = "transport_hold_near_target"
+
+                # Clamp cumulative correction.
+                desired = state["applied_x_m"] + requested_delta
+                desired = max(-max_total_open, min(max_total_close, desired))
+                requested_delta = desired - state["applied_x_m"]
+                if abs(requested_delta) > 1.0e-9:
+                    adjust = self.gripper.adjust_hold_targets(
+                        delta_close_m=requested_delta,
+                        reason=action,
+                    )
+                    if adjust.get("applied"):
+                        state["applied_x_m"] += requested_delta
+                else:
+                    adjust = {
+                        "applied": False,
+                        "reason": action,
+                        "requested_delta_close_m": 0.0,
+                    }
+            else:
+                action = "transport_hold_no_force_observation"
+
+            state["samples"] += 1
+            _update_count(action)
+            summary["trace"].append(json_safe({
+                "frame": frame,
+                "action": action,
+                "effort_sim": effort,
+                "effort_error_sim": effort_error,
+                "target_effort_sim": target_effort,
+                "delta_close_m": requested_delta,
+                "applied_x_m": state["applied_x_m"],
+                "relative_object_flange_drift_m": relative_drift,
+                "relative_object_flange_drift_xy_m": relative_drift_xy,
+                "width_ratio_x": width_ratio_x,
+                "width_ratio_y": width_ratio_y,
+                "max_width_ratio": max_width_ratio,
+                "deformation_score": deformation_score,
+                "combined_risk_score": combined_risk_score,
+                "table_gap_m": table_gap_m,
+                "abort_requested": state["abort_requested"],
+                "abort_reason": state["abort_reason"],
+                "adjustment": adjust,
+                "observation": obs,
+                "soft_observation": soft_obs,
+                "safety_assessment": safety,
+            }))
+            summary.update(json_safe({
+                "frames_seen": state["frame"],
+                "samples": state["samples"],
+                "final_applied_x_m": state["applied_x_m"],
+                "max_relative_object_flange_drift_m": state["max_relative_drift_m"],
+                "max_relative_object_flange_drift_xy_m": state["max_relative_drift_xy_m"],
+                "max_deformation_score": state["max_deformation_score"],
+                "max_combined_risk_score": state["max_combined_risk_score"],
+                "max_width_ratio": state["max_width_ratio"],
+                "unsafe_seen": state["unsafe_seen"],
+                "warning_seen": state["warning_seen"],
+                "slip_warning_seen": state["slip_warning_seen"],
+                "slip_critical_seen": state["slip_critical_seen"],
+                "effort_loss_seen": state["effort_loss_seen"],
+                "table_drop_seen": state["table_drop_seen"],
+                "abort_requested": state["abort_requested"],
+                "abort_reason": state["abort_reason"],
+            }))
+            if state["abort_requested"]:
+                return {"abort": True, "reason": state["abort_reason"]}
+            return None
+
+        return _callback, summary
+
+
     async def _hold_for_inspection(self, seconds: float = None):
         if not self.config.get("debug_hold_after_stage", False):
             return
@@ -996,6 +2040,8 @@ class PickAndPlaceExecutor:
             "flange_pos": flange_pos,
             "object_lift_delta_z": None,
             "flange_object_distance": None,
+            "thresholds": {},
+            "warnings": [],
             "success": False,
             "reasons": [],
         }
@@ -1128,6 +2174,8 @@ class PickAndPlaceExecutor:
             "place_zone_xy_error_m": None,
             "object_transport_xy_delta_m": None,
             "flange_object_distance": None,
+            "thresholds": {},
+            "warnings": [],
             "success": False,
             "reasons": [],
         }
@@ -1609,6 +2657,8 @@ class PickAndPlaceExecutor:
                 "micro_lift_validation": None,
                 "lift_validation": None,
                 "place_transport_plan": None,
+                "place_transport_shear_reference": None,
+                "place_transport_shear_preload": None,
                 "place_transport_validation": None,
                 "gripper_diagnostics_after_close": None,
                 "gripper_diagnostics_after_micro_lift": None,
@@ -2480,32 +3530,153 @@ class PickAndPlaceExecutor:
                         object_pos_before_transport = self._get_observed_object_pos(
                             target, stage_name="before_place_transport"
                         )
+
+                        transport_duration = float(self.config.get("place_transport_duration", 6.0))
+                        transport_steps = int(self.config.get("place_transport_steps", 360))
+
+                        # Phase 4.1g: compute a shear-aware effort reference before moving.
+                        # The Phase 4.1f audit showed that gravity/shear is the main
+                        # load and that reacting after slip starts is too late.  Here
+                        # we estimate required normal load from 2*mu*N >= F_shear,
+                        # convert it to our empirical effort proxy, preload while
+                        # stationary, then keep a small feedback loop alive during
+                        # transport.
+                        transport_shear_reference = None
+                        transport_preload = None
+                        if bool(self.config.get("place_transport_shear_compensation_enabled", True)):
+                            transport_shear_reference = self._compute_transport_shear_reference(
+                                target=target,
+                                place_goal=place_goal,
+                                transport_duration=transport_duration,
+                                transport_steps=transport_steps,
+                            )
+                            attempt_log["place_transport_shear_reference"] = json_safe(transport_shear_reference)
+                            if bool(self.config.get("place_transport_shear_preload_enabled", True)):
+                                transport_preload = await self._apply_transport_shear_preload(
+                                    target=target,
+                                    shear_reference=transport_shear_reference,
+                                )
+                                attempt_log["place_transport_shear_preload"] = json_safe(transport_preload)
+
+                        transport_target_effort_override = None
+                        if isinstance(transport_shear_reference, dict) and transport_shear_reference.get("success"):
+                            transport_target_effort_override = transport_shear_reference.get("target_effort_sim")
+
+                        transport_step_callback = self.gripper.update
+                        transport_admittance = None
+                        if bool(self.config.get("place_transport_admittance_enabled", False)):
+                            transport_step_callback, transport_admittance = (
+                                self._make_transport_admittance_step_callback(
+                                    target=target,
+                                    target_effort_override_sim=transport_target_effort_override,
+                                    shear_reference=transport_shear_reference,
+                                )
+                            )
+                            attempt_log["place_transport_admittance"] = json_safe(transport_admittance)
+
+                        transport_shear_audit = None
+                        if bool(self.config.get("place_transport_shear_audit_enabled", True)):
+                            transport_step_callback, transport_shear_audit = (
+                                self._make_transport_shear_audit_step_callback(
+                                    target=target,
+                                    base_step_callback=transport_step_callback,
+                                    dt_s=(transport_duration / max(1, transport_steps)),
+                                    place_goal=place_goal,
+                                )
+                            )
+                            attempt_log["place_transport_shear_audit"] = json_safe(transport_shear_audit)
+
                         if bool(self.config.get("place_transport_use_safe_height_wrapper", False)):
                             ok = await self.arm.move_via_safe_height(
                                 place_transport_target,
-                                duration=float(self.config.get("place_transport_duration", 8.0)),
-                                steps=int(self.config.get("place_transport_steps", 480)),
-                                step_callback=self.gripper.update,
+                                duration=transport_duration,
+                                steps=transport_steps,
+                                step_callback=transport_step_callback,
                             )
                         else:
                             ok = await self.arm.move_to(
                                 place_transport_target,
-                                duration=float(self.config.get("place_transport_duration", 8.0)),
-                                steps=int(self.config.get("place_transport_steps", 480)),
+                                duration=transport_duration,
+                                steps=transport_steps,
                                 check_table_collision=True,
-                                step_callback=self.gripper.update,
+                                step_callback=transport_step_callback,
                             )
+
+                        if transport_admittance is not None:
+                            transport_admittance["move_completed"] = bool(ok)
+                            transport_admittance["duration_s"] = transport_duration
+                            transport_admittance["steps"] = transport_steps
+                            attempt_log["place_transport_admittance"] = json_safe(transport_admittance)
+                        if transport_shear_audit is not None:
+                            transport_shear_audit["move_completed"] = bool(ok)
+                            transport_shear_audit["duration_s"] = transport_duration
+                            transport_shear_audit["steps"] = transport_steps
+                            attempt_log["place_transport_shear_audit"] = json_safe(transport_shear_audit)
+
                         if not ok:
-                            print("[Executor] ❌ Place transport motion failed.")
-                            attempt_log["failure_reason"] = "place_transport_motion_failed"
+                            transport_abort_reason = None
+                            if isinstance(transport_admittance, dict):
+                                transport_abort_reason = transport_admittance.get("abort_reason")
+                            if transport_abort_reason:
+                                failure_reason = "place_transport_aborted_due_to_slip_or_drop"
+                                print(f"[Executor] ❌ Place transport aborted by reactive monitor: {transport_abort_reason}")
+                            else:
+                                failure_reason = "place_transport_motion_failed"
+                                print("[Executor] ❌ Place transport motion failed.")
+                            attempt_log["failure_reason"] = failure_reason
+                            attempt_log["place_transport_abort_reason"] = transport_abort_reason
                             trial_log["attempts"].append(attempt_log)
-                            trial_log["final_reason"] = "place_transport_motion_failed"
+                            trial_log["final_reason"] = failure_reason
                             self._last_trial_log = trial_log
                             return False
 
                         await self._step_gripper_for_seconds(
                             float(self.config.get("post_place_transport_settle_seconds", 0.5))
                         )
+                        if transport_admittance is not None:
+                            try:
+                                transport_admittance["post_transport_force_observation"] = json_safe(
+                                    self.force_observer.observe(stage_name="after_place_transport_settle")
+                                    if hasattr(self, "force_observer") else None
+                                )
+                            except Exception as e:
+                                transport_admittance["post_transport_force_observation"] = {
+                                    "available": False,
+                                    "reason": f"force_observer_exception: {e}",
+                                }
+                            try:
+                                transport_admittance["post_transport_soft_observation"] = json_safe(
+                                    self._observe_target(target, stage_name="after_place_transport_settle")
+                                )
+                            except Exception as e:
+                                transport_admittance["post_transport_soft_observation"] = {
+                                    "available": False,
+                                    "reason": f"soft_observer_exception: {e}",
+                                }
+                            attempt_log["place_transport_admittance"] = json_safe(transport_admittance)
+
+                        if transport_shear_audit is not None:
+                            try:
+                                transport_shear_audit["post_transport_force_observation"] = json_safe(
+                                    self.force_observer.observe(stage_name="after_place_transport_shear_audit_settle")
+                                    if hasattr(self, "force_observer") else None
+                                )
+                            except Exception as e:
+                                transport_shear_audit["post_transport_force_observation"] = {
+                                    "available": False,
+                                    "reason": f"force_observer_exception: {e}",
+                                }
+                            try:
+                                transport_shear_audit["post_transport_soft_observation"] = json_safe(
+                                    self._observe_target(target, stage_name="after_place_transport_shear_audit_settle")
+                                )
+                            except Exception as e:
+                                transport_shear_audit["post_transport_soft_observation"] = {
+                                    "available": False,
+                                    "reason": f"soft_observer_exception: {e}",
+                                }
+                            attempt_log["place_transport_shear_audit"] = json_safe(transport_shear_audit)
+
                         object_pos_after_transport = self._get_observed_object_pos(
                             target, stage_name="after_place_transport"
                         )

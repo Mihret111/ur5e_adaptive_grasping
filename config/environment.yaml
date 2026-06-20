@@ -415,9 +415,127 @@ place_default_object_height_m: 0.04
 # validation after transport.
 place_transport_waypoint: lift
 place_transport_use_safe_height_wrapper: false
-place_transport_duration: 8.0
-place_transport_steps: 480
-post_place_transport_settle_seconds: 0.8
+place_transport_duration: 5.0
+place_transport_steps: 300
+post_place_transport_settle_seconds: 0.6
 place_transport_max_width_ratio: 1.35
 place_transport_max_deformation_score: 0.25
 place_transport_fail_on_excessive_deformation: true
+# ───────────── PHASE 4.1c: ACTIVE GRIPPER ADMITTANCE DURING TRANSPORT ─────────────
+# Phase 4.1b made transport lower/slower, but a passive gripper hold can still
+# allow soft-object slip/stretch during sideways motion.  This keeps the same
+# scalar gripper-admittance idea active while the arm moves.  The target effort
+# is slightly higher than the static hold target because transport adds lateral
+# shear demand.  Corrections remain sub-millimetric to avoid crushing.
+place_transport_admittance_enabled: true
+place_transport_effort_boost_sim: 0.05
+place_transport_admittance_target_effort_sim: 0.40
+place_transport_admittance_max_effort_sim: 1.20
+place_transport_admittance_deadband_sim: 0.030
+place_transport_admittance_sample_stride_frames: 6
+place_transport_admittance_delta_step_m: 0.00008
+place_transport_admittance_max_extra_close_m: 0.00150
+place_transport_admittance_max_relax_open_m: 0.00000
+place_transport_slip_warn_relative_drift_m: 0.0020
+place_transport_slip_close_relative_drift_m: 0.0030
+place_transport_slip_critical_relative_drift_m: 0.0100
+place_transport_admittance_warn_deformation_score: 0.20
+place_transport_disable_relax_during_motion: true
+place_transport_abort_on_critical_slip: true
+place_transport_abort_on_effort_loss: true
+place_transport_abort_on_table_drop: true
+place_transport_effort_loss_threshold_sim: 0.10
+place_transport_min_table_gap_during_hold_m: 0.030
+place_transport_emergency_close_step_m: 0.00012
+
+# ───────────── PHASE 4.1f: SHEAR FORCE / SLIP OBSERVABILITY AUDIT ─────────────
+# We pause reactive transport-policy changes and measure the real cause of slip.
+# The audit estimates transport shear demand from object mass, gravity, and
+# flange acceleration, then compares it against the measured gripper effort proxy
+# and live object/flange drift from the soft simulation mesh.
+place_transport_shear_audit_enabled: true
+place_transport_shear_audit_sample_stride_frames: 6
+place_transport_shear_audit_max_trace_samples: 120
+place_transport_shear_audit_object_mass_kg: 0.010
+place_transport_default_object_mass_kg: 0.010
+place_transport_shear_audit_gravity_mps2: 9.81
+place_transport_shear_audit_mu_candidates: [0.30, 0.50, 0.80]
+place_transport_shear_audit_safety_factor: 2.0
+place_transport_shear_audit_assumed_normal_axis_local: "+X"
+place_transport_shear_audit_warn_relative_drift_m: 0.0040
+place_transport_shear_audit_warn_slip_velocity_mps: 0.0030
+
+# Phase 4.1f default: audit-only.  Do not let the transport gripper controller
+# add squeeze/relaxation while we are trying to identify the cause of slip.
+place_transport_admittance_enabled: false
+place_transport_abort_on_critical_slip: false
+place_transport_abort_on_effort_loss: false
+place_transport_abort_on_table_drop: false
+
+# Keep transport reasonably fast so measured shear/acceleration is meaningful,
+# but not as aggressively slow as the previous diagnostic run.
+place_transport_duration: 5.0
+place_transport_steps: 300
+
+# ───────────── PHASE 4.1g: CALIBRATED SHEAR-AWARE TRANSPORT ─────────────
+# The Phase 4.1f audit showed that the cube is not failing because the arm
+# misses the place zone; it creeps/slips out of the gripper under a
+# gravity-dominated shear load.  Therefore we use a friction-grasp model before
+# transport instead of waiting for visible slip.
+place_transport_shear_compensation_enabled: true
+place_transport_shear_preload_enabled: true
+place_transport_shear_preload_settle_seconds: 0.25
+
+# Contact-axis selection.  AUTO_HORIZONTAL_MAX_SHEAR avoids the previous bad
+# assumption that flange +X was automatically the contact normal.  In the audit
+# +X was nearly vertical; for parallel-jaw support the relevant contact normal
+# should be a mostly horizontal candidate, because gravity is then tangential
+# shear that must be resisted by friction.
+place_transport_contact_normal_axis_mode: AUTO_HORIZONTAL_MAX_SHEAR
+place_transport_contact_normal_axis_local: AUTO
+place_transport_contact_axis_max_abs_vertical_component: 0.75
+
+# Shear model: 2*mu*N >= F_shear.  We keep mu conservative because soft foam on
+# simulated gripper pads can have effective friction/contact behavior lower than
+# ideal visual intuition.  The target is still an effort proxy, not calibrated
+# true fingertip normal force.
+place_transport_shear_mu_effective: 0.35
+place_transport_shear_safety_factor: 2.0
+place_transport_shear_accel_scale: 6.0
+place_transport_proxy_effort_per_newton: 1.0
+place_transport_proxy_effort_bias_sim: 0.25
+place_transport_shear_target_min_sim: 0.42
+place_transport_shear_target_max_sim: 0.62
+
+# Re-enable transport feedback, but now with shear feed-forward target override
+# and stationary preload.  The feedback should correct small residual drift; it
+# should not be the first line of defense.
+place_transport_admittance_enabled: true
+place_transport_admittance_sample_stride_frames: 3
+place_transport_admittance_deadband_sim: 0.025
+place_transport_admittance_delta_step_m: 0.00004
+place_transport_admittance_max_extra_close_m: 0.00060
+place_transport_admittance_max_relax_open_m: 0.00000
+place_transport_disable_relax_during_motion: true
+
+# Do not abort merely because relative drift crosses the old 8-10 mm diagnostic
+# threshold; first let the shear-preloaded controller demonstrate whether the
+# predicted normal effort can hold the object.  Still stop if the object touches
+# the table, because then the held-object transport has physically failed.
+place_transport_slip_warn_relative_drift_m: 0.0020
+place_transport_slip_close_relative_drift_m: 0.0030
+place_transport_slip_critical_relative_drift_m: 0.0140
+place_transport_abort_on_critical_slip: false
+place_transport_abort_on_effort_loss: false
+place_transport_abort_on_table_drop: true
+place_transport_effort_loss_threshold_sim: 0.06
+place_transport_min_table_gap_during_hold_m: 0.012
+place_transport_emergency_close_step_m: 0.00008
+
+# Keep audit on while testing 4.1g so every run logs the predicted shear,
+# required normal force, and whether the effort proxy margin was meaningful.
+place_transport_shear_audit_enabled: true
+place_transport_shear_audit_assumed_normal_axis_local: AUTO_HORIZONTAL_MAX_SHEAR
+place_transport_duration: 5.0
+place_transport_steps: 300
+post_place_transport_settle_seconds: 0.6
