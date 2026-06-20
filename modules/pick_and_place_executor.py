@@ -6,6 +6,7 @@ from modules.micro_lift_validator import MicroLiftValidator
 from modules.soft_object_observer import SoftObjectObserver
 from modules.retry_policy import RetryPolicy
 from modules.force_observer import ArticulationEffortForceObserver
+from modules.adaptive_safety_monitor import AdaptiveSafetyMonitor
 from modules.trial_diagnostics import (
     compact_pick_result,
     grip_feasibility,
@@ -57,6 +58,7 @@ class PickAndPlaceExecutor:
         self.soft_observer = SoftObjectObserver(config)
         self.retry_policy = RetryPolicy(config)
         self.force_observer = ArticulationEffortForceObserver(config)
+        self.safety_monitor = AdaptiveSafetyMonitor(config)
         # self.move_home_before_pick = config.get("move_home_before_pick", True)   #
         print("[PickAndPlaceExecutor] Ready.")
 
@@ -83,6 +85,7 @@ class PickAndPlaceExecutor:
         expected_grip_dim_m=None,
         hold_settle_extra_s: float = 0.0,
         hold_extra_close_m=None,
+        target=None,
     ):
         """Close gripper with optional object-size-aware contact expectation.
 
@@ -169,7 +172,7 @@ class PickAndPlaceExecutor:
         
         return close_resolution
 
-    async def _regulate_gripper_effort_after_close(self) -> dict:
+    async def _regulate_gripper_effort_after_close(self, target=None) -> dict:
         """Scalar measured-effort admittance for the 2FG7 gripper.
 
         Phase 2 used a deadband rule: if effort was too low, close a fixed
@@ -205,6 +208,7 @@ class PickAndPlaceExecutor:
             "units": "sim_prismatic_joint_effort_not_calibrated_newtons",
             "formal_model": "M*x_ddot + D*x_dot + K*x = G*(F_target - F_measured)",
             "state_meaning": "x is a small correction of gripper HOLDING targets; positive closes, negative opens",
+            "safety_layer": "AdaptiveSafetyMonitor combines measured effort with soft-object deformation/motion observations",
             "ran": False,
             "trace": [],
         }
@@ -263,6 +267,10 @@ class PickAndPlaceExecutor:
         max_frames = max(1, int(self.config.get("adaptive_effort_max_frames", 90)))
         required_stable = max(1, int(self.config.get("adaptive_effort_required_stable_samples", 3)))
 
+        safety_enabled = bool(self.config.get("adaptive_safety_monitor_enabled", True))
+        safety_abort_on_unsafe = bool(self.config.get("adaptive_safety_abort_on_unsafe", False))
+        safety_soft_sample_stride = max(1, int(self.config.get("adaptive_safety_soft_sample_stride", sample_stride)))
+
         summary.update({
             "ran": True,
             "target_effort_sim": target,
@@ -281,6 +289,9 @@ class PickAndPlaceExecutor:
             "sample_stride_frames": sample_stride,
             "max_frames": max_frames,
             "required_stable_samples": required_stable,
+            "safety_monitor_enabled": safety_enabled,
+            "safety_abort_on_unsafe": safety_abort_on_unsafe,
+            "safety_soft_sample_stride": safety_soft_sample_stride,
         })
 
         # Admittance state. x=0 means keep the original hold target.
@@ -314,19 +325,63 @@ class PickAndPlaceExecutor:
             effort_error = None
             force_input = 0.0
             x_ddot = 0.0
+            soft_obs_for_safety = None
+            safety_assessment = None
 
             if obs.get("available"):
                 effort = float(obs.get("grip_effort_sim", 0.0) or 0.0)
                 effort_error = target - effort
 
+                # Safety/perception layer: combine force-like effort with live
+                # deformable object shape.  This is the COGAR reactive inhibitor:
+                # it can request relax/open before the admittance model squeezes
+                # a soft object too much.  It is deliberately conservative and
+                # monitor-first; abort is optional and off by default.
+                if safety_enabled and hasattr(self, "safety_monitor"):
+                    if target is not None and ((frame % safety_soft_sample_stride) == 0):
+                        try:
+                            soft_obs_for_safety = self._observe_target(
+                                target,
+                                stage_name=f"adaptive_safety_frame_{frame + 1}",
+                            )
+                        except Exception as e:
+                            soft_obs_for_safety = {
+                                "available": False,
+                                "reason": f"soft_observer_exception: {e}",
+                            }
+                    try:
+                        safety_assessment = self.safety_monitor.assess(
+                            soft_obs=soft_obs_for_safety,
+                            effort_obs=obs,
+                            context={
+                                "frame": frame + 1,
+                                "target_effort_sim": target,
+                                "max_effort_sim": max_effort,
+                                "controller_phase": "scalar_admittance",
+                            },
+                        )
+                    except Exception as e:
+                        safety_assessment = {
+                            "available": False,
+                            "safe_to_continue": True,
+                            "recommended_action": "continue",
+                            "reason": f"safety_monitor_exception: {e}",
+                        }
+
+                safety_action = (safety_assessment or {}).get("recommended_action")
+                safety_unsafe = bool((safety_assessment or {}).get("unsafe", False))
+
                 # Safety override: if measured effort is above the maximum safe
-                # value, force a small relaxation independent of the virtual
-                # dynamics. This is the reactive inhibitor layer.
-                if effort >= max_effort:
+                # value, or the soft-object safety monitor asks for relaxation,
+                # force a small opening independent of the virtual dynamics.
+                # This is the reactive inhibition layer.
+                if effort >= max_effort or safety_action in ("relax_open", "relax_open_deformation", "relax_open_effort"):
                     x = max(x - max_delta_per_update, -max_total_open)
                     x_dot = min(x_dot, 0.0)
-                    action = "safety_relax_over_max_effort"
+                    action = "safety_relax_over_max_effort" if effort >= max_effort else f"safety_{safety_action}"
                     stable_count = 0
+                    if safety_abort_on_unsafe and safety_unsafe:
+                        final_reason = "safety_abort_requested"
                 else:
                     if abs(effort_error) <= deadband:
                         force_input = 0.0
@@ -388,11 +443,13 @@ class PickAndPlaceExecutor:
                 "stable_count": stable_count,
                 "adjustment": adjust,
                 "observation": obs,
+                "soft_observation_for_safety": soft_obs_for_safety,
+                "safety_assessment": safety_assessment,
             })
 
-            if final_reason == "stable_near_target":
+            if final_reason in ("stable_near_target", "safety_abort_requested"):
                 break
-            if action == "safety_relax_over_max_effort" and applied_x <= -max_total_open + 1.0e-9:
+            if action.startswith("safety_relax") and applied_x <= -max_total_open + 1.0e-9:
                 final_reason = "safety_open_limit_reached"
                 break
 
@@ -1591,6 +1648,7 @@ class PickAndPlaceExecutor:
                     current_retry_adjustments.get("hold_settle_extra_s", 0.0)
                 ),
                 hold_extra_close_m=pick_result.get("gripper_hold_extra_close_m"),
+                target=target,
             )
             attempt_log["gripper_close_resolution"] = json_safe(close_resolution)
 

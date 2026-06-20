@@ -61,6 +61,7 @@ MODULE_NAMES = [
     "modules.micro_lift_validator",
     "modules.retry_policy",
     "modules.force_observer",
+    "modules.adaptive_safety_monitor",
 ]
 for mod_name in MODULE_NAMES:
     if mod_name in sys.modules:
