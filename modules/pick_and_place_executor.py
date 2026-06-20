@@ -5,6 +5,7 @@ from modules.gripper_controller import Gripper2FG7
 from modules.micro_lift_validator import MicroLiftValidator
 from modules.soft_object_observer import SoftObjectObserver
 from modules.retry_policy import RetryPolicy
+from modules.force_observer import ArticulationEffortForceObserver
 from modules.trial_diagnostics import (
     compact_pick_result,
     grip_feasibility,
@@ -55,6 +56,7 @@ class PickAndPlaceExecutor:
         self.micro_lift_validator = MicroLiftValidator(config)
         self.soft_observer = SoftObjectObserver(config)
         self.retry_policy = RetryPolicy(config)
+        self.force_observer = ArticulationEffortForceObserver(config)
         # self.move_home_before_pick = config.get("move_home_before_pick", True)   #
         print("[PickAndPlaceExecutor] Ready.")
 
@@ -92,6 +94,21 @@ class PickAndPlaceExecutor:
         """
         print("[Executor] Closing gripper...")
 
+        force_before_close = None
+        if hasattr(self, "force_observer"):
+            # Capture an open/no-contact-ish baseline immediately before the close.
+            # This does not command anything; it only makes the effort logs interpretable.
+            try:
+                force_before_close = self.force_observer.set_baseline_from_current(
+                    stage_name="before_close_command_baseline"
+                )
+            except Exception as e:
+                force_before_close = {
+                    "available": False,
+                    "stage": "before_close_command_baseline",
+                    "reason": f"force_observer_exception: {e}",
+                }
+
         self.gripper.close(
             force_n=force_n,
             expected_grip_dim_m=expected_grip_dim_m,
@@ -116,8 +133,34 @@ class PickAndPlaceExecutor:
 
         await self._step_gripper_for_seconds(hold_settle_time)
 
+        force_after_hold = None
+        if hasattr(self, "force_observer"):
+            try:
+                force_after_hold = self.force_observer.observe(stage_name="after_close_hold_settle")
+            except Exception as e:
+                force_after_hold = {
+                    "available": False,
+                    "stage": "after_close_hold_settle",
+                    "reason": f"force_observer_exception: {e}",
+                }
+
+        close_resolution["force_observation_before_close"] = force_before_close
+        close_resolution["force_observation_after_hold_settle"] = force_after_hold
+        close_resolution["force_observer_diagnostics"] = (
+            self.force_observer.get_diagnostics()
+            if hasattr(self, "force_observer")
+            else None
+        )
+
         print(f"[Executor] Gripper state: {self.gripper.get_state()}")
         print(f"[Executor] Has object: {self.gripper.has_object()}")
+        if force_after_hold and force_after_hold.get("available"):
+            print(
+                "[Executor] ForceObserver after hold: "
+                f"source={force_after_hold.get('force_source')} "
+                f"grip_effort_sim={force_after_hold.get('grip_effort_sim'):.4f} "
+                f"contact_like={force_after_hold.get('contact_like_effort')}"
+            )
         
         return close_resolution
 
@@ -774,12 +817,26 @@ class PickAndPlaceExecutor:
 
         last_state = None
         frames_used = 0
+        force_trace = []
+        force_stride = max(1, int(self.config.get("force_observer_trace_stride_frames", 10)))
 
         for i in range(max_frames):
             last_state = self.gripper.update()
             frames_used = i + 1
 
             await app.next_update_async()
+
+            if (i % force_stride) == 0 and hasattr(self, "force_observer"):
+                try:
+                    force_trace.append(
+                        self.force_observer.observe(stage_name=f"during_close_frame_{frames_used}")
+                    )
+                except Exception as e:
+                    force_trace.append({
+                        "available": False,
+                        "stage": f"during_close_frame_{frames_used}",
+                        "reason": f"force_observer_exception: {e}",
+                    })
 
             # The key guard:
             # Do not continue waiting once close has resolved.
@@ -792,6 +849,7 @@ class PickAndPlaceExecutor:
                     "final_state": last_state,
                     "timeout_s": max_seconds,
                     "gripper_diagnostics": diagnostics,
+                    "force_trace_during_close": force_trace,
                 }
 
         # Timeout: close did not resolve.
@@ -803,6 +861,7 @@ class PickAndPlaceExecutor:
             "final_state": last_state,
             "timeout_s": max_seconds,
             "gripper_diagnostics": diagnostics,
+            "force_trace_during_close": force_trace,
             "reason": "gripper_close_wait_timeout",
         }
     # implement move to pregrasp_approach position (a point above target pos with constant height of pregrasp_height)

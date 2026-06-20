@@ -60,6 +60,7 @@ MODULE_NAMES = [
     "modules.soft_object_observer",
     "modules.micro_lift_validator",
     "modules.retry_policy",
+    "modules.force_observer",
 ]
 for mod_name in MODULE_NAMES:
     if mod_name in sys.modules:
@@ -280,4 +281,3 @@ async def main():
 # ═══════════════════════════════════════════════════════════════
 
 asyncio.ensure_future(main())
-

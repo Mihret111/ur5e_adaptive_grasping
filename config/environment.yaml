@@ -251,3 +251,27 @@ retry_low_edge_contact_alpha: 0.25
 retry_borderline_lift_delta_margin_m: 0.002
 retry_borderline_following_ratio_margin: 0.08
 retry_borderline_drift_margin_m: 0.004
+# ───────────── FORCE OBSERVER / ADAPTIVE GRASPING PHASE 1 ─────────────
+# Scientifically honest status:
+#   Isaac ContactSensor.force was validated for rigid-rigid contact, but for
+#   finger ↔ deformable foam it returned contact geometry with zero force.
+#   The usable sim-side signal found by V10 is measured articulation effort
+#   on the 2FG7 prismatic finger joints.
+force_observer_enabled: true
+force_observer_backend: articulation_effort
+force_observer_articulation_root: /mir/base_link_cabinet/cabinet/ur_mount/ur5e_physics
+force_observer_left_finger_joint_name: left_finger_joint
+force_observer_right_finger_joint_name: right_finger_joint
+
+# These are NOT Newtons yet; they are Isaac measured prismatic-joint effort units.
+# V10 observed ≈0 before contact and roughly 0.38–1.18 while holding foam.
+force_observer_target_effort_sim: 0.45
+force_observer_max_effort_sim: 1.20
+force_observer_contact_effort_threshold_sim: 0.05
+force_observer_target_band_sim: 0.10
+force_observer_baseline_abs_deadband: 0.0001
+force_observer_trace_stride_frames: 10
+
+# Phase 1 is monitor-only. We log force feedback first, then close the loop after
+# a few stable traces prove effort correlates with contact/hold/lift.
+adaptive_grasp_monitor_only: true
