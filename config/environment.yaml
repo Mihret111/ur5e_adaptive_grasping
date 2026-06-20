@@ -164,7 +164,7 @@ preclose_diagnostics_print_all_axes: false
 # The pre-close gate remains active. After a successful close, lift only
 # 25 mm and verify that the object genuinely follows the gripper.
 enable_micro_lift_test: true
-enable_lift_test: false
+enable_lift_test: true
 plan_retreat_during_pick: false
 max_grasp_attempts: 2
 
