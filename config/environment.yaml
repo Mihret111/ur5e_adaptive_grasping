@@ -821,3 +821,31 @@ place_transport_seed_place_ik_from_current_carry: true
 
 # Keep previous 4.2g force/contact settings.  This phase changes commanded wrist
 # rotation, not scalar force.
+
+# ───────────── PHASE 4.3a: CONTROLLED TABLE RELEASE + RETREAT VALIDATION ─────────────
+# Carry is now stable after orientation lock.  Enable conservative release:
+# lower from safe-hover to table in small stages, relax/open the gripper in
+# small steps, fully open, retreat, then validate that the object stays in the
+# place zone and rests on the table.
+enable_place_release_test: true
+place_release_retreat_waypoint: lift
+place_release_lowering_stage_fractions: [0.50, 1.00]
+place_release_lowering_stage_duration: 0.90
+place_release_lowering_stage_steps: 54
+place_release_stage_settle_seconds: 0.20
+place_release_fail_if_not_near_table: true
+place_release_max_pre_release_bottom_clearance_m: 0.030
+place_release_min_pre_release_bottom_clearance_m: -0.006
+place_release_partial_open_steps: 6
+place_release_partial_open_step_m: 0.00035
+place_release_partial_step_settle_seconds: 0.16
+place_release_partial_open_force_n: 45.0
+place_release_open_settle_seconds: 0.70
+place_release_retreat_duration: 1.80
+place_release_retreat_steps: 108
+place_release_post_retreat_settle_seconds: 0.60
+place_release_xy_tolerance_m: 0.055
+place_release_min_final_bottom_clearance_m: -0.008
+place_release_max_final_bottom_clearance_m: 0.030
+place_release_max_object_follow_retreat_z_m: 0.015
+place_release_max_post_release_stability_drift_m: 0.005

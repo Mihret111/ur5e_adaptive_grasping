@@ -3015,6 +3015,287 @@ class PickAndPlaceExecutor:
         result["success"] = len(result["reasons"]) == 0
         return result
 
+    def _object_pos_from_soft_observation(self, target, stage_name: str):
+        obs = self._observe_target(target, stage_name=stage_name)
+        pos = None
+        if isinstance(obs, dict) and obs.get("center") is not None:
+            try:
+                pos = list(obs.get("center"))
+            except Exception:
+                pos = None
+        if pos is None:
+            pos = self._get_observed_object_pos(target, stage_name=stage_name)
+        return pos, obs
+
+    def _xy_error_to_place_zone(self, object_pos, place_zone: dict):
+        if object_pos is None:
+            return None
+        center = (place_zone or {}).get("world_center") or []
+        if len(center) < 2:
+            return None
+        try:
+            dx = float(object_pos[0]) - float(center[0])
+            dy = float(object_pos[1]) - float(center[1])
+            return (dx * dx + dy * dy) ** 0.5
+        except Exception:
+            return None
+
+    def _bottom_clearance_from_observation(self, soft_obs, object_pos=None, table_height=None):
+        clearance = None
+        if isinstance(soft_obs, dict):
+            clearance = soft_obs.get("bottom_clearance_m")
+            if clearance is None:
+                clearance = soft_obs.get("table_gap_m")
+        try:
+            if clearance is not None:
+                return float(clearance)
+        except Exception:
+            pass
+        try:
+            if object_pos is not None and table_height is not None:
+                return float(object_pos[2]) - float(table_height)
+        except Exception:
+            pass
+        return None
+
+    async def _execute_controlled_place_release(
+        self,
+        *,
+        target: dict,
+        place_zone: dict,
+        table_height: float,
+        full_place_target_joints_deg,
+        retreat_target_joints_deg,
+    ) -> dict:
+        """Phase 4.3a/b/c: staged table approach, gradual release, retreat validation.
+
+        The object is already transported and safely lowered while held.  This
+        routine finishes the placement conservatively: lower to near-table,
+        relax/open in stages, then retreat and verify the object stays on table.
+        """
+        release_log = {
+            "phase": "4.3_controlled_table_release",
+            "enabled": bool(self.config.get("enable_place_release_test", False)),
+            "full_place_target_joints_deg": full_place_target_joints_deg,
+            "retreat_target_joints_deg": retreat_target_joints_deg,
+            "lowering_stages": [],
+            "partial_release_steps": [],
+            "pre_release_validation": None,
+            "after_open_observation": None,
+            "after_retreat_observation": None,
+            "after_release_stability": None,
+            "validation": {
+                "success": False,
+                "reasons": [],
+                "warnings": [],
+            },
+        }
+        if not release_log["enabled"]:
+            release_log["validation"]["reasons"].append("place release disabled")
+            return json_safe(release_log)
+        if full_place_target_joints_deg is None:
+            release_log["validation"]["reasons"].append("missing full place target")
+            return json_safe(release_log)
+
+        app = omni.kit.app.get_app()
+
+        # ── 4.3a: staged approach from safe hover to actual table-place pose ──
+        start_joints = list(self.arm.get_joint_targets_deg())
+        fractions = self.config.get("place_release_lowering_stage_fractions", [0.50, 1.00])
+        if not isinstance(fractions, (list, tuple)):
+            fractions = [0.50, 1.00]
+        duration_per_stage = float(self.config.get("place_release_lowering_stage_duration", 0.90))
+        steps_per_stage = int(self.config.get("place_release_lowering_stage_steps", 54))
+        settle_s = float(self.config.get("place_release_stage_settle_seconds", 0.20))
+        for stage_idx, frac in enumerate(fractions):
+            try:
+                f = max(0.0, min(1.0, float(frac)))
+            except Exception:
+                continue
+            stage_target = [
+                float(c) + f * (float(t) - float(c))
+                for c, t in zip(start_joints, list(full_place_target_joints_deg))
+            ]
+            ok = await self.arm.move_to(
+                stage_target,
+                duration=duration_per_stage,
+                steps=steps_per_stage,
+                check_table_collision=True,
+                step_callback=self.gripper.update,
+            )
+            await self._step_gripper_for_seconds(settle_s)
+            pos, obs = self._object_pos_from_soft_observation(target, stage_name=f"place_release_lowering_stage_{stage_idx}")
+            release_log["lowering_stages"].append(json_safe({
+                "stage_index": stage_idx,
+                "fraction_to_full_place": f,
+                "move_completed": bool(ok),
+                "object_pos": pos,
+                "bottom_clearance_m": self._bottom_clearance_from_observation(obs, pos, table_height),
+                "place_zone_xy_error_m": self._xy_error_to_place_zone(pos, place_zone),
+                "soft_observation": obs,
+            }))
+            if not ok:
+                release_log["validation"]["reasons"].append("release final lowering motion failed")
+                return json_safe(release_log)
+
+        pre_pos, pre_obs = self._object_pos_from_soft_observation(target, stage_name="before_controlled_release")
+        pre_bottom = self._bottom_clearance_from_observation(pre_obs, pre_pos, table_height)
+        pre_xy = self._xy_error_to_place_zone(pre_pos, place_zone)
+        max_pre_bottom = float(self.config.get("place_release_max_pre_release_bottom_clearance_m", 0.030))
+        min_pre_bottom = float(self.config.get("place_release_min_pre_release_bottom_clearance_m", -0.006))
+        pre_reasons = []
+        if pre_bottom is None:
+            pre_reasons.append("pre-release bottom clearance unavailable")
+        else:
+            if pre_bottom > max_pre_bottom:
+                pre_reasons.append(f"object still too high for gentle release: bottom_clearance={pre_bottom:.4f} > {max_pre_bottom:.4f}")
+            if pre_bottom < min_pre_bottom:
+                pre_reasons.append(f"object penetrated table before release: bottom_clearance={pre_bottom:.4f} < {min_pre_bottom:.4f}")
+        release_log["pre_release_validation"] = json_safe({
+            "object_pos": pre_pos,
+            "soft_observation": pre_obs,
+            "bottom_clearance_m": pre_bottom,
+            "place_zone_xy_error_m": pre_xy,
+            "max_pre_release_bottom_clearance_m": max_pre_bottom,
+            "min_pre_release_bottom_clearance_m": min_pre_bottom,
+            "success": len(pre_reasons) == 0,
+            "reasons": pre_reasons,
+        })
+        if pre_reasons and bool(self.config.get("place_release_fail_if_not_near_table", True)):
+            release_log["validation"]["reasons"].extend(pre_reasons)
+            return json_safe(release_log)
+
+        # ── 4.3b: relax grip in tiny stages while the object is close to table ──
+        n_steps = max(0, int(self.config.get("place_release_partial_open_steps", 6)))
+        step_open = float(self.config.get("place_release_partial_open_step_m", 0.00035))
+        step_settle = float(self.config.get("place_release_partial_step_settle_seconds", 0.16))
+        for i in range(n_steps):
+            adj = self.gripper.adjust_hold_targets(
+                delta_close_m=-abs(step_open),
+                reason="controlled_table_release_partial_open",
+                force_n=float(self.config.get("place_release_partial_open_force_n", 45.0)),
+            )
+            await self._step_gripper_for_seconds(step_settle)
+            pos, obs = self._object_pos_from_soft_observation(target, stage_name=f"partial_release_step_{i}")
+            force_obs = None
+            try:
+                force_obs = self.force_observer.observe(stage_name=f"partial_release_step_{i}") if hasattr(self, "force_observer") else None
+            except Exception as e:
+                force_obs = {"available": False, "reason": f"force_observer_exception: {e}"}
+            release_log["partial_release_steps"].append(json_safe({
+                "step_index": i,
+                "adjustment": adj,
+                "object_pos": pos,
+                "bottom_clearance_m": self._bottom_clearance_from_observation(obs, pos, table_height),
+                "place_zone_xy_error_m": self._xy_error_to_place_zone(pos, place_zone),
+                "force_observation": force_obs,
+                "soft_observation": obs,
+            }))
+
+        # ── 4.3c: full open/release, then retreat upward ──
+        self.gripper.open()
+        await self._step_gripper_for_seconds(float(self.config.get("place_release_open_settle_seconds", 0.70)))
+        after_open_pos, after_open_obs = self._object_pos_from_soft_observation(target, stage_name="after_gripper_open_release")
+        release_log["after_open_observation"] = json_safe({
+            "object_pos": after_open_pos,
+            "bottom_clearance_m": self._bottom_clearance_from_observation(after_open_obs, after_open_pos, table_height),
+            "place_zone_xy_error_m": self._xy_error_to_place_zone(after_open_pos, place_zone),
+            "soft_observation": after_open_obs,
+            "gripper_diagnostics": self.gripper.get_diagnostics(),
+        })
+
+        before_retreat_pos = after_open_pos
+        retreat_ok = True
+        if retreat_target_joints_deg is not None:
+            retreat_ok = await self.arm.move_to(
+                retreat_target_joints_deg,
+                duration=float(self.config.get("place_release_retreat_duration", 1.80)),
+                steps=int(self.config.get("place_release_retreat_steps", 108)),
+                check_table_collision=True,
+                step_callback=self.gripper.update,
+            )
+            await self._step_gripper_for_seconds(float(self.config.get("place_release_post_retreat_settle_seconds", 0.60)))
+        else:
+            release_log["validation"]["warnings"].append("missing retreat target; release validated without retreat")
+
+        final_pos, final_obs = self._object_pos_from_soft_observation(target, stage_name="after_release_retreat")
+        release_log["after_retreat_observation"] = json_safe({
+            "retreat_completed": bool(retreat_ok),
+            "object_pos": final_pos,
+            "bottom_clearance_m": self._bottom_clearance_from_observation(final_obs, final_pos, table_height),
+            "place_zone_xy_error_m": self._xy_error_to_place_zone(final_pos, place_zone),
+            "soft_observation": final_obs,
+            "gripper_diagnostics": self.gripper.get_diagnostics(),
+        })
+
+        stability = await self._sample_target_stability(target, stage_name="after_release_stability")
+        release_log["after_release_stability"] = json_safe(stability)
+
+        # ── Validation: object must be on table, in zone, stable, not following retreat ──
+        reasons = []
+        warnings = release_log["validation"].get("warnings", [])
+        xy_tol = float(self.config.get("place_release_xy_tolerance_m", self.config.get("place_transport_xy_tolerance_m", 0.075)))
+        min_final_bottom = float(self.config.get("place_release_min_final_bottom_clearance_m", -0.008))
+        max_final_bottom = float(self.config.get("place_release_max_final_bottom_clearance_m", 0.030))
+        max_retreat_follow_z = float(self.config.get("place_release_max_object_follow_retreat_z_m", 0.015))
+        max_stability_drift = float(self.config.get("place_release_max_post_release_stability_drift_m", 0.005))
+        final_xy = self._xy_error_to_place_zone(final_pos, place_zone)
+        final_bottom = self._bottom_clearance_from_observation(final_obs, final_pos, table_height)
+        if not retreat_ok:
+            reasons.append("release retreat motion failed")
+        if final_pos is None:
+            reasons.append("missing final object pose after release")
+        if final_xy is None:
+            reasons.append("final place-zone xy error unavailable")
+        elif final_xy > xy_tol:
+            reasons.append(f"released object outside place zone tolerance: xy_error={final_xy:.4f} > {xy_tol:.4f}")
+        if final_bottom is None:
+            reasons.append("final bottom clearance unavailable")
+        else:
+            if final_bottom < min_final_bottom:
+                reasons.append(f"released object penetrated table: bottom_clearance={final_bottom:.4f} < {min_final_bottom:.4f}")
+            if final_bottom > max_final_bottom:
+                reasons.append(f"released object not resting on table: bottom_clearance={final_bottom:.4f} > {max_final_bottom:.4f}")
+        follow_z = None
+        if before_retreat_pos is not None and final_pos is not None:
+            try:
+                follow_z = abs(float(final_pos[2]) - float(before_retreat_pos[2]))
+                if follow_z > max_retreat_follow_z:
+                    reasons.append(f"object followed gripper during retreat: dz={follow_z:.4f} > {max_retreat_follow_z:.4f}")
+            except Exception:
+                follow_z = None
+        if self.gripper.has_object():
+            reasons.append("gripper still reports object after release")
+        if not stability.get("stable"):
+            drift = stability.get("max_drift_m")
+            if drift is not None:
+                try:
+                    if float(drift) > max_stability_drift:
+                        reasons.append(f"released object not stable: drift={float(drift):.4f} > {max_stability_drift:.4f}")
+                    else:
+                        warnings.append("stability checker returned unstable despite small drift")
+                except Exception:
+                    reasons.append("released object stability failed")
+            else:
+                reasons.append("released object stability failed")
+
+        release_log["validation"] = json_safe({
+            "success": len(reasons) == 0,
+            "reasons": reasons,
+            "warnings": warnings,
+            "final_place_zone_xy_error_m": final_xy,
+            "final_bottom_clearance_m": final_bottom,
+            "object_follow_retreat_z_m": follow_z,
+            "thresholds": {
+                "place_release_xy_tolerance_m": xy_tol,
+                "place_release_min_final_bottom_clearance_m": min_final_bottom,
+                "place_release_max_final_bottom_clearance_m": max_final_bottom,
+                "place_release_max_object_follow_retreat_z_m": max_retreat_follow_z,
+                "place_release_max_post_release_stability_drift_m": max_stability_drift,
+            },
+        })
+        return json_safe(release_log)
+
     # Method to get last trial log as .json file and write it to the output directory with a timestamp and create the dir if not exists
     def get_last_trial_log(self):
         return json_safe(getattr(self, "_last_trial_log", None))
@@ -4742,7 +5023,48 @@ class PickAndPlaceExecutor:
                                 self._last_trial_log = trial_log
                                 return False
 
-                            print("[Executor] ✅ Phase 4.2 lowering passed: object held near table, release disabled.")
+                            print("[Executor] ✅ Phase 4.2 lowering passed: object held near table.")
+
+                            if bool(self.config.get("enable_place_release_test", False)):
+                                print("\n[Executor] Phase 4.3: controlled table release and retreat...")
+                                retreat_target = place_joints.get(
+                                    str(self.config.get("place_release_retreat_waypoint", "lift"))
+                                ) or place_joints.get("safe_above") or place_joints.get("lift")
+                                place_release_result = await self._execute_controlled_place_release(
+                                    target=target,
+                                    place_zone=place_goal.get("place_zone", {}),
+                                    table_height=table_height,
+                                    full_place_target_joints_deg=full_place_lowering_target,
+                                    retreat_target_joints_deg=retreat_target,
+                                )
+                                attempt_log["place_release_result"] = json_safe(place_release_result)
+                                attempt_log["events"].append(
+                                    make_event(
+                                        "place_release_validation_done",
+                                        success=(place_release_result.get("validation") or {}).get("success"),
+                                        reasons=(place_release_result.get("validation") or {}).get("reasons", []),
+                                    )
+                                )
+                                if not (place_release_result.get("validation") or {}).get("success"):
+                                    print("[Executor] ❌ Place release validation failed.")
+                                    for reason in (place_release_result.get("validation") or {}).get("reasons", []):
+                                        print(f"  - {reason}")
+                                    attempt_log["failure_reason"] = "place_release_validation_failed"
+                                    trial_log["trial_success"] = False
+                                    trial_log["final_reason"] = "place_release_validation_failed"
+                                    trial_log["attempts"].append(attempt_log)
+                                    self._last_trial_log = trial_log
+                                    return False
+
+                                print("[Executor] ✅ Phase 4.3 release passed: object placed and gripper retreated.")
+                                attempt_log["success"] = True
+                                trial_log["trial_success"] = True
+                                trial_log["final_reason"] = "place_release_validation_passed"
+                                trial_log["attempts"].append(attempt_log)
+                                self._last_trial_log = trial_log
+                                return True
+
+                            print("[Executor] ✅ Phase 4.2 lowering passed: release disabled.")
                             attempt_log["success"] = True
                             trial_log["trial_success"] = True
                             trial_log["final_reason"] = "place_lowering_validation_passed_release_disabled"
