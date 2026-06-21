@@ -3327,6 +3327,9 @@ class UR5EController:
         pan_to_place_deg: float,
         table_height:     float = 0.75,
         object_metadata         = None,
+        carry_orientation       = None,
+        carry_orientation_name: str = None,
+        seed_deg               = None,
     ) -> dict:
         """
         Compute joint angles for all place waypoints.
@@ -3400,13 +3403,43 @@ class UR5EController:
 
         # ── Lula IK ──────────────────────────────────────────
         if self._ik_mode in ("lula", "rmpflow"):
-            tool_orient    = compute_grasp_orientation(approach_angle)
+            # Phase 4.2h: do not rotate the wrist during transport/lowering.
+            # Earlier place planning recomputed tool orientation from the place
+            # approach angle.  That can command a yaw change while holding the
+            # soft cube, visually rotating it and injecting in-hand shear.  For
+            # held-object transport, lock the place/lowering IK to the same
+            # orientation selected for grasp, and seed IK from the current carry
+            # joint configuration so the solver does not jump wrist branches.
+            use_locked_orientation = bool(
+                self.config.get("place_transport_lock_grasp_orientation", True)
+            ) and carry_orientation is not None
+            if use_locked_orientation:
+                tool_orient = np.array(carry_orientation, dtype=np.float64)
+                orient_source = "locked_grasp_orientation"
+                orient_name = carry_orientation_name or "locked_grasp_orientation"
+            else:
+                tool_orient = compute_grasp_orientation(approach_angle)
+                orient_source = "computed_place_approach_angle"
+                orient_name = "place_approach_angle"
+
+            self._last_place_plan_meta = {
+                "phase": "4.2h_orientation_locked_transport",
+                "place_world_pos": list(np.array(place_world_pos, dtype=float)),
+                "approach_angle_rad": float(approach_angle),
+                "orientation_source": orient_source,
+                "orient_name": orient_name,
+                "orient_quat": list(np.array(tool_orient, dtype=float)),
+                "seeded_from_current_carry_joints": seed_deg is not None,
+                "seed_deg": list(seed_deg) if seed_deg is not None else None,
+            }
+
             waypoint_order = [
                 "safe_above", "pre_place", "place",
                 "lift", "safe_retreat", "retract",
             ]
             results  = {}
-            prev     = None
+            prev     = list(seed_deg) if seed_deg is not None else None
+            prev_name = "current_carry_seed" if prev is not None else None
             all_ok   = True
 
             for name in waypoint_order:
@@ -3431,21 +3464,25 @@ class UR5EController:
                     break
 
                 if prev is not None:
-                    prev_name = waypoint_order[
-                        waypoint_order.index(name) - 1]
+                    label_from = prev_name or "previous"
                     if not self._validate_path_between_joints(
                             prev, j, n_samples=10,
-                            label=f"{prev_name}→{name}"):
+                            label=f"{label_from}→{name}"):
                         all_ok = False
                         break
 
                 results[name] = list(j)
                 prev = j
+                prev_name = name
 
             if all_ok and results:
                 return results
 
             self._log("  [IK] Place Lula failed → calibration")
+            try:
+                self._last_place_plan_meta["lula_failed_calibration_fallback"] = True
+            except Exception:
+                self._last_place_plan_meta = {"lula_failed_calibration_fallback": True}
 
         # ── Calibration fallback ──────────────────────────────
         pan    = pan_to_place_deg - self.PAN_OFFSET_DEG

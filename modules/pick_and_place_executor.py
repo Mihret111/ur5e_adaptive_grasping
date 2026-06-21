@@ -4293,14 +4293,37 @@ class PickAndPlaceExecutor:
                             self._last_trial_log = trial_log
                             return False
 
+                        # Phase 4.2h: transport/lowering must preserve the grasp wrist
+                        # orientation.  If place planning recomputes a new orientation from
+                        # the place approach angle, the wrist rotates while holding the soft
+                        # object, which looks like object rotation and adds shear.  Lock place
+                        # IK to the grasp orientation and seed the IK from the current carry
+                        # joints to avoid wrist-branch jumps.
+                        grasp_ik_meta = pick_result.get("ik_meta", {}) if isinstance(pick_result, dict) else {}
+                        carry_orientation = grasp_ik_meta.get("orient_quat")
+                        carry_orientation_name = grasp_ik_meta.get("orient_name")
+                        carry_seed_joints = self.arm.get_joint_targets_deg()
+                        place_plan_log["carry_orientation_lock"] = {
+                            "enabled": bool(self.config.get("place_transport_lock_grasp_orientation", True)),
+                            "source": "pick_result.ik_meta.orient_quat",
+                            "carry_orientation_name": carry_orientation_name,
+                            "carry_orientation_quat": carry_orientation,
+                            "carry_seed_joints_deg": carry_seed_joints,
+                            "reason": "avoid commanded wrist yaw/branch rotation while transporting soft object",
+                        }
+
                         place_joints = self.arm.compute_place_joints(
                             place_world_pos=place_goal["place_object_center"],
                             pan_to_place_deg=pan_to_object_deg,
                             table_height=table_height,
                             object_metadata=target,
+                            carry_orientation=carry_orientation,
+                            carry_orientation_name=carry_orientation_name,
+                            seed_deg=carry_seed_joints,
                         ) or {}
                         place_plan_log["waypoint_names"] = list(place_joints.keys())
                         place_plan_log["joints"] = place_joints
+                        place_plan_log["place_plan_meta"] = json_safe(getattr(self.arm, "_last_place_plan_meta", None))
                         attempt_log["place_transport_plan"] = json_safe(place_plan_log)
 
                         # Phase 4.1b: avoid unnecessary safe_above lift during

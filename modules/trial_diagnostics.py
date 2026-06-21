@@ -193,6 +193,8 @@ def selected_config_snapshot(config: dict) -> Dict[str, Any]:
         "retry_block_after_disturbed_micro_lift",
         "retry_abort_object_displacement_threshold_m",
         "retry_abort_object_horizontal_displacement_threshold_m",
+        "place_transport_lock_grasp_orientation",
+        "place_transport_seed_place_ik_from_current_carry",
     ]
     snap = {k: config.get(k) for k in keys if k in config}
 

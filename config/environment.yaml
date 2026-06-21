@@ -810,3 +810,14 @@ place_transport_max_width_ratio: 1.50
 place_transport_max_deformation_score: 0.50
 place_lowering_max_width_ratio: 1.58
 place_lowering_max_deformation_score: 0.58
+# ───────────── PHASE 4.2h: CARRY ORIENTATION LOCK / NO-WRIST-ROTATION TRANSPORT ─────────────
+# Visual issue: the object appears to rotate during transport.  Root cause found
+# in code: pick uses the selected grasp orientation, but place planning recomputed
+# a new tool orientation from the place approach angle.  Joint interpolation then
+# rotates the wrist while holding the soft object.  Lock place/transport/lowering
+# IK to the grasp orientation and seed IK from the current carry joints.
+place_transport_lock_grasp_orientation: true
+place_transport_seed_place_ik_from_current_carry: true
+
+# Keep previous 4.2g force/contact settings.  This phase changes commanded wrist
+# rotation, not scalar force.
