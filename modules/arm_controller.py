@@ -2016,7 +2016,7 @@ class UR5EController:
         return math.atan2(float(mtx[1][0]), float(mtx[0][0]))
 
     def _compute_grasp_candidates_for_object(
-        self, object_metadata, prim_path,
+        self, object_metadata, prim_path, object_world_pos=None,
     ) -> list:
         """
         Generate candidate grasp orientations based on object shape.
@@ -2033,14 +2033,24 @@ class UR5EController:
         )
 
         if shape == "Cube":
-            # Both faces are equal.  Keep a deterministic preferred order.
-            # Alternative face_B is available only if the caller explicitly
-            # enables alternate grasp orientations.
-            return [
-                ("face_A", compute_grasp_orientation(obj_yaw)),
-                ("face_B", compute_grasp_orientation(
-                    obj_yaw + math.pi / 2)),
-            ]
+            # Both faces are equal geometrically, but they are NOT equivalent for
+            # transport.  The previous default face_A made the estimated contact
+            # normal roughly world-X while the benchmark transport is mostly
+            # world-Y.  That turns the carry into tangential pad shear and the
+            # foam cube visibly rotates/creeps inside the fingers.  Prefer the
+            # 90-degree yaw first when anti-rotation grasping is enabled, then
+            # keep the old face_A as deterministic fallback.
+            prefer_transport_aligned = bool(
+                self.config.get("anti_rotation_cube_prefer_transport_aligned_yaw", True)
+            )
+            yaw_offset = float(
+                self.config.get("anti_rotation_cube_transport_yaw_offset_rad", math.pi / 2.0)
+            )
+            face_a = ("face_A_old_default", compute_grasp_orientation(obj_yaw))
+            face_b = ("face_B_transport_aligned", compute_grasp_orientation(obj_yaw + yaw_offset))
+            if prefer_transport_aligned:
+                return [face_b, face_a]
+            return [face_a, face_b]
 
         if shape == "Rectangle":
             # ── CRITICAL: grip across the WIDTH (short side) ──────
@@ -3049,6 +3059,7 @@ class UR5EController:
             orientation_candidates = self._compute_grasp_candidates_for_object(
                 object_metadata,
                 prim_path,
+                object_world_pos=object_world_pos,
             )
         else:
             orientation_candidates = [

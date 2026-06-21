@@ -135,8 +135,8 @@ gripper_object_detect_threshold: 0.003
 # ═══════════════════════════════════════════════════════════════════
 
 gripper_friction:
-  static_friction:  3.5
-  dynamic_friction: 3.0
+  static_friction:  5.2
+  dynamic_friction: 4.4
   restitution:      0.0
 
 

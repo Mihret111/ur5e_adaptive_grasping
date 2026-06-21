@@ -331,6 +331,13 @@ class RetryPolicy:
         )
 
         significant = (total >= threshold) or (horizontal >= horizontal_threshold)
+        disturbed_retry_block_threshold = float(
+            self.config.get("retry_abort_object_displacement_threshold_m", threshold)
+        )
+        disturbed_retry_block_horizontal = float(
+            self.config.get("retry_abort_object_horizontal_displacement_threshold_m", disturbed_retry_block_threshold)
+        )
+        disturbed_for_retry = (total >= disturbed_retry_block_threshold) or (horizontal >= disturbed_retry_block_horizontal)
 
         return {
             "source": source,
@@ -342,6 +349,9 @@ class RetryPolicy:
             "fresh_pose_threshold_m": threshold,
             "fresh_pose_horizontal_threshold_m": horizontal_threshold,
             "significant_object_motion": significant,
+            "disturbed_for_normal_retry": disturbed_for_retry,
+            "retry_abort_object_displacement_threshold_m": disturbed_retry_block_threshold,
+            "retry_abort_object_horizontal_displacement_threshold_m": disturbed_retry_block_horizontal,
         }
 
     def _is_plausible_contact_quality(self, quality: str) -> bool:
@@ -610,6 +620,15 @@ class RetryPolicy:
                 "too_asymmetric",
                 "missing_close_diagnostics",
             )
+
+            if bool(self.config.get("retry_block_after_disturbed_micro_lift", True)) and motion.get("disturbed_for_normal_retry"):
+                decision["retry"] = False
+                decision["reason"] = "no_retry_object_disturbed_after_failed_micro_lift"
+                decision["adjustments"] = {
+                    "object_motion": motion,
+                    "recommended_next_step": "reset object or run fresh perception after a controlled retreat; do not chase disturbed soft object",
+                }
+                return decision
 
             if cls == "NO_SECURE_CAPTURE_OBJECT_DID_NOT_FOLLOW":
                 decision["retry"] = True

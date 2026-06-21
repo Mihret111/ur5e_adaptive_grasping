@@ -45,8 +45,8 @@ print_contact_offset_errors: false
 
 soft_physics_materials:
   - name: foam_green
-    static_friction: 1.0
-    dynamic_friction: 1.0
+    static_friction: 2.7
+    dynamic_friction: 2.25
     restitution: 0.02
 
 soft_objects:
@@ -82,8 +82,8 @@ soft_objects:
     poissons_ratio: 0.25
     elasticity_damping: 0.08
 
-    static_friction: 1.0
-    dynamic_friction: 1.0
+    static_friction: 2.7
+    dynamic_friction: 2.25
     restitution: 0.02
 
     preferred_force_n: 20.0

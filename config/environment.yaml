@@ -389,7 +389,7 @@ table_zones:
   place_zone:
     label: place_zone
     role: target_placement_region
-    local_xy_m: [-0.07, 0.23]
+    local_xy_m: [-0.07, 0.21]
     size_xy_m: [0.08, 0.08]
     color: [0.10, 0.80, 0.20]
     cross_color: [1.00, 1.00, 1.00]
@@ -634,21 +634,21 @@ place_transport_fail_on_excessive_deformation: true
 # Phase 4.1i passed held transport.  Remaining slip is small but visible.
 # Reduce lateral transport distance slightly by moving the place zone closer,
 # slow transport only slightly, then add a no-release lowering stage.
-place_transport_duration: 4.30
-place_transport_steps: 258
+place_transport_duration: 4.00
+place_transport_steps: 240
 post_place_transport_settle_seconds: 0.45
 
 # Enable Phase 4.2.  The robot lowers the held object near the table over the
 # place zone, validates pose/shape/effort, and still does NOT open the gripper.
 enable_place_lowering_test: true
 place_lowering_waypoint: place
-place_lowering_duration: 2.60
-place_lowering_steps: 156
-post_place_lowering_settle_seconds: 0.45
+place_lowering_duration: 2.20
+place_lowering_steps: 132
+post_place_lowering_settle_seconds: 0.25
 place_lowering_xy_tolerance_m: 0.075
 place_lowering_max_flange_object_distance_m: 0.30
 place_lowering_min_bottom_clearance_m: -0.004
-place_lowering_max_bottom_clearance_m: 0.045
+place_lowering_max_bottom_clearance_m: 0.060
 place_lowering_min_grip_effort_sim: 0.10
 place_lowering_use_oriented_shape_for_deformation: true
 place_lowering_max_width_ratio: 1.56
@@ -661,3 +661,152 @@ place_lowering_admittance_enabled: true
 place_lowering_admittance_max_extra_close_m: 0.00025
 place_lowering_admittance_delta_step_m: 0.000025
 place_lowering_admittance_sample_stride_frames: 4
+
+# Phase 4.2b safe-hover lowering: do not force the held soft object all the
+# way to table contact yet.  The 4.2 logs showed most remaining slip during
+# lowering is vertical creep while approaching the table.  Stop slightly above
+# the table first; release will be handled separately in Phase 4.3.
+place_lowering_fraction_to_place: 0.88
+place_lowering_abort_min_table_gap_m: -0.003
+place_lowering_abort_on_table_drop: true
+place_lowering_slip_critical_relative_drift_m: 0.020
+
+# ───────────── PHASE 4.2c: FORCE-GATED SAFE LOWERING RESET ─────────────
+# The 4.2b log showed the run was visually worse because ForceObserver was
+# unavailable from before close onward.  The controller then entered
+# hold_no_force_observation and direct preload closed blindly to its limit.
+# This is not valid adaptive force control, so 4.2c fails closed if force
+# feedback is unavailable and tries both possible articulation roots.
+force_observer_articulation_roots:
+  - /mir/base_link_cabinet/cabinet/ur_mount/ur5e_physics
+  - /onrobot_2fg7
+  - /World/onrobot_2fg7
+
+place_transport_direct_preload_require_force_feedback: true
+place_transport_direct_preload_max_missing_force_samples: 2
+place_transport_abort_if_preload_force_unavailable: true
+place_lowering_require_force_feedback: true
+
+# The 4.2b lowering fraction of 0.88 went too close to the table and created
+# large vertical creep while the force loop was not alive.  Return to a safer
+# mid-hover lowering.  This still tests lowering, but not final table approach.
+place_lowering_fraction_to_place: 0.62
+place_lowering_duration: 1.80
+place_lowering_steps: 108
+post_place_lowering_settle_seconds: 0.25
+place_lowering_max_bottom_clearance_m: 0.130
+place_lowering_min_bottom_clearance_m: 0.020
+place_lowering_abort_min_table_gap_m: 0.010
+place_lowering_min_grip_effort_sim: 0.10
+
+# Slightly reduce direct preload max extra closure.  If force feedback is alive
+# it should stop near target; if not, it must not close blindly at all.
+place_transport_direct_preload_max_extra_close_m: 0.00120
+place_transport_direct_preload_max_shape_ratio: 1.34
+# ───────────── PHASE 4.2d: EXECUTION-STATE INTEGRITY + TARGET-LOCK + SAFE RETRY ─────────────
+# Logs showed several failures where the planner produced a grasp pose but the
+# actual flange was 5-60 mm away, and one case was >1 m away.  Do not close the
+# gripper unless the measured flange pose matches the planned waypoint.
+enable_target_stability_check_before_planning: true
+target_stability_sample_seconds: 0.30
+target_stability_sample_stride_frames: 6
+target_stability_max_drift_m: 0.0030
+target_stability_max_xy_drift_m: 0.0030
+post_motion_tracking_check_settle_seconds: 0.15
+max_safe_above_flange_tracking_error_m: 0.030
+max_pregrasp_flange_tracking_error_m: 0.020
+max_grasp_flange_tracking_error_m: 0.010
+max_waypoint_flange_tracking_error_m: 0.020
+
+# Retry is blocked if a failed grasp/lift visibly disturbed the object.  This
+# avoids chasing a soft cube that has already rotated/slid into a new state.
+enable_retry_disturbance_gate: true
+retry_block_after_disturbed_micro_lift: true
+retry_abort_object_displacement_threshold_m: 0.015
+retry_abort_object_horizontal_displacement_threshold_m: 0.012
+
+# Make preclose gate non-negotiable: if the flange tracking or geometry is bad,
+# the system must not close the gripper.
+enable_preclose_geometry_gate: true
+max_preclose_flange_tracking_error_m: 0.010
+max_preclose_grasp_centre_xy_error_m: 0.015
+
+# ───────────── PHASE 4.2e: ANTI-ROTATION GRASP CONTACT GEOMETRY ─────────────
+# Phase 4.2d fixed execution validity and retry safety.  The remaining visual
+# issue is object rotation/creep during transport/lowering.  The previous cube
+# default orientation made the contact-normal candidate approximately world-X,
+# while the transport is mostly world-Y.  Prefer the 90° cube face first so the
+# gripper pad normal is better aligned with the transport direction and the
+# object sees less tangential shear during carry.
+anti_rotation_cube_prefer_transport_aligned_yaw: true
+anti_rotation_cube_transport_yaw_offset_rad: 1.5707963267948966
+grasp_try_alternate_orientations: true
+
+# Keep this as a diagnostic-controlled experiment: do not release yet.
+enable_place_lowering_test: true
+
+# Contact/friction commissioning for the soft benchmark.  This is still a sim
+# material parameter, not a claim about real foam friction.  It represents
+# rubberized pad/foam contact that should resist in-hand rotation better.
+anti_rotation_contact_material_tuning_enabled: true
+
+# ───────────── PHASE 4.2f: CUBE PCA-DEGENERACY-AWARE SHAPE VALIDATION ─────────────
+# Phase 4.2e reduced transport drift, but the run failed because PCA-oriented
+# bbox ratio became larger than world-AABB.  For cube-like objects PCA axes are
+# underdetermined when eigenvalues are similar, so use world-AABB for pass/fail
+# when PCA is degenerate, while keeping PCA logged as audit.
+cube_shape_use_world_aabb_when_pca_degenerate: true
+cube_pca_degenerate_eigen_spread_threshold: 0.12
+place_transport_use_oriented_shape_for_deformation: true
+place_lowering_use_oriented_shape_for_deformation: true
+
+# Keep the anti-rotation grasp from 4.2e.  Validation should now judge it by the
+# metric that is meaningful for a near-cubic object.
+place_transport_max_width_ratio: 1.48
+place_transport_max_deformation_score: 0.48
+place_lowering_max_width_ratio: 1.56
+place_lowering_max_deformation_score: 0.56
+
+
+# ───────────── PHASE 4.2g: CONSERVATIVE HOLD STRENGTHENING ─────────────
+# Phase 4.2f is visibly better: drift is down to about 10 mm in transport and
+# 5--6 mm in lowering.  This phase strengthens the hold conservatively without
+# returning to blind crushing.  The idea is better pad/foam grip and slightly
+# higher stationary preload, not aggressive in-motion squeezing.
+
+# Slightly stronger shear target.  With the 4.2f logs the old target was about
+# 0.653 and preload reached 0.637--0.649.  This raises the desired held effort
+# only modestly into the 0.68--0.70 range.
+place_transport_proxy_effort_bias_sim: 0.32
+place_transport_shear_target_min_sim: 0.64
+place_transport_shear_target_max_sim: 0.78
+
+# Make the stationary preload a little more decisive.  It must still require
+# valid force feedback and must stop on shape/effort limits.
+place_transport_direct_preload_target_band_sim: 0.020
+place_transport_direct_preload_required_stable_samples: 4
+place_transport_direct_preload_max_extra_close_m: 0.00145
+place_transport_direct_preload_max_effort_sim: 1.12
+place_transport_direct_preload_max_shape_ratio: 1.40
+place_transport_direct_preload_step_m: 0.000075
+place_transport_direct_preload_force_n: 52.0
+
+# Allow only a tiny bit more residual correction during transport, because 4.2f
+# was hitting the old 0.40 mm cap.  This is intentionally small.
+place_transport_admittance_max_extra_close_m: 0.00052
+place_transport_admittance_delta_step_m: 0.000030
+place_transport_slip_close_effort_margin_sim: 0.055
+place_transport_slip_close_max_shape_ratio: 1.43
+
+# Lowering creep is mostly vertical/time-related.  Keep the same safe-hover
+# depth but slightly shorten the lowering motion.
+place_lowering_duration: 1.60
+place_lowering_steps: 96
+
+# Keep cube metric behavior from 4.2f.
+cube_shape_use_world_aabb_when_pca_degenerate: true
+cube_pca_degenerate_eigen_spread_threshold: 0.12
+place_transport_max_width_ratio: 1.50
+place_transport_max_deformation_score: 0.50
+place_lowering_max_width_ratio: 1.58
+place_lowering_max_deformation_score: 0.58

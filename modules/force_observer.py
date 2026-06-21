@@ -126,6 +126,16 @@ class ArticulationEffortForceObserver:
                 "/mir/base_link_cabinet/cabinet/ur_mount/ur5e_physics",
             )
         )
+        roots_cfg = self.config.get("force_observer_articulation_roots", None)
+        if isinstance(roots_cfg, (list, tuple)):
+            self.root_candidates = [str(r) for r in roots_cfg if str(r).strip()]
+        else:
+            self.root_candidates = [self.root_path]
+        # The 2FG7 may appear either inside the UR5e articulation or as its own
+        # articulation depending on how the USD is loaded/composed.  Try both.
+        for fallback in ["/onrobot_2fg7", "/World/onrobot_2fg7"]:
+            if fallback not in self.root_candidates:
+                self.root_candidates.append(fallback)
         self.left_joint_name = str(
             self.config.get("force_observer_left_finger_joint_name", "left_finger_joint")
         )
@@ -182,39 +192,82 @@ class ArticulationEffortForceObserver:
     # Articulation creation and DOF mapping
     # ─────────────────────────────────────────────────────────────
 
+    def _invalidate_articulation(self, reason: str = "unknown"):
+        """Forget a bad Isaac articulation wrapper so the next observe can retry.
+
+        In some Isaac/Kit sessions the first Articulation wrapper can be created
+        before the full DOF metadata is populated, returning a scalar dummy
+        effort with generated name ['dof_0'].  Treat that as not-ready, not as a
+        valid force signal.
+        """
+        self._art = None
+        self._art_module = None
+        self._name_source = None
+        self._dof_names = []
+        self._left_idx = None
+        self._right_idx = None
+        self._init_error = reason
+
     def _try_create_articulation(self):
         errors = []
-        for module_name, class_name in [
-            ("isaacsim.core.prims", "Articulation"),
-            ("omni.isaac.core.articulations", "Articulation"),
-        ]:
-            try:
-                mod = __import__(module_name, fromlist=[class_name])
-                Cls = getattr(mod, class_name)
-                art = Cls(self.root_path)
+        roots = list(dict.fromkeys([self.root_path] + list(getattr(self, "root_candidates", []))))
+        for root_path in roots:
+            for module_name, class_name in [
+                ("isaacsim.core.prims", "Articulation"),
+                ("omni.isaac.core.articulations", "Articulation"),
+            ]:
+                try:
+                    mod = __import__(module_name, fromlist=[class_name])
+                    Cls = getattr(mod, class_name)
+                    art = Cls(root_path)
 
-                for meth in ("initialize", "post_reset"):
-                    if hasattr(art, meth):
-                        try:
-                            getattr(art, meth)()
-                        except Exception:
-                            # Some Isaac versions require Play/World context.
-                            # Do not fail immediately; effort read will decide.
-                            pass
+                    for meth in ("initialize", "post_reset"):
+                        if hasattr(art, meth):
+                            try:
+                                getattr(art, meth)()
+                            except Exception:
+                                pass
 
-                # Test that at least an effort-like call exists.
-                if not hasattr(art, "get_measured_joint_efforts"):
-                    errors.append(f"{module_name}.{class_name}: missing get_measured_joint_efforts")
-                    continue
+                    if not hasattr(art, "get_measured_joint_efforts"):
+                        errors.append(f"{root_path} {module_name}.{class_name}: missing get_measured_joint_efforts")
+                        continue
 
-                self._art = art
-                self._art_module = f"{module_name}.{class_name}"
-                return True
-            except Exception as e:
-                errors.append(f"{module_name}.{class_name}: {repr(e)}")
+                    self._art = art
+                    self._art_module = f"{module_name}.{class_name}"
+                    self.root_path = root_path
+
+                    flat, shape, err = self._read_efforts_flat()
+                    if err or not flat or len(flat) < 2:
+                        errors.append(
+                            f"{root_path} {module_name}.{class_name}: unusable effort read err={err}, shape={shape}, len={len(flat)}"
+                        )
+                        self._art = None
+                        continue
+
+                    names, source = self._select_dof_names(len(flat))
+                    if self.left_joint_name in names and self.right_joint_name in names:
+                        self._dof_names = names
+                        self._name_source = source
+                        self._left_idx = names.index(self.left_joint_name)
+                        self._right_idx = names.index(self.right_joint_name)
+                        print(
+                            "[ForceObserver] selected articulation: "
+                            f"root={root_path}, module={self._art_module}, "
+                            f"source={source}, left_idx={self._left_idx}, right_idx={self._right_idx}"
+                        )
+                        return True
+
+                    errors.append(
+                        f"{root_path} {module_name}.{class_name}: finger names missing in efforts; "
+                        f"names={names}, source={source}, shape={shape}, len={len(flat)}"
+                    )
+                    self._art = None
+                except Exception as e:
+                    errors.append(f"{root_path} {module_name}.{class_name}: {repr(e)}")
 
         self._init_error = " | ".join(errors)
         self._init_trace = traceback.format_exc()
+        self._invalidate_articulation(self._init_error)
         return False
 
     def _name_sources(self) -> Dict[str, List[str]]:
@@ -340,6 +393,8 @@ class ArticulationEffortForceObserver:
         if self._art is None:
             if not self._try_create_articulation():
                 return False
+            if self._art is not None and self._left_idx is not None and self._right_idx is not None:
+                return True
 
         flat, shape, err = self._read_efforts_flat()
         if err or not flat:
@@ -397,16 +452,34 @@ class ArticulationEffortForceObserver:
             return obs
 
         flat, shape, err = self._read_efforts_flat()
-        if err or not flat:
-            obs = {
-                "available": False,
-                "stage": stage_name,
-                "force_source": self.BACKEND_NAME,
-                "reason": err or "empty_effort_array",
-                "root_path": self.root_path,
-            }
-            self._last_observation = obs
-            return obs
+        bad_indices = (
+            self._left_idx is None or self._right_idx is None or
+            not flat or self._left_idx >= len(flat) or self._right_idx >= len(flat)
+        )
+        if err or bad_indices:
+            # The Isaac articulation wrapper can occasionally become stale or
+            # return a dummy scalar effort.  Reacquire once before giving up.
+            old_reason = err or f"bad_effort_indices_or_empty: shape={shape}, len={len(flat)}"
+            self._invalidate_articulation(old_reason)
+            if self._try_create_articulation():
+                flat, shape, err = self._read_efforts_flat()
+                bad_indices = (
+                    self._left_idx is None or self._right_idx is None or
+                    not flat or self._left_idx >= len(flat) or self._right_idx >= len(flat)
+                )
+            if err or bad_indices:
+                obs = {
+                    "available": False,
+                    "stage": stage_name,
+                    "force_source": self.BACKEND_NAME,
+                    "reason": err or old_reason or "empty_or_invalid_effort_array_after_reacquire",
+                    "root_path": self.root_path,
+                    "candidate_roots": list(getattr(self, "root_candidates", [])),
+                    "effort_shape": shape,
+                    "dof_names": list(self._dof_names),
+                }
+                self._last_observation = obs
+                return obs
 
         left_raw = _finite_float(flat[self._left_idx], 0.0) if self._left_idx is not None else 0.0
         right_raw = _finite_float(flat[self._right_idx], 0.0) if self._right_idx is not None else 0.0

@@ -800,6 +800,100 @@ class PickAndPlaceExecutor:
             summary.update({"success": False, "reason": f"exception: {e}"})
         return json_safe(summary)
 
+    def _is_cube_like_target(self, target=None):
+        try:
+            if isinstance(target, dict):
+                label = str(target.get("label", "")).lower()
+                shape = str(target.get("shape", "")).lower()
+                return "cube" in label or "cube" in shape
+        except Exception:
+            pass
+        return False
+
+    def _pca_eigen_spread_ratio(self, soft_obs=None):
+        try:
+            obb = (soft_obs or {}).get("oriented_bbox") or {}
+            eigs = obb.get("eigenvalues") or []
+            vals = [abs(float(v)) for v in eigs if v is not None]
+            if not vals:
+                return None
+            vmax = max(vals)
+            if vmax <= 1.0e-12:
+                return None
+            return (max(vals) - min(vals)) / vmax
+        except Exception:
+            return None
+
+    def _shape_ratio_from_world_aabb(self, soft_obs=None):
+        ratios = []
+        try:
+            wx = (soft_obs or {}).get("width_ratio_x")
+            wy = (soft_obs or {}).get("width_ratio_y")
+            if wx is not None:
+                ratios.append(float(wx))
+            if wy is not None:
+                ratios.append(float(wy))
+            h = (soft_obs or {}).get("height_m")
+            nominal_h = float(self.config.get("adaptive_safety_nominal_height_m", 0.040))
+            if h is not None and nominal_h > 1.0e-9:
+                ratios.append(float(h) / nominal_h)
+        except Exception:
+            pass
+        if not ratios:
+            return None, None
+        m = max(ratios)
+        return m, max(abs(r - 1.0) for r in ratios)
+
+    def _select_soft_shape_metric(self, *, target=None, soft_obs=None, use_oriented=True, stage_name="shape"):
+        """Choose a deformation metric without over-trusting PCA for near-cubes.
+
+        PCA/OBB is useful for elongated objects, but a cube has nearly equal
+        eigenvalues, so its PCA axes are underdetermined: the box can jump even
+        when the physical deformation is smaller.  For cube-like objects with
+        near-degenerate PCA eigenvalues, use world-AABB for pass/fail and keep
+        PCA as an audit signal.
+        """
+        world_ratio, world_score = self._shape_ratio_from_world_aabb(soft_obs)
+        oriented_ratio = None
+        try:
+            if (soft_obs or {}).get("oriented_max_ratio") is not None:
+                oriented_ratio = float((soft_obs or {}).get("oriented_max_ratio"))
+        except Exception:
+            oriented_ratio = None
+        eigen_spread = self._pca_eigen_spread_ratio(soft_obs)
+        cube_like = self._is_cube_like_target(target)
+        threshold = float(self.config.get("cube_pca_degenerate_eigen_spread_threshold", 0.12))
+        degenerate = cube_like and eigen_spread is not None and eigen_spread <= threshold
+        prefer_world_for_cube = bool(self.config.get("cube_shape_use_world_aabb_when_pca_degenerate", True))
+
+        source = "world_aabb"
+        ratio = world_ratio
+        score = world_score
+        if use_oriented and oriented_ratio is not None:
+            source = "pca_oriented_bbox"
+            ratio = oriented_ratio
+            score = abs(oriented_ratio - 1.0)
+        if prefer_world_for_cube and degenerate and world_ratio is not None:
+            source = "world_aabb_cube_pca_degenerate"
+            ratio = world_ratio
+            score = world_score
+
+        return {
+            "stage_name": stage_name,
+            "shape_metric_source": source,
+            "max_dimension_ratio": ratio,
+            "deformation_score_proxy": score,
+            "world_aabb_max_dimension_ratio": world_ratio,
+            "world_aabb_deformation_score_proxy": world_score,
+            "oriented_max_ratio": oriented_ratio,
+            "oriented_ratio_sorted": (soft_obs or {}).get("oriented_ratio_sorted") if isinstance(soft_obs, dict) else None,
+            "oriented_bbox": (soft_obs or {}).get("oriented_bbox") if isinstance(soft_obs, dict) else None,
+            "cube_like_target": cube_like,
+            "pca_eigen_spread_ratio": eigen_spread,
+            "pca_degenerate_for_cube": bool(degenerate),
+            "interpretation": "For cube-like targets, near-degenerate PCA eigenvalues make PCA axes unstable; world-AABB is used for pass/fail while PCA remains logged as audit.",
+        }
+
     async def _direct_transport_preload_boost(self, *, target=None, target_effort_sim=None):
         """Direct stationary preload booster for Phase 4.1h.
 
@@ -857,7 +951,14 @@ class PickAndPlaceExecutor:
 
         total_extra = 0.0
         stable_samples = 0
+        force_missing_samples = 0
+        require_force_feedback = bool(self.config.get("place_transport_direct_preload_require_force_feedback", True))
+        max_missing_force_samples = max(1, int(self.config.get("place_transport_direct_preload_max_missing_force_samples", 2)))
         final_reason = "max_frames_reached"
+        summary.update({
+            "require_force_feedback": require_force_feedback,
+            "max_missing_force_samples": max_missing_force_samples,
+        })
 
         def count(action):
             d = summary.setdefault("action_counts", {})
@@ -886,30 +987,36 @@ class PickAndPlaceExecutor:
                     effort = None
             err = None if effort is None else (target_effort - effort)
 
-            # Prefer rotation-aware OBB ratio if available; otherwise fall back
-            # to world-AABB ratio.  The booster should not overreact to simple
-            # rigid rotation.
-            shape_ratio_source = "none"
-            shape_ratio = None
-            if isinstance(soft_obs, dict):
-                try:
-                    if soft_obs.get("oriented_max_ratio") is not None and bool(self.config.get("place_transport_use_oriented_shape_for_deformation", True)):
-                        shape_ratio = float(soft_obs.get("oriented_max_ratio"))
-                        shape_ratio_source = "oriented_pca_bbox"
-                    else:
-                        ratios = []
-                        for key in ("width_ratio_x", "width_ratio_y"):
-                            if soft_obs.get(key) is not None:
-                                ratios.append(float(soft_obs.get(key)))
-                        h = soft_obs.get("height_m")
-                        nominal_h = float(self.config.get("adaptive_safety_nominal_height_m", 0.040))
-                        if h is not None and nominal_h > 1.0e-9:
-                            ratios.append(float(h) / nominal_h)
-                        if ratios:
-                            shape_ratio = max(ratios)
-                            shape_ratio_source = "world_aabb"
-                except Exception:
-                    pass
+            if effort is None and require_force_feedback:
+                force_missing_samples += 1
+                action = "force_feedback_unavailable_no_blind_close"
+                count(action)
+                summary["trace"].append(json_safe({
+                    "frame": frame,
+                    "action": action,
+                    "effort_sim": None,
+                    "error_sim": None,
+                    "force_missing_samples": force_missing_samples,
+                    "total_extra_close_m": total_extra,
+                    "effort_observation": effort_obs,
+                    "soft_observation": soft_obs,
+                }))
+                if force_missing_samples >= max_missing_force_samples:
+                    final_reason = "force_feedback_unavailable"
+                    summary["aborted"] = True
+                    summary["abort_reason"] = final_reason
+                    break
+                continue
+
+            # Choose shape metric without over-trusting PCA for near-cubic targets.
+            shape_metric = self._select_soft_shape_metric(
+                target=target,
+                soft_obs=soft_obs,
+                use_oriented=bool(self.config.get("place_transport_use_oriented_shape_for_deformation", True)),
+                stage_name="direct_preload",
+            )
+            shape_ratio = shape_metric.get("max_dimension_ratio")
+            shape_ratio_source = shape_metric.get("shape_metric_source", "none")
 
             action = "hold"
             adjustment = None
@@ -1075,6 +1182,10 @@ class PickAndPlaceExecutor:
                 target_effort_sim=target_effort,
             )
         summary["direct_preload_boost"] = json_safe(direct_boost)
+        if isinstance(direct_boost, dict) and direct_boost.get("aborted"):
+            summary["aborted"] = True
+            summary["abort_reason"] = direct_boost.get("abort_reason", direct_boost.get("final_reason"))
+            return json_safe(summary)
 
         settle_s = float(self.config.get("place_transport_shear_preload_settle_seconds", 0.25))
         if settle_s > 0.0:
@@ -1639,12 +1750,14 @@ class PickAndPlaceExecutor:
                 max_width_ratio = max(width_ratio_x, width_ratio_y)
                 old = state.get("max_width_ratio")
                 state["max_width_ratio"] = max_width_ratio if old is None else max(old, max_width_ratio)
-                if bool(self.config.get("place_transport_use_oriented_shape_for_deformation", True)) and (soft_obs or {}).get("oriented_max_ratio") is not None:
-                    transport_shape_ratio = _safe_float((soft_obs or {}).get("oriented_max_ratio"))
-                    transport_shape_ratio_source = "pca_oriented_bbox"
-                else:
-                    transport_shape_ratio = max_width_ratio
-                    transport_shape_ratio_source = "world_aabb"
+                shape_metric = self._select_soft_shape_metric(
+                    target=target,
+                    soft_obs=soft_obs,
+                    use_oriented=bool(self.config.get("place_transport_use_oriented_shape_for_deformation", True)),
+                    stage_name="transport_admittance",
+                )
+                transport_shape_ratio = shape_metric.get("max_dimension_ratio", max_width_ratio)
+                transport_shape_ratio_source = shape_metric.get("shape_metric_source", "world_aabb")
             except Exception:
                 pass
 
@@ -1934,6 +2047,163 @@ class PickAndPlaceExecutor:
             return float(((float(a[0]) - float(b[0])) ** 2 + (float(a[1]) - float(b[1])) ** 2 + (float(a[2]) - float(b[2])) ** 2) ** 0.5)
         except Exception:
             return None
+
+    def _flange_tracking_check(self, *, expected_world_pos, stage_name: str, max_error_m=None):
+        """Execution-monitoring check: did the flange actually reach the planned pose?"""
+        actual = None
+        error = None
+        success = False
+        try:
+            actual = self.arm.get_flange_world_pos()
+        except Exception as e:
+            return {
+                "stage": stage_name,
+                "success": False,
+                "expected_flange_world_pos": expected_world_pos,
+                "actual_flange_world_pos": None,
+                "tracking_error_m": None,
+                "max_error_m": max_error_m,
+                "reason": f"flange_pose_unavailable: {e}",
+            }
+        if max_error_m is None:
+            max_error_m = float(self.config.get("max_waypoint_flange_tracking_error_m", 0.020))
+        if expected_world_pos is not None:
+            error = self._point_dist(actual, expected_world_pos)
+            success = (error is not None and error <= float(max_error_m))
+            reason = None if success else f"flange tracking error too large: {error:.4f} m > {float(max_error_m):.4f} m"
+        else:
+            reason = "expected flange target unavailable"
+        return json_safe({
+            "stage": stage_name,
+            "success": success,
+            "expected_flange_world_pos": expected_world_pos,
+            "actual_flange_world_pos": actual,
+            "tracking_error_m": error,
+            "max_error_m": float(max_error_m),
+            "reason": reason,
+        })
+
+    async def _verify_waypoint_tracking_or_fail(
+        self,
+        *,
+        attempt_log: dict,
+        trial_log: dict,
+        pick_result: dict,
+        waypoint_name: str,
+        final_reason: str,
+        max_error_m=None,
+        settle_seconds=None,
+    ):
+        """Verify actual flange pose after a motion command and fail before unsafe actions.
+
+        Motion commands can return True even if the physical/simulated flange has
+        not settled at the intended Cartesian pose.  Closing the gripper after
+        such a miss is exactly what creates the visual "wrong target" behaviour.
+        """
+        if settle_seconds is None:
+            settle_seconds = float(self.config.get("post_motion_tracking_check_settle_seconds", 0.15))
+        if settle_seconds > 0.0:
+            await self._step_gripper_for_seconds(settle_seconds)
+        expected = (pick_result.get("flange_targets", {}) or {}).get(waypoint_name)
+        check = self._flange_tracking_check(
+            expected_world_pos=expected,
+            stage_name=f"after_{waypoint_name}",
+            max_error_m=max_error_m,
+        )
+        attempt_log.setdefault("execution_tracking_checks", {})[waypoint_name] = check
+        attempt_log["events"].append(
+            make_event(
+                "waypoint_tracking_check_done",
+                waypoint=waypoint_name,
+                success=check.get("success"),
+                tracking_error_m=check.get("tracking_error_m"),
+            )
+        )
+        if not check.get("success"):
+            print(f"[Executor] ❌ Execution monitor rejected {waypoint_name}: {check.get('reason')}")
+            attempt_log["failure_reason"] = final_reason
+            attempt_log["arm_tracking_failure"] = check
+            trial_log["attempts"].append(attempt_log)
+            trial_log["trial_success"] = False
+            trial_log["final_reason"] = final_reason
+            self._last_trial_log = trial_log
+            return False, check
+        return True, check
+
+    async def _sample_target_stability(self, target: dict, stage_name: str = "target_stability"):
+        """Sample object pose over a short window before trusting a target/retry."""
+        app = omni.kit.app.get_app()
+        seconds = float(self.config.get("target_stability_sample_seconds", 0.35))
+        stride = max(1, int(self.config.get("target_stability_sample_stride_frames", 6)))
+        frames = max(stride, int(seconds * 60))
+        samples = []
+        for i in range(frames + 1):
+            if i % stride == 0:
+                pos = self._get_observed_object_pos(target, stage_name=f"{stage_name}_{i}")
+                if pos is not None:
+                    samples.append(list(pos))
+            await app.next_update_async()
+        max_dist = 0.0
+        max_xy = 0.0
+        if len(samples) >= 2:
+            ref = samples[0]
+            for pnt in samples[1:]:
+                d = self._point_dist(ref, pnt) or 0.0
+                dx = float(ref[0]) - float(pnt[0])
+                dy = float(ref[1]) - float(pnt[1])
+                xy = (dx * dx + dy * dy) ** 0.5
+                max_dist = max(max_dist, d)
+                max_xy = max(max_xy, xy)
+        max_allowed = float(self.config.get("target_stability_max_drift_m", 0.0030))
+        max_xy_allowed = float(self.config.get("target_stability_max_xy_drift_m", max_allowed))
+        stable = len(samples) >= 2 and max_dist <= max_allowed and max_xy <= max_xy_allowed
+        return json_safe({
+            "stage": stage_name,
+            "stable": stable,
+            "samples": samples,
+            "sample_count": len(samples),
+            "max_drift_m": max_dist,
+            "max_xy_drift_m": max_xy,
+            "max_allowed_m": max_allowed,
+            "max_xy_allowed_m": max_xy_allowed,
+            "reason": None if stable else "target pose unstable or insufficient samples",
+        })
+
+    def _retry_disturbance_gate(self, attempt_log: dict, previous_attempt: dict):
+        """Executor-side guard against retrying after a failed grasp disturbed the object."""
+        summary = attempt_log.get("object_displacement_since_previous_attempt") or {}
+        prev_failure = (previous_attempt or {}).get("failure_reason")
+        total = summary.get("displacement_since_previous_attempt_m")
+        horiz = summary.get("horizontal_displacement_since_previous_attempt_m")
+        total_thr = float(self.config.get("retry_abort_object_displacement_threshold_m", 0.015))
+        horiz_thr = float(self.config.get("retry_abort_object_horizontal_displacement_threshold_m", total_thr))
+        significant = False
+        try:
+            significant = (total is not None and float(total) >= total_thr) or (horiz is not None and float(horiz) >= horiz_thr)
+        except Exception:
+            significant = False
+        enabled = bool(self.config.get("enable_retry_disturbance_gate", True))
+        gate = {
+            "enabled": enabled,
+            "previous_failure_reason": prev_failure,
+            "displacement_since_previous_attempt_m": total,
+            "horizontal_displacement_since_previous_attempt_m": horiz,
+            "total_threshold_m": total_thr,
+            "horizontal_threshold_m": horiz_thr,
+            "significant_disturbance": significant,
+            "allowed": True,
+            "reason": None,
+        }
+        disturbed_after_grasp_failure = prev_failure in (
+            "micro_lift_validation_failed",
+            "place_transport_validation_failed",
+            "place_lowering_validation_failed",
+            "transport_preload_force_unavailable",
+        )
+        if enabled and significant and disturbed_after_grasp_failure:
+            gate["allowed"] = False
+            gate["reason"] = "object_disturbed_after_failed_grasp_no_normal_retry"
+        return json_safe(gate)
 
     def _make_soft_micro_lift_step_callback(self, target: dict, trace: list):
         """Return a step callback that updates the gripper and samples soft state.
@@ -2498,37 +2768,19 @@ class PickAndPlaceExecutor:
             world_max_ratio = max(world_ratios) if world_ratios else None
             world_deformation_score = max(abs(r - 1.0) for r in world_ratios) if world_ratios else None
 
-            use_oriented = bool(self.config.get("place_transport_use_oriented_shape_for_deformation", True))
-            oriented_max_ratio = soft_obs_after.get("oriented_max_ratio")
-            oriented_ratio_sorted = soft_obs_after.get("oriented_ratio_sorted")
-            oriented_bbox = soft_obs_after.get("oriented_bbox")
-
-            max_ratio = world_max_ratio
-            deformation_score = soft_obs_after.get("deformation_score")
-            shape_metric_source = "world_aabb"
-            if use_oriented and oriented_max_ratio is not None:
-                try:
-                    max_ratio = float(oriented_max_ratio)
-                    deformation_score = abs(max_ratio - 1.0)
-                    shape_metric_source = "pca_oriented_bbox"
-                except Exception:
-                    pass
-            if deformation_score is None:
-                deformation_score = world_deformation_score
-
+            shape_metric = self._select_soft_shape_metric(
+                target=target,
+                soft_obs=soft_obs_after,
+                use_oriented=bool(self.config.get("place_transport_use_oriented_shape_for_deformation", True)),
+                stage_name="place_transport_validation",
+            )
+            max_ratio = shape_metric.get("max_dimension_ratio")
+            deformation_score = shape_metric.get("deformation_score_proxy")
             result["transport_shape_safety"] = {
-                "shape_metric_source": shape_metric_source,
+                **shape_metric,
                 "width_ratio_x_world_aabb": wx_ratio,
                 "width_ratio_y_world_aabb": wy_ratio,
                 "height_ratio_world_aabb": height_ratio,
-                "world_aabb_max_dimension_ratio": world_max_ratio,
-                "world_aabb_deformation_score_proxy": world_deformation_score,
-                "oriented_max_ratio": oriented_max_ratio,
-                "oriented_ratio_sorted": oriented_ratio_sorted,
-                "oriented_bbox": oriented_bbox,
-                "max_dimension_ratio": max_ratio,
-                "deformation_score_proxy": deformation_score,
-                "interpretation": "PCA-oriented bbox helps separate cube rotation from real soft-object deformation/extrusion.",
             }
             if max_ratio is not None and max_ratio > max_width_ratio:
                 msg = f"soft object stretched during transport: max_ratio={max_ratio:.3f} > {max_width_ratio:.3f}"
@@ -2699,34 +2951,18 @@ class PickAndPlaceExecutor:
             world_max_ratio = max(world_ratios) if world_ratios else None
             world_deformation_score = max(abs(r - 1.0) for r in world_ratios) if world_ratios else None
 
-            use_oriented = bool(self.config.get("place_lowering_use_oriented_shape_for_deformation", True))
-            oriented_max_ratio = soft_obs_after.get("oriented_max_ratio")
-            oriented_ratio_sorted = soft_obs_after.get("oriented_ratio_sorted")
-            oriented_bbox = soft_obs_after.get("oriented_bbox")
-
-            max_ratio = world_max_ratio
-            deformation_score = soft_obs_after.get("deformation_score")
-            shape_metric_source = "world_aabb"
-            if use_oriented and oriented_max_ratio is not None:
-                try:
-                    max_ratio = float(oriented_max_ratio)
-                    deformation_score = abs(max_ratio - 1.0)
-                    shape_metric_source = "pca_oriented_bbox"
-                except Exception:
-                    pass
-            if deformation_score is None:
-                deformation_score = world_deformation_score
-
+            shape_metric = self._select_soft_shape_metric(
+                target=target,
+                soft_obs=soft_obs_after,
+                use_oriented=bool(self.config.get("place_lowering_use_oriented_shape_for_deformation", True)),
+                stage_name="place_lowering_validation",
+            )
+            max_ratio = shape_metric.get("max_dimension_ratio")
+            deformation_score = shape_metric.get("deformation_score_proxy")
             result["lowering_shape_safety"] = {
-                "shape_metric_source": shape_metric_source,
+                **shape_metric,
                 "world_aabb_max_dimension_ratio": world_max_ratio,
                 "world_aabb_deformation_score_proxy": world_deformation_score,
-                "oriented_max_ratio": oriented_max_ratio,
-                "oriented_ratio_sorted": oriented_ratio_sorted,
-                "oriented_bbox": oriented_bbox,
-                "max_dimension_ratio": max_ratio,
-                "deformation_score_proxy": deformation_score,
-                "interpretation": "Lowering validation keeps the object held near table while separating rotation from true deformation.",
             }
             if max_ratio is not None and max_ratio > max_width_ratio:
                 msg = f"soft object stretched during lowering: max_ratio={max_ratio:.3f} > {max_width_ratio:.3f}"
@@ -2767,6 +3003,10 @@ class PickAndPlaceExecutor:
                 )
         else:
             result["warnings"].append("bottom clearance unavailable after lowering")
+        require_lowering_force = bool(self.config.get("place_lowering_require_force_feedback", True))
+        result["thresholds"]["place_lowering_require_force_feedback"] = require_lowering_force
+        if require_lowering_force and not (isinstance(force_obs_after, dict) and force_obs_after.get("available")):
+            result["reasons"].append("force feedback unavailable after lowering")
         if effort is not None and effort < min_effort:
             result["reasons"].append(
                 f"grip effort too low after lowering: {effort:.3f} < {min_effort:.3f}"
@@ -3140,6 +3380,10 @@ class PickAndPlaceExecutor:
                 "grasp_ok": False,
                 "planning_initial": None,
                 "planning_replanned_after_safe_above": None,
+                "target_lock": None,
+                "target_stability_before_planning": None,
+                "retry_disturbance_gate": None,
+                "execution_tracking_checks": {},
                 "preclose_diagnostics": None,
                 "preclose_geometry_gate": None,
                 "close_validation": None,
@@ -3173,12 +3417,36 @@ class PickAndPlaceExecutor:
                 actual_object_pos = target["world_pos"]
 
             attempt_log["actual_object_pos"] = json_safe(actual_object_pos)
+            attempt_log["target_lock"] = json_safe({
+                "prim_path": target.get("prim_path"),
+                "stored_spawn_world_pos": target.get("world_pos"),
+                "live_target_pos_used_for_initial_planning": actual_object_pos,
+                "pose_source": "soft_observer_center" if self._is_soft_target(target) else "rigid_root",
+                "attempt": attempt + 1,
+            })
+
+            if bool(self.config.get("enable_target_stability_check_before_planning", True)):
+                stability = await self._sample_target_stability(target, stage_name="before_planning_stability")
+                attempt_log["target_stability_before_planning"] = json_safe(stability)
+                if not stability.get("stable") and attempt > 0:
+                    print("[Executor] ❌ Retry target is not stable; refusing to chase disturbed object.")
+                    attempt_log["failure_reason"] = "retry_target_unstable_before_planning"
+                    trial_log["attempts"].append(attempt_log)
+                    trial_log["trial_success"] = False
+                    trial_log["final_reason"] = "retry_target_unstable_before_planning"
+                    self._last_trial_log = trial_log
+                    return False
+
             if attempt > 0 and trial_log.get("attempts"):
+                previous_attempt = trial_log["attempts"][-1]
                 attempt_log["object_displacement_since_previous_attempt"] = json_safe(
                     self._object_retry_displacement_summary(
                         actual_object_pos,
-                        trial_log["attempts"][-1],
+                        previous_attempt,
                     )
+                )
+                attempt_log["retry_disturbance_gate"] = json_safe(
+                    self._retry_disturbance_gate(attempt_log, previous_attempt)
                 )
                 attempt_log["events"].append(
                     make_event(
@@ -3190,8 +3458,19 @@ class PickAndPlaceExecutor:
                             if attempt_log.get("object_displacement_since_previous_attempt")
                             else None
                         ),
+                        retry_allowed_by_disturbance_gate=(attempt_log.get("retry_disturbance_gate") or {}).get("allowed"),
                     )
                 )
+                if not (attempt_log.get("retry_disturbance_gate") or {}).get("allowed", True):
+                    print("[Executor] ❌ Retry disturbance gate blocked normal retry.")
+                    print(f"  reason: {attempt_log['retry_disturbance_gate'].get('reason')}")
+                    attempt_log["failure_reason"] = "retry_blocked_object_disturbed_after_failed_grasp"
+                    trial_log["attempts"].append(attempt_log)
+                    trial_log["trial_success"] = False
+                    trial_log["final_reason"] = "retry_blocked_object_disturbed_after_failed_grasp"
+                    self._last_trial_log = trial_log
+                    return False
+
             attempt_log["snapshots"]["before_planning"] = pose_snapshot(
                 self, target, "before_planning"
             )
@@ -3273,6 +3552,17 @@ class PickAndPlaceExecutor:
                 return False
 
             print("[Executor] ✅ Reached safe_above.")
+            safe_tracking_ok, _safe_tracking = await self._verify_waypoint_tracking_or_fail(
+                attempt_log=attempt_log,
+                trial_log=trial_log,
+                pick_result=pick_result,
+                waypoint_name="safe_above",
+                final_reason="arm_tracking_failed_after_safe_above",
+                max_error_m=float(self.config.get("max_safe_above_flange_tracking_error_m", 0.030)),
+            )
+            if not safe_tracking_ok:
+                return False
+
             attempt_log["safe_above_ok"] = True
             attempt_log["snapshots"]["after_safe_above"] = pose_snapshot(
                 self, target, "after_safe_above"
@@ -3285,6 +3575,9 @@ class PickAndPlaceExecutor:
                 actual_object_pos = target["world_pos"]
             
             attempt_log["actual_object_pos"] = json_safe(actual_object_pos)
+            if isinstance(attempt_log.get("target_lock"), dict):
+                attempt_log["target_lock"]["live_target_pos_used_for_replanning_after_safe_above"] = json_safe(actual_object_pos)
+                attempt_log["target_lock"]["replanned_after_safe_above"] = True
             attempt_log["retry_used_refreshed_pose_after_safe_above"] = True
             attempt_log["snapshots"]["after_safe_above_object_refresh"] = pose_snapshot(
                 self, target, "after_safe_above_object_refresh"
@@ -3349,6 +3642,17 @@ class PickAndPlaceExecutor:
                 return False
 
             print("[Executor] ✅ Reached pre_grasp.")
+            pre_tracking_ok, _pre_tracking = await self._verify_waypoint_tracking_or_fail(
+                attempt_log=attempt_log,
+                trial_log=trial_log,
+                pick_result=pick_result,
+                waypoint_name="pre_grasp",
+                final_reason="arm_tracking_failed_before_grasp",
+                max_error_m=float(self.config.get("max_pregrasp_flange_tracking_error_m", 0.020)),
+            )
+            if not pre_tracking_ok:
+                return False
+
             attempt_log["pre_grasp_ok"] = True
 
             print("\n[Executor] Moving to grasp pose...")
@@ -3367,6 +3671,17 @@ class PickAndPlaceExecutor:
                 return False
 
             print("[Executor] ✅ Reached grasp pose.")
+            grasp_tracking_ok, _grasp_tracking = await self._verify_waypoint_tracking_or_fail(
+                attempt_log=attempt_log,
+                trial_log=trial_log,
+                pick_result=pick_result,
+                waypoint_name="grasp",
+                final_reason="arm_tracking_failed_before_close",
+                max_error_m=float(self.config.get("max_grasp_flange_tracking_error_m", 0.010)),
+            )
+            if not grasp_tracking_ok:
+                return False
+
             attempt_log["grasp_ok"] = True
             attempt_log["snapshots"]["at_grasp_before_preclose"] = pose_snapshot(
                 self, target, "at_grasp_before_preclose"
@@ -4049,6 +4364,15 @@ class PickAndPlaceExecutor:
                                     shear_reference=transport_shear_reference,
                                 )
                                 attempt_log["place_transport_shear_preload"] = json_safe(transport_preload)
+                                if bool(self.config.get("place_transport_abort_if_preload_force_unavailable", True)) and isinstance(transport_preload, dict) and transport_preload.get("aborted"):
+                                    reason = transport_preload.get("abort_reason", "transport_preload_force_unavailable")
+                                    print(f"[Executor] ❌ Transport preload aborted before motion: {reason}")
+                                    attempt_log["failure_reason"] = "transport_preload_force_unavailable"
+                                    trial_log["attempts"].append(attempt_log)
+                                    trial_log["trial_success"] = False
+                                    trial_log["final_reason"] = "transport_preload_force_unavailable"
+                                    self._last_trial_log = trial_log
+                                    return False
 
                         transport_target_effort_override = None
                         if isinstance(transport_shear_reference, dict) and transport_shear_reference.get("success"):
@@ -4231,6 +4555,34 @@ class PickAndPlaceExecutor:
                                 target, stage_name="before_place_lowering"
                             )
 
+                            # Phase 4.2b: safe-hover lowering, not full table contact yet.
+                            # The first Phase 4.2 logs showed that forcing the still-held
+                            # soft cube all the way to the table produced vertical creep/slip
+                            # during lowering.  We therefore interpolate only partway from
+                            # the current transport pose to the full place pose.  Phase 4.3
+                            # will handle controlled release/table contact separately.
+                            try:
+                                lowering_fraction = float(self.config.get("place_lowering_fraction_to_place", 1.0))
+                            except Exception:
+                                lowering_fraction = 1.0
+                            lowering_fraction = max(0.0, min(1.0, lowering_fraction))
+                            full_place_lowering_target = list(place_lowering_target)
+                            if lowering_fraction < 0.999:
+                                current_lowering_start = list(self.arm.get_joint_targets_deg())
+                                place_lowering_target = [
+                                    float(c) + lowering_fraction * (float(t) - float(c))
+                                    for c, t in zip(current_lowering_start, full_place_lowering_target)
+                                ]
+                                lowering_plan_log.update({
+                                    "safe_hover_lowering_enabled": True,
+                                    "lowering_fraction_to_place": lowering_fraction,
+                                    "full_place_target_joints_deg": full_place_lowering_target,
+                                    "start_joints_deg": current_lowering_start,
+                                    "target_joints_deg": place_lowering_target,
+                                    "design_intent": "lower toward the table but stop at a safe hover while still holding; release/table contact is deferred to Phase 4.3",
+                                })
+                                attempt_log["place_lowering_plan"] = json_safe(lowering_plan_log)
+
                             lowering_step_callback = self.gripper.update
                             lowering_admittance = None
                             if bool(self.config.get("place_lowering_admittance_enabled", True)):
@@ -4238,6 +4590,9 @@ class PickAndPlaceExecutor:
                                 old_extra = self.config.get("place_transport_admittance_max_extra_close_m")
                                 old_delta = self.config.get("place_transport_admittance_delta_step_m")
                                 old_stride = self.config.get("place_transport_admittance_sample_stride_frames")
+                                old_min_gap = self.config.get("place_transport_min_table_gap_during_hold_m")
+                                old_abort_table = self.config.get("place_transport_abort_on_table_drop")
+                                old_critical_slip = self.config.get("place_transport_slip_critical_relative_drift_m")
                                 try:
                                     self.config["place_transport_admittance_max_extra_close_m"] = float(
                                         self.config.get("place_lowering_admittance_max_extra_close_m", 0.00025)
@@ -4247,6 +4602,18 @@ class PickAndPlaceExecutor:
                                     )
                                     self.config["place_transport_admittance_sample_stride_frames"] = int(
                                         self.config.get("place_lowering_admittance_sample_stride_frames", 4)
+                                    )
+                                    # During intentional lowering, a small positive table gap is not a drop;
+                                    # the object is supposed to approach the table.  Abort only on real
+                                    # penetration/unsafe table contact, not at 1 cm clearance.
+                                    self.config["place_transport_min_table_gap_during_hold_m"] = float(
+                                        self.config.get("place_lowering_abort_min_table_gap_m", -0.003)
+                                    )
+                                    self.config["place_transport_abort_on_table_drop"] = bool(
+                                        self.config.get("place_lowering_abort_on_table_drop", True)
+                                    )
+                                    self.config["place_transport_slip_critical_relative_drift_m"] = float(
+                                        self.config.get("place_lowering_slip_critical_relative_drift_m", 0.020)
                                     )
                                     lowering_step_callback, lowering_admittance = (
                                         self._make_transport_admittance_step_callback(
@@ -4267,6 +4634,12 @@ class PickAndPlaceExecutor:
                                         self.config["place_transport_admittance_delta_step_m"] = old_delta
                                     if old_stride is not None:
                                         self.config["place_transport_admittance_sample_stride_frames"] = old_stride
+                                    if old_min_gap is not None:
+                                        self.config["place_transport_min_table_gap_during_hold_m"] = old_min_gap
+                                    if old_abort_table is not None:
+                                        self.config["place_transport_abort_on_table_drop"] = old_abort_table
+                                    if old_critical_slip is not None:
+                                        self.config["place_transport_slip_critical_relative_drift_m"] = old_critical_slip
 
                             lowering_duration = float(self.config.get("place_lowering_duration", 2.6))
                             lowering_steps = int(self.config.get("place_lowering_steps", 156))

@@ -180,6 +180,19 @@ def selected_config_snapshot(config: dict) -> Dict[str, Any]:
         "place_lowering_admittance_max_extra_close_m",
         "place_lowering_admittance_delta_step_m",
         "place_lowering_admittance_sample_stride_frames",
+        "enable_target_stability_check_before_planning",
+        "target_stability_sample_seconds",
+        "target_stability_max_drift_m",
+        "target_stability_max_xy_drift_m",
+        "post_motion_tracking_check_settle_seconds",
+        "max_safe_above_flange_tracking_error_m",
+        "max_pregrasp_flange_tracking_error_m",
+        "max_grasp_flange_tracking_error_m",
+        "max_waypoint_flange_tracking_error_m",
+        "enable_retry_disturbance_gate",
+        "retry_block_after_disturbed_micro_lift",
+        "retry_abort_object_displacement_threshold_m",
+        "retry_abort_object_horizontal_displacement_threshold_m",
     ]
     snap = {k: config.get(k) for k in keys if k in config}
 
