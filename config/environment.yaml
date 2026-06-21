@@ -389,7 +389,7 @@ table_zones:
   place_zone:
     label: place_zone
     role: target_placement_region
-    local_xy_m: [-0.07, 0.25]
+    local_xy_m: [-0.07, 0.23]
     size_xy_m: [0.08, 0.08]
     color: [0.10, 0.80, 0.20]
     cross_color: [1.00, 1.00, 1.00]
@@ -629,3 +629,35 @@ place_transport_use_oriented_shape_for_deformation: true
 place_transport_max_width_ratio: 1.48
 place_transport_max_deformation_score: 0.48
 place_transport_fail_on_excessive_deformation: true
+
+# ───────────── PHASE 4.2: GENTLE LOWERING WHILE STILL HOLDING ─────────────
+# Phase 4.1i passed held transport.  Remaining slip is small but visible.
+# Reduce lateral transport distance slightly by moving the place zone closer,
+# slow transport only slightly, then add a no-release lowering stage.
+place_transport_duration: 4.30
+place_transport_steps: 258
+post_place_transport_settle_seconds: 0.45
+
+# Enable Phase 4.2.  The robot lowers the held object near the table over the
+# place zone, validates pose/shape/effort, and still does NOT open the gripper.
+enable_place_lowering_test: true
+place_lowering_waypoint: place
+place_lowering_duration: 2.60
+place_lowering_steps: 156
+post_place_lowering_settle_seconds: 0.45
+place_lowering_xy_tolerance_m: 0.075
+place_lowering_max_flange_object_distance_m: 0.30
+place_lowering_min_bottom_clearance_m: -0.004
+place_lowering_max_bottom_clearance_m: 0.045
+place_lowering_min_grip_effort_sim: 0.10
+place_lowering_use_oriented_shape_for_deformation: true
+place_lowering_max_width_ratio: 1.56
+place_lowering_max_deformation_score: 0.56
+place_lowering_fail_on_excessive_deformation: true
+
+# During lowering we mostly hold the achieved shear preload.  Use only tiny
+# residual corrections; lowering is not the moment to chase slip aggressively.
+place_lowering_admittance_enabled: true
+place_lowering_admittance_max_extra_close_m: 0.00025
+place_lowering_admittance_delta_step_m: 0.000025
+place_lowering_admittance_sample_stride_frames: 4

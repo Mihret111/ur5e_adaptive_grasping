@@ -163,6 +163,23 @@ def selected_config_snapshot(config: dict) -> Dict[str, Any]:
         "place_transport_shear_audit_mu_candidates",
         "place_transport_shear_audit_safety_factor",
         "place_transport_shear_audit_assumed_normal_axis_local",
+        "enable_place_lowering_test",
+        "place_lowering_waypoint",
+        "place_lowering_duration",
+        "place_lowering_steps",
+        "post_place_lowering_settle_seconds",
+        "place_lowering_xy_tolerance_m",
+        "place_lowering_max_flange_object_distance_m",
+        "place_lowering_min_bottom_clearance_m",
+        "place_lowering_max_bottom_clearance_m",
+        "place_lowering_min_grip_effort_sim",
+        "place_lowering_use_oriented_shape_for_deformation",
+        "place_lowering_max_width_ratio",
+        "place_lowering_max_deformation_score",
+        "place_lowering_admittance_enabled",
+        "place_lowering_admittance_max_extra_close_m",
+        "place_lowering_admittance_delta_step_m",
+        "place_lowering_admittance_sample_stride_frames",
     ]
     snap = {k: config.get(k) for k in keys if k in config}
 

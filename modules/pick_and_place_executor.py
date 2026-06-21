@@ -2564,6 +2564,217 @@ class PickAndPlaceExecutor:
         result["success"] = len(result["reasons"]) == 0
         return result
 
+    def validate_after_place_lowering(
+        self,
+        *,
+        target: dict,
+        place_zone: dict,
+        object_pos_before_lowering,
+        object_pos_after_lowering,
+        table_height: float,
+    ) -> dict:
+        """Validate Phase 4.2 gentle lowering while still holding the object.
+
+        This still does not validate release.  It checks that the object is near
+        the semantic place zone, close to the table, not deeply penetrating, and
+        still held with nonzero force-like feedback.
+        """
+        flange_pos = self.arm.get_flange_world_pos()
+        soft_obs_after = self._observe_target(target, stage_name="after_place_lowering_validation")
+        force_obs_after = None
+        try:
+            force_obs_after = (
+                self.force_observer.observe(stage_name="after_place_lowering_validation")
+                if hasattr(self, "force_observer") else None
+            )
+        except Exception as e:
+            force_obs_after = {"available": False, "reason": f"force_observer_exception: {e}"}
+
+        result = {
+            "stage": "after_place_lowering",
+            "phase": "4.2_lower_to_table_no_release",
+            "validation_mode": "soft_bbox" if self._is_soft_target(target) else "rigid_root",
+            "gripper_has_object": self.gripper.has_object(),
+            "place_zone": place_zone,
+            "object_pos_before_lowering": object_pos_before_lowering,
+            "object_pos_after_lowering": object_pos_after_lowering,
+            "soft_observation_after": soft_obs_after,
+            "force_observation_after": force_obs_after,
+            "flange_pos": flange_pos,
+            "place_zone_xy_error_m": None,
+            "object_lowering_delta_z_m": None,
+            "flange_object_distance": None,
+            "bottom_clearance_m": None,
+            "grip_effort_sim": None,
+            "thresholds": {},
+            "warnings": [],
+            "success": False,
+            "reasons": [],
+        }
+
+        if object_pos_after_lowering is None:
+            result["reasons"].append("missing object pose after place lowering")
+            return result
+
+        world_center = place_zone.get("world_center") or []
+        if len(world_center) < 2:
+            result["reasons"].append("place zone world center unavailable")
+            return result
+
+        dx = float(object_pos_after_lowering[0]) - float(world_center[0])
+        dy = float(object_pos_after_lowering[1]) - float(world_center[1])
+        xy_err = (dx * dx + dy * dy) ** 0.5
+        result["place_zone_xy_error_m"] = xy_err
+
+        if object_pos_before_lowering is not None:
+            result["object_lowering_delta_z_m"] = (
+                float(object_pos_after_lowering[2]) - float(object_pos_before_lowering[2])
+            )
+
+        if flange_pos is not None:
+            result["flange_object_distance"] = self._distance(object_pos_after_lowering, flange_pos)
+
+        bottom_clearance = None
+        if isinstance(soft_obs_after, dict):
+            bottom_clearance = soft_obs_after.get("bottom_clearance_m")
+            if bottom_clearance is None:
+                bottom_clearance = soft_obs_after.get("table_gap_m")
+            try:
+                bottom_clearance = float(bottom_clearance)
+            except Exception:
+                bottom_clearance = None
+        if bottom_clearance is None:
+            try:
+                bottom_clearance = float(object_pos_after_lowering[2]) - float(table_height)
+            except Exception:
+                bottom_clearance = None
+        result["bottom_clearance_m"] = bottom_clearance
+
+        effort = None
+        if isinstance(force_obs_after, dict):
+            try:
+                effort = float(force_obs_after.get("grip_effort_sim"))
+            except Exception:
+                effort = None
+        result["grip_effort_sim"] = effort
+
+        tolerance = float(self.config.get("place_lowering_xy_tolerance_m", self.config.get("place_transport_xy_tolerance_m", 0.075)))
+        max_flange_dist = float(self.config.get("place_lowering_max_flange_object_distance_m", 0.30))
+        min_bottom_clearance = float(self.config.get("place_lowering_min_bottom_clearance_m", -0.004))
+        max_bottom_clearance = float(self.config.get("place_lowering_max_bottom_clearance_m", 0.045))
+        min_effort = float(self.config.get("place_lowering_min_grip_effort_sim", 0.10))
+        max_width_ratio = float(self.config.get("place_lowering_max_width_ratio", self.config.get("place_transport_max_width_ratio", 1.56)))
+        max_deformation_score = float(self.config.get("place_lowering_max_deformation_score", self.config.get("place_transport_max_deformation_score", 0.56)))
+        fail_on_deformation = bool(self.config.get("place_lowering_fail_on_excessive_deformation", True))
+        result["thresholds"].update({
+            "place_lowering_xy_tolerance_m": tolerance,
+            "place_lowering_max_flange_object_distance_m": max_flange_dist,
+            "place_lowering_min_bottom_clearance_m": min_bottom_clearance,
+            "place_lowering_max_bottom_clearance_m": max_bottom_clearance,
+            "place_lowering_min_grip_effort_sim": min_effort,
+            "place_lowering_max_width_ratio": max_width_ratio,
+            "place_lowering_max_deformation_score": max_deformation_score,
+            "place_lowering_fail_on_excessive_deformation": fail_on_deformation,
+        })
+
+        if isinstance(soft_obs_after, dict):
+            wx_ratio = soft_obs_after.get("width_ratio_x")
+            wy_ratio = soft_obs_after.get("width_ratio_y")
+            height = soft_obs_after.get("height_m")
+            nominal_h = float(self.config.get("adaptive_safety_nominal_height_m", 0.040))
+            height_ratio = None
+            try:
+                if height is not None and nominal_h > 1.0e-9:
+                    height_ratio = float(height) / nominal_h
+            except Exception:
+                height_ratio = None
+
+            world_ratios = []
+            for v in (wx_ratio, wy_ratio, height_ratio):
+                try:
+                    if v is not None:
+                        world_ratios.append(float(v))
+                except Exception:
+                    pass
+            world_max_ratio = max(world_ratios) if world_ratios else None
+            world_deformation_score = max(abs(r - 1.0) for r in world_ratios) if world_ratios else None
+
+            use_oriented = bool(self.config.get("place_lowering_use_oriented_shape_for_deformation", True))
+            oriented_max_ratio = soft_obs_after.get("oriented_max_ratio")
+            oriented_ratio_sorted = soft_obs_after.get("oriented_ratio_sorted")
+            oriented_bbox = soft_obs_after.get("oriented_bbox")
+
+            max_ratio = world_max_ratio
+            deformation_score = soft_obs_after.get("deformation_score")
+            shape_metric_source = "world_aabb"
+            if use_oriented and oriented_max_ratio is not None:
+                try:
+                    max_ratio = float(oriented_max_ratio)
+                    deformation_score = abs(max_ratio - 1.0)
+                    shape_metric_source = "pca_oriented_bbox"
+                except Exception:
+                    pass
+            if deformation_score is None:
+                deformation_score = world_deformation_score
+
+            result["lowering_shape_safety"] = {
+                "shape_metric_source": shape_metric_source,
+                "world_aabb_max_dimension_ratio": world_max_ratio,
+                "world_aabb_deformation_score_proxy": world_deformation_score,
+                "oriented_max_ratio": oriented_max_ratio,
+                "oriented_ratio_sorted": oriented_ratio_sorted,
+                "oriented_bbox": oriented_bbox,
+                "max_dimension_ratio": max_ratio,
+                "deformation_score_proxy": deformation_score,
+                "interpretation": "Lowering validation keeps the object held near table while separating rotation from true deformation.",
+            }
+            if max_ratio is not None and max_ratio > max_width_ratio:
+                msg = f"soft object stretched during lowering: max_ratio={max_ratio:.3f} > {max_width_ratio:.3f}"
+                if fail_on_deformation:
+                    result["reasons"].append(msg)
+                else:
+                    result["warnings"].append(msg)
+            if deformation_score is not None:
+                try:
+                    ds = float(deformation_score)
+                    if ds > max_deformation_score:
+                        msg = f"lowering deformation score high: {ds:.3f} > {max_deformation_score:.3f}"
+                        if fail_on_deformation:
+                            result["reasons"].append(msg)
+                        else:
+                            result["warnings"].append(msg)
+                except Exception:
+                    pass
+
+        if not result["gripper_has_object"]:
+            result["reasons"].append("gripper_has_object false after place lowering")
+        if xy_err > tolerance:
+            result["reasons"].append(
+                f"object not above place zone after lowering: xy_error={xy_err:.3f} > {tolerance:.3f}"
+            )
+        if result["flange_object_distance"] is not None and result["flange_object_distance"] > max_flange_dist:
+            result["reasons"].append(
+                f"object too far from flange after lowering: {result['flange_object_distance']:.3f} > {max_flange_dist:.3f}"
+            )
+        if bottom_clearance is not None:
+            if bottom_clearance < min_bottom_clearance:
+                result["reasons"].append(
+                    f"object penetrated table during lowering: bottom_clearance={bottom_clearance:.4f} < {min_bottom_clearance:.4f}"
+                )
+            if bottom_clearance > max_bottom_clearance:
+                result["reasons"].append(
+                    f"object not lowered close enough to table: bottom_clearance={bottom_clearance:.4f} > {max_bottom_clearance:.4f}"
+                )
+        else:
+            result["warnings"].append("bottom clearance unavailable after lowering")
+        if effort is not None and effort < min_effort:
+            result["reasons"].append(
+                f"grip effort too low after lowering: {effort:.3f} < {min_effort:.3f}"
+            )
+
+        result["success"] = len(result["reasons"]) == 0
+        return result
+
     # Method to get last trial log as .json file and write it to the output directory with a timestamp and create the dir if not exists
     def get_last_trial_log(self):
         return json_safe(getattr(self, "_last_trial_log", None))
@@ -2938,6 +3149,9 @@ class PickAndPlaceExecutor:
                 "place_transport_shear_reference": None,
                 "place_transport_shear_preload": None,
                 "place_transport_validation": None,
+                "place_lowering_plan": None,
+                "place_lowering_admittance": None,
+                "place_lowering_validation": None,
                 "gripper_diagnostics_after_close": None,
                 "gripper_diagnostics_after_micro_lift": None,
                 "gripper_diagnostics_after_lift": None,
@@ -3985,6 +4199,161 @@ class PickAndPlaceExecutor:
                             return False
 
                         print("[Executor] ✅ Phase 4.1 transport passed: object held above place zone.")
+
+                        # ──── Phase 4.2: gentle lowering while still holding, no release ────
+                        if bool(self.config.get("enable_place_lowering_test", False)):
+                            print("\n[Executor] Phase 4.2: gently lowering held object near table, release disabled...")
+                            lowering_waypoint_name = str(self.config.get("place_lowering_waypoint", "place"))
+                            place_lowering_target = place_joints.get(lowering_waypoint_name)
+                            lowering_plan_log = {
+                                "phase": "4.2_lower_to_table_no_release",
+                                "waypoint_name": lowering_waypoint_name,
+                                "planning_failed": False,
+                                "reason": None,
+                                "target_joints_deg": place_lowering_target,
+                                "release_enabled": False,
+                                "design_intent": "lower the already-held object close to table while maintaining shear-aware grip; do not open gripper yet",
+                            }
+                            attempt_log["place_lowering_plan"] = json_safe(lowering_plan_log)
+
+                            if place_lowering_target is None:
+                                print("[Executor] ❌ Place lowering planning failed: missing lowering waypoint.")
+                                lowering_plan_log["planning_failed"] = True
+                                lowering_plan_log["reason"] = "missing_place_lowering_waypoint"
+                                attempt_log["place_lowering_plan"] = json_safe(lowering_plan_log)
+                                attempt_log["failure_reason"] = "place_lowering_planning_failed"
+                                trial_log["attempts"].append(attempt_log)
+                                trial_log["final_reason"] = "place_lowering_planning_failed"
+                                self._last_trial_log = trial_log
+                                return False
+
+                            object_pos_before_lowering = self._get_observed_object_pos(
+                                target, stage_name="before_place_lowering"
+                            )
+
+                            lowering_step_callback = self.gripper.update
+                            lowering_admittance = None
+                            if bool(self.config.get("place_lowering_admittance_enabled", True)):
+                                # Temporarily use smaller residual lowering correction limits.
+                                old_extra = self.config.get("place_transport_admittance_max_extra_close_m")
+                                old_delta = self.config.get("place_transport_admittance_delta_step_m")
+                                old_stride = self.config.get("place_transport_admittance_sample_stride_frames")
+                                try:
+                                    self.config["place_transport_admittance_max_extra_close_m"] = float(
+                                        self.config.get("place_lowering_admittance_max_extra_close_m", 0.00025)
+                                    )
+                                    self.config["place_transport_admittance_delta_step_m"] = float(
+                                        self.config.get("place_lowering_admittance_delta_step_m", 0.000025)
+                                    )
+                                    self.config["place_transport_admittance_sample_stride_frames"] = int(
+                                        self.config.get("place_lowering_admittance_sample_stride_frames", 4)
+                                    )
+                                    lowering_step_callback, lowering_admittance = (
+                                        self._make_transport_admittance_step_callback(
+                                            target=target,
+                                            target_effort_override_sim=transport_target_effort_override,
+                                            shear_reference=transport_shear_reference,
+                                        )
+                                    )
+                                    lowering_admittance["phase"] = "4.2_lowering_admittance_hold"
+                                    lowering_admittance["controller_phase_note"] = (
+                                        "reuse shear-aware transport admittance with smaller correction limits during vertical lowering"
+                                    )
+                                    attempt_log["place_lowering_admittance"] = json_safe(lowering_admittance)
+                                finally:
+                                    if old_extra is not None:
+                                        self.config["place_transport_admittance_max_extra_close_m"] = old_extra
+                                    if old_delta is not None:
+                                        self.config["place_transport_admittance_delta_step_m"] = old_delta
+                                    if old_stride is not None:
+                                        self.config["place_transport_admittance_sample_stride_frames"] = old_stride
+
+                            lowering_duration = float(self.config.get("place_lowering_duration", 2.6))
+                            lowering_steps = int(self.config.get("place_lowering_steps", 156))
+                            ok_lower = await self.arm.move_to(
+                                place_lowering_target,
+                                duration=lowering_duration,
+                                steps=lowering_steps,
+                                check_table_collision=True,
+                                step_callback=lowering_step_callback,
+                            )
+                            if lowering_admittance is not None:
+                                lowering_admittance["move_completed"] = bool(ok_lower)
+                                lowering_admittance["duration_s"] = lowering_duration
+                                lowering_admittance["steps"] = lowering_steps
+                                attempt_log["place_lowering_admittance"] = json_safe(lowering_admittance)
+
+                            if not ok_lower:
+                                print("[Executor] ❌ Place lowering motion failed.")
+                                attempt_log["failure_reason"] = "place_lowering_motion_failed"
+                                trial_log["attempts"].append(attempt_log)
+                                trial_log["final_reason"] = "place_lowering_motion_failed"
+                                self._last_trial_log = trial_log
+                                return False
+
+                            await self._step_gripper_for_seconds(
+                                float(self.config.get("post_place_lowering_settle_seconds", 0.45))
+                            )
+
+                            if lowering_admittance is not None:
+                                try:
+                                    lowering_admittance["post_lowering_force_observation"] = json_safe(
+                                        self.force_observer.observe(stage_name="after_place_lowering_settle")
+                                        if hasattr(self, "force_observer") else None
+                                    )
+                                except Exception as e:
+                                    lowering_admittance["post_lowering_force_observation"] = {
+                                        "available": False,
+                                        "reason": f"force_observer_exception: {e}",
+                                    }
+                                try:
+                                    lowering_admittance["post_lowering_soft_observation"] = json_safe(
+                                        self._observe_target(target, stage_name="after_place_lowering_settle")
+                                    )
+                                except Exception as e:
+                                    lowering_admittance["post_lowering_soft_observation"] = {
+                                        "available": False,
+                                        "reason": f"soft_observer_exception: {e}",
+                                    }
+                                attempt_log["place_lowering_admittance"] = json_safe(lowering_admittance)
+
+                            object_pos_after_lowering = self._get_observed_object_pos(
+                                target, stage_name="after_place_lowering"
+                            )
+                            place_lowering_validation = self.validate_after_place_lowering(
+                                target=target,
+                                place_zone=place_goal.get("place_zone", {}),
+                                object_pos_before_lowering=object_pos_before_lowering,
+                                object_pos_after_lowering=object_pos_after_lowering,
+                                table_height=table_height,
+                            )
+                            print("\n[Executor] Place lowering validation:")
+                            print(place_lowering_validation)
+                            attempt_log["place_lowering_validation"] = json_safe(place_lowering_validation)
+                            attempt_log["events"].append(
+                                make_event(
+                                    "place_lowering_validation_done",
+                                    success=place_lowering_validation.get("success"),
+                                    reasons=place_lowering_validation.get("reasons", []),
+                                )
+                            )
+
+                            if not place_lowering_validation.get("success"):
+                                print("[Executor] ❌ Place lowering validation failed.")
+                                attempt_log["failure_reason"] = "place_lowering_validation_failed"
+                                trial_log["attempts"].append(attempt_log)
+                                trial_log["final_reason"] = "place_lowering_validation_failed"
+                                self._last_trial_log = trial_log
+                                return False
+
+                            print("[Executor] ✅ Phase 4.2 lowering passed: object held near table, release disabled.")
+                            attempt_log["success"] = True
+                            trial_log["trial_success"] = True
+                            trial_log["final_reason"] = "place_lowering_validation_passed_release_disabled"
+                            trial_log["attempts"].append(attempt_log)
+                            self._last_trial_log = trial_log
+                            return True
+
                         attempt_log["success"] = True
                         trial_log["trial_success"] = True
                         trial_log["final_reason"] = "place_transport_validation_passed_release_disabled"
