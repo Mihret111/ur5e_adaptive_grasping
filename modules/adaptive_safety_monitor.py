@@ -76,7 +76,7 @@ class AdaptiveSafetyMonitor:
     def __init__(self, config: Dict[str, Any]):
         self.config = config or {}
 
-    def _nominal_dimensions(self, soft_obs: Optional[Dict[str, Any]]) -> Dict[str, Optional[float]]:
+    def _nominal_dimensions(self, soft_obs: Optional[Dict[str, Any]], context: Optional[Dict[str, Any]] = None) -> Dict[str, Optional[float]]:
         """Resolve nominal object dimensions used for ratio calculations.
 
         SoftObjectObserver may provide nominal_width_m but not nominal_height_m.
@@ -86,18 +86,31 @@ class AdaptiveSafetyMonitor:
         """
         cfg = self.config
         soft_obs = soft_obs or {}
+        context = context or {}
+        context_nominal = context.get("nominal_dimensions_m") if isinstance(context, dict) else None
+        if not isinstance(context_nominal, dict):
+            context_nominal = {}
 
         nominal_width = _ffloat(
-            soft_obs.get("nominal_width_m"),
-            _ffloat(cfg.get("adaptive_safety_nominal_width_m"), _ffloat(cfg.get("soft_object_nominal_width_m"), 0.04)),
+            context_nominal.get("nominal_width_x_m"),
+            _ffloat(
+                soft_obs.get("nominal_width_m"),
+                _ffloat(cfg.get("adaptive_safety_nominal_width_m"), _ffloat(cfg.get("soft_object_nominal_width_m"), 0.04)),
+            ),
         )
         nominal_depth = _ffloat(
-            soft_obs.get("nominal_depth_m"),
-            _ffloat(cfg.get("adaptive_safety_nominal_depth_m"), nominal_width),
+            context_nominal.get("nominal_width_y_m"),
+            _ffloat(
+                soft_obs.get("nominal_depth_m"),
+                _ffloat(cfg.get("adaptive_safety_nominal_depth_m"), nominal_width),
+            ),
         )
         nominal_height = _ffloat(
-            soft_obs.get("nominal_height_m"),
-            _ffloat(cfg.get("adaptive_safety_nominal_height_m"), nominal_width),
+            context_nominal.get("nominal_height_m"),
+            _ffloat(
+                soft_obs.get("nominal_height_m"),
+                _ffloat(cfg.get("adaptive_safety_nominal_height_m"), nominal_width),
+            ),
         )
         return {
             "nominal_width_x_m": nominal_width,
@@ -116,13 +129,14 @@ class AdaptiveSafetyMonitor:
         cfg = self.config
 
         max_effort = _ffloat(
-            cfg.get("adaptive_safety_max_effort_sim", cfg.get("adaptive_effort_max_sim", 1.20)),
-            1.20,
+            context.get("max_effort_sim"),
+            _ffloat(cfg.get("adaptive_safety_max_effort_sim", cfg.get("adaptive_effort_max_sim", 1.20)), 1.20),
         )
         warn_effort = _ffloat(
-            cfg.get("adaptive_safety_warn_effort_sim", 0.85 * max_effort),
-            0.85 * max_effort,
+            context.get("warn_effort_sim"),
+            _ffloat(cfg.get("adaptive_safety_warn_effort_sim", 0.85 * max_effort), 0.85 * max_effort),
         )
+        effort_safety_enabled = bool(context.get("effort_safety_enabled", True))
 
         # Deformation thresholds.
         max_compression = _ffloat(cfg.get("adaptive_safety_max_compression_ratio", 0.25), 0.25)
@@ -159,7 +173,7 @@ class AdaptiveSafetyMonitor:
         table_gap = None
         pose_source = None
         soft_available = False
-        nominal = self._nominal_dimensions(soft_obs if isinstance(soft_obs, dict) else None)
+        nominal = self._nominal_dimensions(soft_obs if isinstance(soft_obs, dict) else None, context=context)
 
         if soft_obs and isinstance(soft_obs, dict):
             soft_available = soft_obs.get("center") is not None or soft_obs.get("pose_source") is not None
@@ -208,12 +222,14 @@ class AdaptiveSafetyMonitor:
 
         effort_state = "unknown"
         if effort is not None:
-            if max_effort is not None and effort >= max_effort:
+            if effort_safety_enabled and max_effort is not None and effort >= max_effort:
                 unsafe_reasons.append(f"effort {effort:.4f} >= max {max_effort:.4f}")
                 effort_state = "unsafe_high"
             elif warn_effort is not None and effort >= warn_effort:
+                # If effort safety is disabled for a declared high-force cage,
+                # retain this as an explanation/warning instead of a hard unsafe.
                 warnings.append(f"effort {effort:.4f} >= warn {warn_effort:.4f}")
-                effort_state = "warning_high"
+                effort_state = "warning_high_effort_policy_disabled" if not effort_safety_enabled else "warning_high"
             elif contact_like:
                 effort_state = "contact_like_safe"
             else:
@@ -326,6 +342,7 @@ class AdaptiveSafetyMonitor:
             "thresholds": {
                 "max_effort_sim": max_effort,
                 "warn_effort_sim": warn_effort,
+                "effort_safety_enabled": effort_safety_enabled,
                 "max_compression_ratio": max_compression,
                 "warn_compression_ratio": warn_compression,
                 "min_height_ratio": min_height_ratio,

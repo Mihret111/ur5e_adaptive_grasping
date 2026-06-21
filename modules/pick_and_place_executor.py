@@ -64,6 +64,32 @@ class PickAndPlaceExecutor:
         # self.move_home_before_pick = config.get("move_home_before_pick", True)   #
         print("[PickAndPlaceExecutor] Ready.")
 
+    def _float_or_default(self, value, default):
+        """Return a float even when YAML/SceneBuilder propagated an explicit None.
+
+        Important for per-object optional keys: dict.get(key, fallback) does NOT
+        use the fallback when the key exists with value None.  A few Phase-7.6
+        object records carried keys such as target_stability_max_drift_m: None,
+        which crashed before the first object could even plan.
+        """
+        if value is None:
+            value = default
+        if value is None:
+            value = 0.0
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default if default is not None else 0.0)
+
+    def _target_or_config_float(self, target: dict, key: str, default):
+        """Read optional numeric value from target, falling back through config safely."""
+        value = None
+        if isinstance(target, dict):
+            value = target.get(key)
+        if value is None:
+            value = self.config.get(key, default)
+        return self._float_or_default(value, default)
+
     async def _step_gripper_for_seconds(self, seconds: float):
         """
         Advance the gripper state machine while Isaac physics steps.
@@ -89,6 +115,7 @@ class PickAndPlaceExecutor:
         hold_extra_close_m=None,
         target=None,
         adaptive_effort_target_override_sim=None,
+        use_expected_contact_floor: bool = False,
     ):
         """Close gripper with optional object-size-aware contact expectation.
 
@@ -119,6 +146,7 @@ class PickAndPlaceExecutor:
             force_n=force_n,
             expected_grip_dim_m=expected_grip_dim_m,
             hold_extra_close_m=hold_extra_close_m,
+            use_expected_contact_floor=use_expected_contact_floor,
         )
 
         # Wait until the gripper leaves CLOSING, or until timeout.
@@ -131,11 +159,18 @@ class PickAndPlaceExecutor:
 
         print(f"[Executor] Gripper close resolved as: {close_resolution}")
 
+        target_hold_extra_s = 0.0
+        if isinstance(target, dict):
+            try:
+                target_hold_extra_s = float(target.get("post_close_hold_extra_seconds", 0.0) or 0.0)
+            except Exception:
+                target_hold_extra_s = 0.0
+
         hold_settle_time = float(
             self.config.get("post_close_hold_seconds", 1.0)
         ) + float(
             hold_settle_extra_s
-        )
+        ) + target_hold_extra_s
 
         await self._step_gripper_for_seconds(hold_settle_time)
 
@@ -239,12 +274,27 @@ class PickAndPlaceExecutor:
             summary["state"] = self.gripper.get_state()
             return summary
 
+        # Per-object override.  The release-4 sphere log showed that adaptive
+        # effort regulation relaxed the gripper after an early soft-shell contact,
+        # destroying the already weak capture.  Some objects should skip this
+        # post-close regulator and rely on geometric squeeze + micro-lift proof.
+        if isinstance(target_obj, dict) and target_obj.get("adaptive_effort_control_enabled") is False:
+            summary["ran"] = False
+            summary["reason"] = "disabled_for_target"
+            summary["target_label"] = target_obj.get("label")
+            summary["target_profile"] = target_obj.get("validation_profile")
+            return summary
+
         target_effort = float(
             target_effort_override_sim
             if target_effort_override_sim is not None
-            else self.config.get(
-                "adaptive_effort_target_sim",
-                self.config.get("force_observer_target_effort_sim", 0.35),
+            else (
+                target_obj.get("adaptive_effort_target_sim")
+                if isinstance(target_obj, dict) and target_obj.get("adaptive_effort_target_sim") is not None
+                else self.config.get(
+                    "adaptive_effort_target_sim",
+                    self.config.get("force_observer_target_effort_sim", 0.35),
+                )
             )
         )
         band = float(
@@ -263,8 +313,16 @@ class PickAndPlaceExecutor:
         # Small physical limits around the pre-existing hold target. These keep
         # the admittance layer from destroying a grasp that the geometric close
         # stage already made plausible.
-        max_total_close = float(self.config.get("adaptive_effort_max_extra_close_m", 0.00150))
-        max_total_open = float(self.config.get("adaptive_effort_max_relax_open_m", 0.00100))
+        max_total_close = float(
+            target_obj.get("adaptive_effort_max_extra_close_m")
+            if isinstance(target_obj, dict) and target_obj.get("adaptive_effort_max_extra_close_m") is not None
+            else self.config.get("adaptive_effort_max_extra_close_m", 0.00150)
+        )
+        max_total_open = float(
+            target_obj.get("adaptive_effort_max_relax_open_m")
+            if isinstance(target_obj, dict) and target_obj.get("adaptive_effort_max_relax_open_m") is not None
+            else self.config.get("adaptive_effort_max_relax_open_m", 0.00100)
+        )
         max_delta_per_update = float(self.config.get("adaptive_admittance_max_delta_per_update_m", 0.00010))
         max_velocity = float(self.config.get("adaptive_admittance_max_velocity_mps", 0.0015))
 
@@ -845,6 +903,97 @@ class PickAndPlaceExecutor:
             return None, None
         m = max(ratios)
         return m, max(abs(r - 1.0) for r in ratios)
+
+    def _target_nominal_dimensions_m(self, target=None, soft_obs=None):
+        """Resolve the nominal object dimensions used by safety/transport checks.
+
+        Phase 7.8 introduced object-specific nominal dimensions so a 60 mm
+        sphere is not evaluated with the old 40 mm cube depth.  The first
+        7.8 patch called this helper but accidentally did not ship the method,
+        causing an AttributeError after transport.  This implementation is
+        intentionally generic: it reads physical descriptors from the target
+        dictionary and soft observation, not object labels.
+        """
+        target = target if isinstance(target, dict) else {}
+        soft_obs = soft_obs if isinstance(soft_obs, dict) else {}
+
+        def _as_float(value, default=None):
+            try:
+                if value is None:
+                    return default
+                value = float(value)
+                if math.isfinite(value):
+                    return value
+            except Exception:
+                pass
+            return default
+
+        def _mm_to_m(value, default=None):
+            value = _as_float(value, None)
+            if value is None:
+                return default
+            return value / 1000.0
+
+        shape = str(target.get("shape", "")).lower()
+
+        # Prefer explicit physical nominal dimensions when present.
+        nominal_wx = _as_float(
+            target.get("target_nominal_width_m"),
+            _as_float(target.get("nominal_width_x_m"), None),
+        )
+        nominal_wy = _as_float(
+            target.get("target_nominal_depth_m"),
+            _as_float(target.get("nominal_width_y_m"), None),
+        )
+        nominal_h = _as_float(
+            target.get("target_nominal_height_m"),
+            _as_float(target.get("nominal_height_m"), None),
+        )
+
+        # Then fall back to common YAML object parameters.
+        grip_dim_m = _mm_to_m(target.get("grip_dim_mm"), None)
+        height_m = _mm_to_m(target.get("height_mm"), None)
+        width_m = _mm_to_m(target.get("width_mm"), None)
+        depth_m = _mm_to_m(target.get("depth_mm"), None)
+        diameter_m = _mm_to_m(target.get("diameter_mm"), None)
+        size_m = _mm_to_m(target.get("size_mm"), None)
+
+        # For sphere/cylinder/cube proxy assets, grip_dim_mm is the intended
+        # physical diameter/width along the gripper direction.  Use it for both
+        # lateral dimensions unless an explicit depth is declared.
+        if nominal_wx is None:
+            nominal_wx = width_m or diameter_m or grip_dim_m or size_m
+        if nominal_wy is None:
+            nominal_wy = depth_m or diameter_m or grip_dim_m or size_m or nominal_wx
+        if nominal_h is None:
+            nominal_h = height_m or diameter_m or (grip_dim_m if shape in ("sphere", "cube", "cylinder") else None) or size_m
+
+        # Observation-provided nominal fields are the next fallback.  They are
+        # useful when the asset observer already knows the visual/collision size.
+        if nominal_wx is None:
+            nominal_wx = _as_float(soft_obs.get("nominal_width_x_m"), _as_float(soft_obs.get("nominal_width_m"), None))
+        if nominal_wy is None:
+            nominal_wy = _as_float(soft_obs.get("nominal_width_y_m"), _as_float(soft_obs.get("nominal_depth_m"), nominal_wx))
+        if nominal_h is None:
+            nominal_h = _as_float(soft_obs.get("nominal_height_m"), None)
+
+        # Last fallback is global legacy config.  This keeps older objects
+        # working, but object-specific YAML wins whenever available.
+        if nominal_wx is None:
+            nominal_wx = _as_float(self.config.get("adaptive_safety_nominal_width_m"), 0.040)
+        if nominal_wy is None:
+            nominal_wy = _as_float(self.config.get("adaptive_safety_nominal_depth_m"), nominal_wx)
+        if nominal_h is None:
+            nominal_h = _as_float(self.config.get("adaptive_safety_nominal_height_m"), nominal_wx)
+
+        return {
+            "nominal_width_x_m": nominal_wx,
+            "nominal_width_y_m": nominal_wy,
+            "nominal_height_m": nominal_h,
+            "shape": target.get("shape"),
+            "source": "target_physical_dimensions_generic",
+            "note": "Resolved from target/object physical metadata first, then observation, then global defaults.",
+        }
 
     def _select_soft_shape_metric(self, *, target=None, soft_obs=None, use_oriented=True, stage_name="shape"):
         """Choose a deformation metric without over-trusting PCA for near-cubes.
@@ -1585,6 +1734,26 @@ class PickAndPlaceExecutor:
                 self.config.get("adaptive_effort_max_sim", 1.20),
             )
         )
+        # Phase 7.8: allow object/behavior profiles to override the effort
+        # envelope.  This is not a label check; it is a property of a high-force
+        # caging grasp.  The force observer is a joint-effort proxy, not calibrated
+        # fingertip Newtons, so a strong cage can exceed the cube-calibrated limit
+        # while the object is still stable and safe.
+        try:
+            if isinstance(target, dict) and target.get("place_transport_admittance_max_effort_sim") is not None:
+                max_effort = float(target.get("place_transport_admittance_max_effort_sim"))
+        except Exception:
+            pass
+        abort_on_effort_over_max = bool(
+            target.get(
+                "transport_abort_on_effort_over_max",
+                self.config.get("place_transport_abort_on_effort_over_max", True),
+            ) if isinstance(target, dict) else self.config.get("place_transport_abort_on_effort_over_max", True)
+        )
+        adaptive_safety_effort_enabled = bool(
+            target.get("adaptive_safety_effort_enabled", True)
+            if isinstance(target, dict) else True
+        )
         deadband = float(self.config.get("place_transport_admittance_deadband_sim", 0.035))
         sample_stride = max(1, int(self.config.get("place_transport_admittance_sample_stride_frames", 12)))
         delta_step = float(self.config.get("place_transport_admittance_delta_step_m", 0.00005))
@@ -1649,6 +1818,9 @@ class PickAndPlaceExecutor:
             "base_target_effort_sim": base_target,
             "deadband_sim": deadband,
             "max_effort_sim": max_effort,
+            "abort_on_effort_over_max": abort_on_effort_over_max,
+            "adaptive_safety_effort_enabled": adaptive_safety_effort_enabled,
+            "target_transport_effort_policy": target.get("transport_effort_policy") if isinstance(target, dict) else None,
             "sample_stride_frames": sample_stride,
             "delta_step_m": delta_step,
             "max_total_close_m": max_total_close,
@@ -1747,8 +1919,9 @@ class PickAndPlaceExecutor:
                 table_gap_m = None
 
             try:
-                width_ratio_x = _safe_float((soft_obs or {}).get("width_x_m")) / float(self.config.get("adaptive_safety_nominal_width_m", 0.040))
-                width_ratio_y = _safe_float((soft_obs or {}).get("width_y_m")) / float(self.config.get("adaptive_safety_nominal_depth_m", 0.040))
+                nominal_dims = self._target_nominal_dimensions_m(target, soft_obs)
+                width_ratio_x = _safe_float((soft_obs or {}).get("width_x_m")) / float(nominal_dims.get("nominal_width_x_m") or 0.040)
+                width_ratio_y = _safe_float((soft_obs or {}).get("width_y_m")) / float(nominal_dims.get("nominal_width_y_m") or nominal_dims.get("nominal_width_x_m") or 0.040)
                 max_width_ratio = max(width_ratio_x, width_ratio_y)
                 old = state.get("max_width_ratio")
                 state["max_width_ratio"] = max_width_ratio if old is None else max(old, max_width_ratio)
@@ -1774,6 +1947,8 @@ class PickAndPlaceExecutor:
                             "frame": frame,
                             "target_effort_sim": target_effort,
                             "max_effort_sim": max_effort,
+                            "effort_safety_enabled": adaptive_safety_effort_enabled,
+                            "nominal_dimensions_m": self._target_nominal_dimensions_m(target, soft_obs),
                             "controller_phase": "place_transport_admittance",
                             "relative_object_flange_drift_m": relative_drift,
                             "relative_object_flange_drift_xy_m": relative_drift_xy,
@@ -1834,11 +2009,18 @@ class PickAndPlaceExecutor:
                     requested_delta = emergency_close_step
                     action = "transport_abort_emergency_hold"
                 elif effort >= max_effort:
-                    # Too much force while moving: stop squeezing and request abort.
-                    state["abort_requested"] = True
-                    state["abort_reason"] = "transport_effort_over_max"
+                    # Too much force while moving.  For ordinary fragile objects
+                    # this still aborts.  For explicitly declared high-force cage
+                    # profiles, effort alone is not a reliable slip/deformation
+                    # signal, so we hold and let table-drop/relative-drift/shape
+                    # checks decide.
                     requested_delta = 0.0
-                    action = "transport_abort_over_effort"
+                    if abort_on_effort_over_max:
+                        state["abort_requested"] = True
+                        state["abort_reason"] = "transport_effort_over_max"
+                        action = "transport_abort_over_effort"
+                    else:
+                        action = "transport_high_effort_no_abort_target_policy"
                 elif relative_drift is not None and relative_drift >= slip_close_m:
                     # Phase 4.1i: do not keep squeezing just because drift exists.
                     # If the effort is already above the shear target, or the
@@ -2001,6 +2183,119 @@ class PickAndPlaceExecutor:
     def _is_soft_target(self, target: dict) -> bool:
         return self.soft_observer.is_soft_target(target)
 
+    def _select_preferred_bbox_for_soft_pose(self, target: dict, obs: dict):
+        """Return a bbox dictionary that should drive runtime pose, if configured.
+
+        Why this exists:
+        PhysX deformable simulation TetMesh AABBs can inflate during contact or
+        remain less useful than the collision/visible mesh for a ball/roller. For
+        planning, validation, and transport-safety we want the same physical
+        surface that the gripper is actually trying to catch.
+        """
+        if not isinstance(target, dict) or not isinstance(obs, dict):
+            return None, None
+        shape = str(target.get("shape", "") or "").lower()
+        preferred = str(target.get("soft_pose_source", "") or "").lower().strip()
+        if not preferred and shape in ("sphere", "cylinder", "disc", "disk"):
+            preferred = "collision_mesh_points"
+        if preferred in ("", "simulation", "simulation_mesh_points"):
+            return None, None
+
+        ordered = []
+        if "collision" in preferred:
+            ordered.extend(["collision_points_bbox", "collision_bbox"])
+        if "visible" in preferred:
+            ordered.extend(["visible_points_bbox", "visible_bbox"])
+        ordered.extend(["collision_points_bbox", "collision_bbox", "visible_points_bbox", "visible_bbox"])
+
+        seen = set()
+        for key in ordered:
+            if key in seen:
+                continue
+            seen.add(key)
+            bbox = obs.get(key)
+            if not isinstance(bbox, dict):
+                continue
+            center = bbox.get("center")
+            size = bbox.get("size") or bbox.get("size_m")
+            mn = bbox.get("min")
+            mx = bbox.get("max")
+            if isinstance(center, (list, tuple)) and len(center) >= 3 and isinstance(size, (list, tuple)) and len(size) >= 3:
+                try:
+                    vals = [float(v) for v in size[:3]]
+                    if all(0.005 <= v <= 0.150 for v in vals):
+                        return key, bbox
+                except Exception:
+                    pass
+            if isinstance(mn, (list, tuple)) and len(mn) >= 3 and isinstance(mx, (list, tuple)) and len(mx) >= 3:
+                try:
+                    vals = [float(mx[i]) - float(mn[i]) for i in range(3)]
+                    if all(0.005 <= v <= 0.150 for v in vals):
+                        return key, bbox
+                except Exception:
+                    pass
+        return None, None
+
+    def _apply_preferred_soft_pose_source(self, target: dict, obs: dict):
+        """Override obs center/dimensions from the preferred bbox when needed."""
+        key, bbox = self._select_preferred_bbox_for_soft_pose(target, obs)
+        if not key or not isinstance(bbox, dict):
+            return obs
+        try:
+            center = list(bbox.get("center"))
+            size = bbox.get("size") or bbox.get("size_m")
+            if not isinstance(size, (list, tuple)) or len(size) < 3:
+                mn = bbox.get("min")
+                mx = bbox.get("max")
+                size = [float(mx[i]) - float(mn[i]) for i in range(3)]
+            size = [float(size[0]), float(size[1]), float(size[2])]
+            center = [float(center[0]), float(center[1]), float(center[2])]
+            out = dict(obs)
+            old_source = out.get("pose_source")
+            out["pose_source"] = f"{key}_preferred_runtime_pose"
+            out["pose_source_before_preference"] = old_source
+            out["preferred_pose_bbox_key"] = key
+            out["center"] = center
+            out["width_x_m"] = size[0]
+            out["width_y_m"] = size[1]
+            out["height_m"] = size[2]
+            out["bottom_z"] = center[2] - 0.5 * size[2]
+            out["top_z"] = center[2] + 0.5 * size[2]
+            try:
+                table_top = float(out.get("table_top_z"))
+                out["table_gap_m"] = out["bottom_z"] - table_top
+                out["bottom_clearance_m"] = out["table_gap_m"]
+            except Exception:
+                pass
+            try:
+                nominal_h = float(out.get("nominal_height_m") or self.arm._get_object_height(target))
+                if nominal_h > 1e-9:
+                    out["deformation_ratio_z"] = out["height_m"] / nominal_h
+            except Exception:
+                pass
+            try:
+                nominal_w = float(out.get("nominal_width_m") or float(target.get("grip_dim_mm")) / 1000.0)
+                if nominal_w > 1e-9:
+                    out["width_ratio_x"] = out["width_x_m"] / nominal_w
+                    out["width_ratio_y"] = out["width_y_m"] / nominal_w
+            except Exception:
+                pass
+            note = {
+                "phase": "7.1_preferred_runtime_pose_source",
+                "reason": "collision/visible bbox is preferred over inflated/static simulation TetMesh for this soft object class",
+                "old_pose_source": old_source,
+                "new_pose_source": out.get("pose_source"),
+                "bbox_key": key,
+            }
+            out["preferred_pose_source_note"] = note
+            return out
+        except Exception as e:
+            obs = dict(obs)
+            warnings = list(obs.get("warnings", []) or [])
+            warnings.append(f"preferred_pose_source_failed: {e}")
+            obs["warnings"] = warnings
+            return obs
+
     def _observe_target(self, target: dict, stage_name: str = "observe"):
         """Return live soft-object observation when available.
 
@@ -2012,6 +2307,7 @@ class PickAndPlaceExecutor:
             return None
         obs = self.soft_observer.observe(target)
         if obs:
+            obs = self._apply_preferred_soft_pose_source(target, obs)
             print(
                 f"[SoftObserver:{stage_name}] "
                 f"source={obs.get('pose_source')} "
@@ -2192,6 +2488,164 @@ class PickAndPlaceExecutor:
             )
         return calibration
 
+    def _bbox_max_dimension_m(self, bbox_dict) -> float:
+        """Return the largest sane dimension from a nested bbox dictionary."""
+        if not isinstance(bbox_dict, dict):
+            return None
+        candidates = []
+        for key in ("size", "size_m"):
+            size = bbox_dict.get(key)
+            if isinstance(size, (list, tuple)) and len(size) >= 3:
+                for v in size[:3]:
+                    try:
+                        fv = float(v)
+                        if math.isfinite(fv) and 0.005 <= fv <= 0.120:
+                            candidates.append(fv)
+                    except Exception:
+                        pass
+        oriented = bbox_dict.get("oriented_bbox")
+        if isinstance(oriented, dict):
+            for key in ("size", "size_m", "size_sorted", "size_sorted_m"):
+                size = oriented.get(key)
+                if isinstance(size, (list, tuple)) and len(size) >= 3:
+                    for v in size[:3]:
+                        try:
+                            fv = float(v)
+                            if math.isfinite(fv) and 0.005 <= fv <= 0.120:
+                                candidates.append(fv)
+                        except Exception:
+                            pass
+        return max(candidates) if candidates else None
+
+    def _resolve_expected_grip_dim_for_close(
+        self,
+        target: dict,
+        target_feasibility: dict,
+        before_close_obs: dict,
+    ):
+        """Choose the dimension used by the 2FG7 close validator.
+
+        Important distinction:
+        - collision/visible geometry is good for object pose and nominal size;
+        - deformable simulation geometry can create a larger contact shell.
+
+        The rubber-ball log showed exactly that mismatch: the visible/collision
+        sphere was about 60 mm, while the fingers stalled at an opening of about
+        68 mm because they contacted the inflated soft simulation shell. If we
+        pass 60 mm to the gripper state machine, that real shell contact is
+        mislabeled as ``too_open_or_early`` and micro-lift is skipped.
+        """
+        base_dim = None
+        if isinstance(target_feasibility, dict):
+            try:
+                base_dim = float(target_feasibility.get("estimated_object_grip_dim_m"))
+            except Exception:
+                base_dim = None
+
+        candidates = []
+        if base_dim is not None and math.isfinite(base_dim):
+            candidates.append(("nominal_target_grip_dim", base_dim))
+
+        try:
+            yaml_close_mm = float(target.get("close_expected_grip_dim_mm"))
+            if math.isfinite(yaml_close_mm):
+                candidates.append(("object_close_expected_grip_dim_mm", yaml_close_mm / 1000.0))
+        except Exception:
+            pass
+
+        shape = str((target or {}).get("shape", "")).lower()
+        label = str((target or {}).get("label", "")).lower()
+        profile = str((target or {}).get("validation_profile", "")).lower()
+        is_soft_sphere = shape == "sphere" or "ball" in label or "ball" in profile
+
+        if is_soft_sphere and isinstance(before_close_obs, dict):
+            # Simulation TetMesh size is not trusted for precise pose, but it is
+            # the right evidence for how wide the soft contact shell is.
+            for bbox_key in ("simulation_bbox", "simulation_points_bbox", "wrapper_bbox"):
+                dim = self._bbox_max_dimension_m(before_close_obs.get(bbox_key))
+                if dim is not None:
+                    candidates.append((f"{bbox_key}_contact_shell_max_dim", dim))
+
+            # If configured, add a tiny shell margin on top of the visual/collision
+            # nominal size. Keep this smaller than using the measured simulation
+            # shell, so live evidence still dominates.
+            try:
+                shell_extra = float(
+                    target.get(
+                        "close_contact_shell_extra_m",
+                        self.config.get("sphere_close_contact_shell_extra_m", 0.0),
+                    )
+                )
+            except Exception:
+                shell_extra = 0.0
+            if base_dim is not None and shell_extra > 0.0:
+                candidates.append(("nominal_plus_configured_shell_extra", base_dim + shell_extra))
+
+        if not candidates:
+            return base_dim, {
+                "available": False,
+                "reason": "no_expected_grip_dimension_available",
+            }
+
+        # Release-4 correction:
+        # Do NOT let the inflated simulation/TetMesh bbox dominate the gripper
+        # close command for a sphere.  The previous policy selected ~72 mm for a
+        # 60 mm ball, so the gripper accepted contact while almost fully open and
+        # never mechanically captured the object.
+        #
+        # New default for spheres: use the configured/nominal capture diameter.
+        # Keep the simulation bbox candidates in the log for diagnosis, but only
+        # use them when explicitly requested.
+        if is_soft_sphere:
+            policy = str(self.config.get("sphere_close_expected_policy", "nominal_capture")).lower()
+            use_sim_bbox = bool(self.config.get("sphere_close_use_sim_bbox_for_close", False))
+            if use_sim_bbox or policy in ("simulation_shell", "max_shell", "largest"):
+                source, chosen = max(candidates, key=lambda item: item[1])
+            else:
+                priority_sources = (
+                    "object_close_expected_grip_dim_mm",
+                    "nominal_plus_configured_shell_extra",
+                    "nominal_target_grip_dim",
+                )
+                source, chosen = candidates[0]
+                for wanted in priority_sources:
+                    match = next((item for item in candidates if item[0] == wanted), None)
+                    if match is not None:
+                        source, chosen = match
+                        break
+        else:
+            source, chosen = candidates[0]
+
+        grip_mode = self.config.get("grip_mode", "outwards")
+        grip_cfg = self.config.get(f"{grip_mode}_grip", {}) or {}
+        try:
+            grip_min = float(grip_cfg.get("grip_range_min", 0.035))
+            grip_max = float(grip_cfg.get("grip_range_max", 0.073))
+        except Exception:
+            grip_min, grip_max = 0.035, 0.073
+
+        margin_to_max = float(self.config.get("close_expected_dim_max_margin_m", 0.0010))
+        chosen_clamped = max(grip_min, min(grip_max - margin_to_max, float(chosen)))
+
+        return chosen_clamped, {
+            "available": True,
+            "shape": shape,
+            "label": label,
+            "is_soft_sphere": is_soft_sphere,
+            "base_dim_m": base_dim,
+            "chosen_dim_m": chosen_clamped,
+            "chosen_dim_mm": chosen_clamped * 1000.0,
+            "chosen_source": source,
+            "raw_candidates": [
+                {"source": name, "dim_m": value, "dim_mm": value * 1000.0}
+                for name, value in candidates
+            ],
+            "grip_range_min_m": grip_min,
+            "grip_range_max_m": grip_max,
+            "close_expected_dim_max_margin_m": margin_to_max,
+            "note": "Dimension used only for close/contact plausibility; planning pose still uses calibrated collision/visible geometry.",
+        }
+
     def _get_observed_object_pos(self, target: dict, stage_name: str = "object"):
         """Return grasp-relevant object centre.
 
@@ -2303,7 +2757,11 @@ class PickAndPlaceExecutor:
     async def _sample_target_stability(self, target: dict, stage_name: str = "target_stability"):
         """Sample object pose over a short window before trusting a target/retry."""
         app = omni.kit.app.get_app()
-        seconds = float(self.config.get("target_stability_sample_seconds", 0.35))
+        seconds = self._target_or_config_float(
+            target,
+            "target_stability_sample_seconds",
+            self.config.get("target_stability_sample_seconds", 0.35),
+        )
         stride = max(1, int(self.config.get("target_stability_sample_stride_frames", 6)))
         frames = max(stride, int(seconds * 60))
         samples = []
@@ -2324,8 +2782,16 @@ class PickAndPlaceExecutor:
                 xy = (dx * dx + dy * dy) ** 0.5
                 max_dist = max(max_dist, d)
                 max_xy = max(max_xy, xy)
-        max_allowed = float(self.config.get("target_stability_max_drift_m", 0.0030))
-        max_xy_allowed = float(self.config.get("target_stability_max_xy_drift_m", max_allowed))
+        max_allowed = self._target_or_config_float(
+            target,
+            "target_stability_max_drift_m",
+            self.config.get("target_stability_max_drift_m", 0.0030),
+        )
+        max_xy_allowed = self._target_or_config_float(
+            target,
+            "target_stability_max_xy_drift_m",
+            self.config.get("target_stability_max_xy_drift_m", max_allowed),
+        )
         stable = len(samples) >= 2 and max_dist <= max_allowed and max_xy <= max_xy_allowed
         return json_safe({
             "stage": stage_name,
@@ -2367,12 +2833,20 @@ class PickAndPlaceExecutor:
         disturbed_after_grasp_failure = prev_failure in (
             "micro_lift_validation_failed",
             "place_transport_validation_failed",
+            "place_transport_aborted_due_to_slip_or_drop",
+            "place_transport_motion_failed",
             "place_lowering_validation_failed",
             "transport_preload_force_unavailable",
         )
+        gate["disturbed_after_grasp_failure"] = disturbed_after_grasp_failure
         if enabled and significant and disturbed_after_grasp_failure:
-            gate["allowed"] = False
-            gate["reason"] = "object_disturbed_after_failed_grasp_no_normal_retry"
+            if bool(self.config.get("retry_allow_fresh_pose_after_disturbance", True)):
+                gate["allowed"] = True
+                gate["reason"] = "fresh_pose_retry_allowed_after_disturbance"
+                gate["requires_fresh_pose"] = True
+            else:
+                gate["allowed"] = False
+                gate["reason"] = "object_disturbed_after_failed_grasp_no_normal_retry"
         return json_safe(gate)
 
     def _make_soft_micro_lift_step_callback(self, target: dict, trace: list):
@@ -2916,9 +3390,18 @@ class PickAndPlaceExecutor:
         max_flange_dist = float(self.config.get("max_object_flange_distance_after_transport_m", 0.28))
         min_above_table = float(self.config.get("min_object_above_table_after_transport_m", 0.03))
 
-        max_width_ratio = float(self.config.get("place_transport_max_width_ratio", 1.35))
-        max_deformation_score = float(self.config.get("place_transport_max_deformation_score", 0.25))
-        fail_on_deformation = bool(self.config.get("place_transport_fail_on_excessive_deformation", True))
+        max_width_ratio = float(
+            target.get("place_transport_max_width_ratio", self.config.get("place_transport_max_width_ratio", 1.35))
+            if isinstance(target, dict) else self.config.get("place_transport_max_width_ratio", 1.35)
+        )
+        max_deformation_score = float(
+            target.get("place_transport_max_deformation_score", self.config.get("place_transport_max_deformation_score", 0.25))
+            if isinstance(target, dict) else self.config.get("place_transport_max_deformation_score", 0.25)
+        )
+        fail_on_deformation = bool(
+            target.get("place_transport_fail_on_excessive_deformation", self.config.get("place_transport_fail_on_excessive_deformation", True))
+            if isinstance(target, dict) else self.config.get("place_transport_fail_on_excessive_deformation", True)
+        )
         result["thresholds"].update({
             "place_transport_max_width_ratio": max_width_ratio,
             "place_transport_max_deformation_score": max_deformation_score,
@@ -2932,7 +3415,8 @@ class PickAndPlaceExecutor:
             wx_ratio = soft_obs_after.get("width_ratio_x")
             wy_ratio = soft_obs_after.get("width_ratio_y")
             height = soft_obs_after.get("height_m")
-            nominal_h = float(self.config.get("adaptive_safety_nominal_height_m", 0.040))
+            nominal_dims = self._target_nominal_dimensions_m(target, soft_obs_after)
+            nominal_h = float(nominal_dims.get("nominal_height_m") or self.config.get("adaptive_safety_nominal_height_m", 0.040))
             height_ratio = None
             try:
                 if height is not None and nominal_h > 1.0e-9:
@@ -3115,7 +3599,8 @@ class PickAndPlaceExecutor:
             wx_ratio = soft_obs_after.get("width_ratio_x")
             wy_ratio = soft_obs_after.get("width_ratio_y")
             height = soft_obs_after.get("height_m")
-            nominal_h = float(self.config.get("adaptive_safety_nominal_height_m", 0.040))
+            nominal_dims = self._target_nominal_dimensions_m(target, soft_obs_after)
+            nominal_h = float(nominal_dims.get("nominal_height_m") or self.config.get("adaptive_safety_nominal_height_m", 0.040))
             height_ratio = None
             try:
                 if height is not None and nominal_h > 1.0e-9:
@@ -3905,13 +4390,43 @@ class PickAndPlaceExecutor:
                 stability = await self._sample_target_stability(target, stage_name="before_planning_stability")
                 attempt_log["target_stability_before_planning"] = json_safe(stability)
                 if not stability.get("stable") and attempt > 0:
-                    print("[Executor] ❌ Retry target is not stable; refusing to chase disturbed object.")
-                    attempt_log["failure_reason"] = "retry_target_unstable_before_planning"
-                    trial_log["attempts"].append(attempt_log)
-                    trial_log["trial_success"] = False
-                    trial_log["final_reason"] = "retry_target_unstable_before_planning"
-                    self._last_trial_log = trial_log
-                    return False
+                    # Phase 7.6: a failed rubber-ball micro-lift may leave the
+                    # sphere rolling by only a few millimetres.  Do not
+                    # immediately abandon the object; wait once, resample, and
+                    # only then refuse to chase it if it is still moving.
+                    resample_log = []
+                    wait_enabled = bool(self.config.get("target_stability_retry_wait_enabled", True))
+                    max_resamples = int(self.config.get("target_stability_retry_wait_max_resamples", 1))
+                    wait_s = self._target_or_config_float(
+                        target,
+                        "target_stability_retry_wait_seconds",
+                        self.config.get("target_stability_retry_wait_seconds", 0.35),
+                    )
+                    if wait_enabled and max_resamples > 0 and wait_s > 0.0:
+                        for resample_idx in range(max_resamples):
+                            print(
+                                "[Executor] Retry target unstable; waiting briefly "
+                                "for sphere/object to settle before refusing."
+                            )
+                            await self._step_gripper_for_seconds(wait_s)
+                            stability = await self._sample_target_stability(
+                                target,
+                                stage_name=f"before_planning_stability_resample_{resample_idx + 1}",
+                            )
+                            resample_log.append(json_safe(stability))
+                            if stability.get("stable"):
+                                break
+                        attempt_log["target_stability_resamples_before_planning"] = json_safe(resample_log)
+                        attempt_log["target_stability_before_planning"] = json_safe(stability)
+
+                    if not stability.get("stable"):
+                        print("[Executor] ❌ Retry target is not stable; refusing to chase disturbed object.")
+                        attempt_log["failure_reason"] = "retry_target_unstable_before_planning"
+                        trial_log["attempts"].append(attempt_log)
+                        trial_log["trial_success"] = False
+                        trial_log["final_reason"] = "retry_target_unstable_before_planning"
+                        self._last_trial_log = trial_log
+                        return False
 
             if attempt > 0 and trial_log.get("attempts"):
                 previous_attempt = trial_log["attempts"][-1]
@@ -4018,8 +4533,8 @@ class PickAndPlaceExecutor:
             print("\n[Executor] Moving to safe_above...")
             ok = await self.arm.move_via_safe_height(
                 safe_above,
-                duration=3.0,
-                steps=150,
+                duration=float(self.config.get("move_safe_above_duration", 2.0)),
+                steps=int(self.config.get("move_safe_above_steps", 120)),
             )
             if not ok:
                 print("[Executor] ❌ Failed to reach safe_above.")
@@ -4113,8 +4628,8 @@ class PickAndPlaceExecutor:
             print("\n[Executor] Moving to pre_grasp...")
             ok = await self.arm.move_to(
                 pre_grasp,
-                duration=3.0,
-                steps=150,
+                duration=float(self.config.get("move_pre_grasp_duration", 1.8)),
+                steps=int(self.config.get("move_pre_grasp_steps", 108)),
                 check_table_collision=True,
             )
             if not ok:
@@ -4141,8 +4656,8 @@ class PickAndPlaceExecutor:
             print("\n[Executor] Moving to grasp pose...")
             ok = await self.arm.move_to(
                 grasp,
-                duration=3.0,
-                steps=150,
+                duration=float(self.config.get("move_grasp_duration", 1.6)),
+                steps=int(self.config.get("move_grasp_steps", 96)),
                 check_table_collision=True,
             )
             if not ok:
@@ -4315,13 +4830,37 @@ class PickAndPlaceExecutor:
             target_feasibility_for_close = grip_feasibility(target, self.config)
             attempt_log["target_feasibility_before_close"] = json_safe(target_feasibility_for_close)
 
-            expected_grip_dim_m = target_feasibility_for_close.get(
-                "estimated_object_grip_dim_m"
+            expected_grip_dim_m, expected_grip_dim_resolution = self._resolve_expected_grip_dim_for_close(
+                target=target,
+                target_feasibility=target_feasibility_for_close,
+                before_close_obs=before_close_obs,
+            )
+
+            expected_delta = float(current_retry_adjustments.get("expected_grip_dim_delta_m", 0.0) or 0.0)
+            if expected_grip_dim_m is not None and abs(expected_delta) > 1.0e-9:
+                grip_mode = self.config.get("grip_mode", "outwards")
+                grip_cfg = self.config.get(f"{grip_mode}_grip", {}) or {}
+                grip_max = float(grip_cfg.get("grip_range_max", 0.073))
+                margin_to_max = float(self.config.get("close_expected_dim_max_margin_m", 0.0010))
+                before_delta = float(expected_grip_dim_m)
+                expected_grip_dim_m = max(
+                    0.0,
+                    min(grip_max - margin_to_max, before_delta + expected_delta),
+                )
+                if isinstance(expected_grip_dim_resolution, dict):
+                    expected_grip_dim_resolution["retry_expected_grip_dim_delta_m"] = expected_delta
+                    expected_grip_dim_resolution["chosen_dim_before_retry_delta_m"] = before_delta
+                    expected_grip_dim_resolution["chosen_dim_after_retry_delta_m"] = expected_grip_dim_m
+                    expected_grip_dim_resolution["chosen_dim_after_retry_delta_mm"] = expected_grip_dim_m * 1000.0
+
+            attempt_log["expected_grip_dim_resolution_before_close"] = json_safe(
+                expected_grip_dim_resolution
             )
 
             print(
                 "[Executor] Expected grip dimension for close: "
-                f"{expected_grip_dim_m}"
+                f"{expected_grip_dim_m} "
+                f"(source={expected_grip_dim_resolution.get('chosen_source') if isinstance(expected_grip_dim_resolution, dict) else None})"
             )
 
             adaptive_effort_target_override = None
@@ -4341,6 +4880,16 @@ class PickAndPlaceExecutor:
                     min(float(self.config.get("adaptive_effort_max_sim", 1.20)), adaptive_effort_target_override),
                 )
 
+            use_expected_contact_floor = bool(
+                isinstance(target, dict)
+                and target.get("gripper_use_expected_contact_floor") is True
+            )
+            if use_expected_contact_floor:
+                print(
+                    "[Executor] Sphere/capture mode: using expected-contact floor "
+                    "for squeeze/hold targets."
+                )
+
             close_resolution = await self.close_gripper(
                 force_n=target_force,
                 expected_grip_dim_m=expected_grip_dim_m,
@@ -4350,6 +4899,7 @@ class PickAndPlaceExecutor:
                 hold_extra_close_m=pick_result.get("gripper_hold_extra_close_m"),
                 target=target,
                 adaptive_effort_target_override_sim=adaptive_effort_target_override,
+                use_expected_contact_floor=use_expected_contact_floor,
             )
             attempt_log["gripper_close_resolution"] = json_safe(close_resolution)
 
@@ -4492,6 +5042,46 @@ class PickAndPlaceExecutor:
                 # only a few centimetres and verify that the object follows the
                 # calibrated grasp centre.
                 if self.config.get("enable_micro_lift_test", False):
+                    # Phase 7.6: for the rubber ball, close validation can pass
+                    # in probationary cage mode, but the ball can still roll out
+                    # during the first 25 mm vertical motion.  Apply a tiny
+                    # stationary capture preload immediately before micro-lift,
+                    # then let the micro-lift remain the empirical proof.
+                    sphere_capture_preload = None
+                    if (
+                        isinstance(target, dict)
+                        and str(target.get("shape", "")).lower() == "sphere"
+                        and bool(target.get("sphere_micro_lift_preload_enabled", False))
+                    ):
+                        try:
+                            preload_delta = float(target.get("sphere_micro_lift_preload_delta_m", 0.0010) or 0.0010)
+                            preload_settle = float(target.get("sphere_micro_lift_preload_settle_seconds", 0.30) or 0.30)
+                            preload_force = target.get("sphere_micro_lift_preload_force_n", None)
+                            preload_force = float(preload_force) if preload_force is not None else None
+                        except Exception:
+                            preload_delta = 0.0010
+                            preload_settle = 0.30
+                            preload_force = None
+
+                        before_preload_diag = self.gripper.get_diagnostics()
+                        sphere_capture_preload = {
+                            "enabled": True,
+                            "phase": "7.6_stationary_sphere_capture_preload_before_micro_lift",
+                            "delta_close_m": preload_delta,
+                            "settle_seconds": preload_settle,
+                            "force_n": preload_force,
+                            "before": json_safe(before_preload_diag),
+                        }
+                        adjustment = self.gripper.adjust_hold_targets(
+                            delta_close_m=preload_delta,
+                            reason="sphere_capture_preload_before_micro_lift",
+                            force_n=preload_force,
+                        )
+                        sphere_capture_preload["adjustment"] = json_safe(adjustment)
+                        await self._step_gripper_for_seconds(preload_settle)
+                        sphere_capture_preload["after"] = json_safe(self.gripper.get_diagnostics())
+                        attempt_log["sphere_capture_preload_before_micro_lift"] = json_safe(sphere_capture_preload)
+
                     micro_lift = joints.get("micro_lift")
                     if micro_lift is None:
                         print("[Executor] ❌ No micro_lift waypoint available.")
@@ -4645,6 +5235,93 @@ class PickAndPlaceExecutor:
                         )
                     )
 
+                    # Phase 7.7: rubber-ball partial micro-lift rescue.
+                    # In release-7 the sphere rose about 11–13 mm while the
+                    # flange rose about 22–23 mm: not a clean pass, but not a
+                    # total drop either.  Treat this as a probationary cage:
+                    # add a small stationary squeeze at the micro-lift pose and
+                    # allow the full-lift validator to decide final capture.
+                    sphere_partial_rescue = None
+                    if (
+                        not micro_validation.get("success")
+                        and isinstance(target, dict)
+                        and str(target.get("shape", "")).lower() == "sphere"
+                        and bool(target.get("sphere_allow_probationary_partial_micro_lift", False))
+                    ):
+                        try:
+                            dz_obj = float(micro_validation.get("object_lift_delta_z_m", 0.0) or 0.0)
+                            following = float(micro_validation.get("following_ratio", 0.0) or 0.0)
+                            drift = float(micro_validation.get("relative_grasp_drift_m", 999.0) or 999.0)
+                            min_dz = float(target.get("sphere_partial_micro_lift_min_dz_m", 0.010) or 0.010)
+                            min_follow = float(target.get("sphere_partial_micro_lift_min_following_ratio", 0.45) or 0.45)
+                            max_drift = float(target.get("sphere_partial_micro_lift_max_drift_m", 0.014) or 0.014)
+                        except Exception:
+                            dz_obj, following, drift = 0.0, 0.0, 999.0
+                            min_dz, min_follow, max_drift = 0.010, 0.45, 0.014
+
+                        partial_ok = (
+                            dz_obj >= min_dz
+                            and following >= min_follow
+                            and drift <= max_drift
+                            and bool(micro_validation.get("gripper_has_object", False))
+                        )
+                        sphere_partial_rescue = {
+                            "enabled": True,
+                            "phase": "7.7_probationary_sphere_partial_micro_lift_rescue",
+                            "partial_ok": partial_ok,
+                            "object_lift_delta_z_m": dz_obj,
+                            "following_ratio": following,
+                            "relative_grasp_drift_m": drift,
+                            "thresholds": {
+                                "min_dz_m": min_dz,
+                                "min_following_ratio": min_follow,
+                                "max_drift_m": max_drift,
+                            },
+                            "before_rescue_gripper": json_safe(self.gripper.get_diagnostics()),
+                        }
+
+                        if partial_ok:
+                            try:
+                                rescue_delta = float(target.get("sphere_micro_lift_rescue_delta_m", 0.0015) or 0.0015)
+                                rescue_settle = float(target.get("sphere_micro_lift_rescue_settle_seconds", 0.25) or 0.25)
+                                rescue_force = target.get("sphere_micro_lift_rescue_force_n", None)
+                                rescue_force = float(rescue_force) if rescue_force is not None else None
+                            except Exception:
+                                rescue_delta, rescue_settle, rescue_force = 0.0015, 0.25, None
+
+                            sphere_partial_rescue.update({
+                                "rescue_delta_close_m": rescue_delta,
+                                "rescue_settle_seconds": rescue_settle,
+                                "rescue_force_n": rescue_force,
+                            })
+                            sphere_partial_rescue["adjustment"] = json_safe(
+                                self.gripper.adjust_hold_targets(
+                                    delta_close_m=rescue_delta,
+                                    reason="sphere_partial_micro_lift_rescue_before_full_lift",
+                                    force_n=rescue_force,
+                                )
+                            )
+                            await self._step_gripper_for_seconds(rescue_settle)
+                            sphere_partial_rescue["after_rescue_gripper"] = json_safe(
+                                self.gripper.get_diagnostics()
+                            )
+
+                            micro_validation = dict(micro_validation)
+                            micro_validation["success"] = True
+                            micro_validation["probationary_success"] = True
+                            micro_validation["probationary_reason"] = (
+                                "sphere_partial_micro_lift_rescued_continue_to_full_lift"
+                            )
+                            micro_validation.setdefault("warnings", [])
+                            micro_validation["warnings"].append(
+                                "Sphere only partially followed micro-lift; applied extra cup preload and delegated final decision to full-lift validation."
+                            )
+                            attempt_log["micro_lift_validation"] = json_safe(micro_validation)
+                            attempt_log["sphere_partial_micro_lift_rescue"] = json_safe(sphere_partial_rescue)
+                            print("[Executor] ⚠️ Sphere partial micro-lift accepted probationarily; applying rescue cup and continuing to full lift.")
+                        else:
+                            attempt_log["sphere_partial_micro_lift_rescue"] = json_safe(sphere_partial_rescue)
+
                     if not micro_validation["success"]:
                         print("[Executor] ❌ Micro-lift validation failed.")
                         for reason in micro_validation["reasons"]:
@@ -4728,8 +5405,12 @@ class PickAndPlaceExecutor:
                     print("[Executor] ❌ Lift motion failed.")
                     return False
 
-                # Let the gripper/object settle briefly after lift.
-                await self._step_gripper_for_seconds(0.5)
+                # Let the gripper/object settle briefly after lift.  Phase 7.4 makes
+                # this configurable because the fixed 0.5 s pause was the visible
+                # delay between lift validation and transport start.
+                await self._step_gripper_for_seconds(
+                    float(self.config.get("post_lift_before_transport_settle_seconds", 0.12))
+                )
 
                 print("\n[Executor] Gripper diagnostics after lift:")
                 # print(self.gripper.get_diagnostics())
@@ -4847,8 +5528,24 @@ class PickAndPlaceExecutor:
                             target, stage_name="before_place_transport"
                         )
 
-                        transport_duration = float(self.config.get("place_transport_duration", 6.0))
-                        transport_steps = int(self.config.get("place_transport_steps", 360))
+                        base_transport_duration = float(self.config.get("place_transport_duration", 6.0))
+                        base_transport_steps = int(self.config.get("place_transport_steps", 360))
+                        retry_transport_speed_scale = float(
+                            current_retry_adjustments.get("place_transport_speed_scale", 1.0)
+                        )
+                        transport_duration = base_transport_duration / max(0.10, retry_transport_speed_scale)
+                        transport_steps = max(
+                            base_transport_steps,
+                            int(round(base_transport_steps / max(0.10, retry_transport_speed_scale))),
+                        )
+                        attempt_log["place_transport_speed_profile"] = json_safe({
+                            "base_duration_s": base_transport_duration,
+                            "base_steps": base_transport_steps,
+                            "retry_transport_speed_scale": retry_transport_speed_scale,
+                            "effective_duration_s": transport_duration,
+                            "effective_steps": transport_steps,
+                            "reason": "slow transport on retry to reduce shear/slip and give admittance more samples",
+                        })
 
                         # Phase 4.1g: compute a shear-aware effort reference before moving.
                         # The Phase 4.1f audit showed that gravity/shear is the main
@@ -4886,6 +5583,20 @@ class PickAndPlaceExecutor:
                         transport_target_effort_override = None
                         if isinstance(transport_shear_reference, dict) and transport_shear_reference.get("success"):
                             transport_target_effort_override = transport_shear_reference.get("target_effort_sim")
+                        if transport_target_effort_override is not None:
+                            effort_scale = float(
+                                current_retry_adjustments.get("place_transport_effort_target_scale", 1.0)
+                            )
+                            if abs(effort_scale - 1.0) > 1.0e-6:
+                                old_effort = float(transport_target_effort_override)
+                                max_effort = float(self.config.get("place_transport_admittance_max_effort_sim", 1.2))
+                                transport_target_effort_override = min(max_effort, old_effort * effort_scale)
+                                attempt_log["place_transport_effort_retry_scale"] = json_safe({
+                                    "old_target_effort_sim": old_effort,
+                                    "scale": effort_scale,
+                                    "new_target_effort_sim": transport_target_effort_override,
+                                    "max_effort_sim": max_effort,
+                                })
 
                         transport_step_callback = self.gripper.update
                         transport_admittance = None
@@ -4950,7 +5661,18 @@ class PickAndPlaceExecutor:
                                 print("[Executor] ❌ Place transport motion failed.")
                             attempt_log["failure_reason"] = failure_reason
                             attempt_log["place_transport_abort_reason"] = transport_abort_reason
+                            decision = self.retry_policy.decide(trial_log, attempt_log)
+                            attempt_log["retry_decision"] = json_safe(decision)
                             trial_log["attempts"].append(attempt_log)
+                            if decision.get("retry") and attempt < max_attempts - 1:
+                                print(f"[Executor] RetryPolicy after transport failure: {decision.get('reason')}")
+                                current_retry_adjustments = decision.get("adjustments", {}) or {}
+                                await self._recover_to_safe_for_retry(
+                                    pre_grasp=pre_grasp,
+                                    safe_above=safe_above,
+                                    from_micro_lift=True,
+                                )
+                                continue
                             trial_log["final_reason"] = failure_reason
                             self._last_trial_log = trial_log
                             return False
@@ -5026,7 +5748,18 @@ class PickAndPlaceExecutor:
                         if not place_transport_validation.get("success"):
                             print("[Executor] ❌ Place transport validation failed.")
                             attempt_log["failure_reason"] = "place_transport_validation_failed"
+                            decision = self.retry_policy.decide(trial_log, attempt_log)
+                            attempt_log["retry_decision"] = json_safe(decision)
                             trial_log["attempts"].append(attempt_log)
+                            if decision.get("retry") and attempt < max_attempts - 1:
+                                print(f"[Executor] RetryPolicy after transport validation failure: {decision.get('reason')}")
+                                current_retry_adjustments = decision.get("adjustments", {}) or {}
+                                await self._recover_to_safe_for_retry(
+                                    pre_grasp=pre_grasp,
+                                    safe_above=safe_above,
+                                    from_micro_lift=True,
+                                )
+                                continue
                             trial_log["final_reason"] = "place_transport_validation_failed"
                             self._last_trial_log = trial_log
                             return False

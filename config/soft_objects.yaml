@@ -42,9 +42,9 @@ soft_physics_materials:
     dynamic_friction: 2.0
     restitution: 0.02
   - name: rubber_ball
-    static_friction: 2.8
-    dynamic_friction: 2.2
-    restitution: 0.04
+    static_friction: 3.4
+    dynamic_friction: 3.0
+    restitution: 0.02
 
 soft_objects:
   - label: foam_cube_green
@@ -120,11 +120,17 @@ soft_objects:
     static_friction: 2.4
     dynamic_friction: 2.0
     restitution: 0.02
-    preferred_force_n: 22.0
-    max_force_n: 32.0
-    close_speed_scale: 0.42
-    hold_extra_m: 0.0006
-    micro_lift_speed_scale: 0.42
+    # Roller passed close + lift but dropped during early transport.
+    # Use a slightly stronger/longer hold and prefer collision surface pose.
+    preferred_force_n: 26.0
+    max_force_n: 38.0
+    close_speed_scale: 0.38
+    hold_extra_m: 0.0010
+    micro_lift_speed_scale: 0.34
+    soft_pose_source: collision_mesh_points
+    grasp_height_mode: center_band
+    grasp_center_height_fraction: 0.52
+    min_fingertip_clearance_m: 0.0035
     strategy_hint: delicate_pick_elongated
     validation_profile: soft_deformable_roller
     fallback_primitive: none
@@ -159,14 +165,74 @@ soft_objects:
     youngs_modulus_pa: 500000.0
     poissons_ratio: 0.47
     elasticity_damping: 0.04
-    static_friction: 2.8
-    dynamic_friction: 2.2
-    restitution: 0.04
-    preferred_force_n: 24.0
-    max_force_n: 36.0
-    close_speed_scale: 0.38
-    hold_extra_m: 0.0007
-    micro_lift_speed_scale: 0.38
+    static_friction: 3.4
+    dynamic_friction: 3.0
+    restitution: 0.02
+    # The ball log showed an upper-cap grasp: finger band was too high.
+    # Catch the equator/lower-middle band and slow the lift.
+    # Release-4 diagnosis: the previous 68--72 mm contact-shell model made the
+    # gripper accept contact almost fully open.  It looked like the gripper was
+    # not closing, and the ball did not follow in micro-lift.  For capture we
+    # intentionally command/validate a 60 mm ball-size closure; the physical soft
+    # shell may be felt earlier, but it must not terminate closing early.
+    # Phase 7.4: this object needs real geometric capture, not just early
+    # deformable-shell contact.  The expected-contact floor below forces the
+    # hold target to cup the 60 mm ball instead of stopping at ~69 mm opening.
+    # Phase 7.6: ball reaches micro-lift but slides/rolls out.  Use a lower
+    # cup/cage grasp and stronger pad preload; this is not a fragile-object
+    # squeeze limit anymore, it is a rubber rolling-slip problem.
+    preferred_force_n: 128.0
+    max_force_n: 155.0
+    close_speed_scale: 0.45
+    hold_extra_m: 0.0088
+    gripper_hold_extra_close_m: 0.0088
+    sphere_micro_lift_preload_enabled: true
+    sphere_micro_lift_preload_delta_m: 0.0018
+    sphere_micro_lift_preload_settle_seconds: 0.30
+    sphere_micro_lift_preload_force_n: 145.0
+    close_expected_grip_dim_mm: 60.0
+    close_contact_shell_extra_m: 0.0000
+    gripper_use_expected_contact_floor: true
+    gripper_capture_floor_note: "For soft spheres, build squeeze/hold target from expected contact position, not early shell touch."
+    adaptive_effort_control_enabled: false
+    adaptive_effort_max_relax_open_m: 0.0000
+    micro_lift_speed_scale: 0.42
+    soft_pose_source: collision_mesh_points
+    grasp_height_mode: spherical_equator
+    # Slightly lower than the exact visual center so the fingers cup the ball
+    # around the lower equator instead of the upper cap.
+    grasp_center_height_fraction: 0.30
+    grasp_z_offset_m: -0.0010
+    min_fingertip_clearance_m: 0.0004
+    allow_lower_than_global_fingertip_clearance: true
+    sphere_allow_probationary_partial_micro_lift: true
+    sphere_partial_micro_lift_min_dz_m: 0.0100
+    sphere_partial_micro_lift_min_following_ratio: 0.45
+    sphere_partial_micro_lift_max_drift_m: 0.0140
+    sphere_micro_lift_rescue_delta_m: 0.0018
+    sphere_micro_lift_rescue_settle_seconds: 0.25
+    sphere_micro_lift_rescue_force_n: 150.0
+
+    # Phase 7.8: generic behavior profile, not a label-specific if-statement.
+    # Any future rolling object can opt into this policy by declaring the same profile.
+    grasp_behavior_profile: rolling_cage
+    transport_effort_policy: stable_high_force_cage
+    use_target_nominal_for_safety: true
+
+    # Carry lower after successful lift; old high-carry placed the ball center at
+    # about z≈1.0 m before transport, which is unnecessarily high for a table task.
+    carry_bottom_clearance_m: 0.055
+
+    # The effort observer is a joint-effort proxy. A strong rolling-cage grasp can
+    # produce high values without meaning slip/drop. For this profile, do not abort
+    # from effort-over-max alone; use object motion, table gap, and deformation too.
+    transport_abort_on_effort_over_max: false
+    place_transport_admittance_max_effort_sim: 9.0
+    adaptive_safety_effort_enabled: false
+
+    target_stability_max_drift_m: 0.0060
+    target_stability_max_xy_drift_m: 0.0060
+    target_stability_retry_wait_seconds: 0.45
     strategy_hint: delicate_pick_spherical
     validation_profile: soft_elastic_ball
     fallback_primitive: none

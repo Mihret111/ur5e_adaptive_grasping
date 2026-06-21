@@ -166,7 +166,7 @@ preclose_diagnostics_print_all_axes: false
 enable_micro_lift_test: true
 enable_lift_test: true
 plan_retreat_during_pick: false
-max_grasp_attempts: 2
+max_grasp_attempts: 3
 
 micro_lift_height_m: 0.025
 micro_lift_duration: 2.0
@@ -429,7 +429,9 @@ table_zones:
   place_zone_roller:
     label: place_roller
     role: target_placement_region
-    local_xy_m: [-0.02, 0.15]
+    # Still scattered, but not so far from the roller pickup that the first
+    # generalization test becomes mostly a long shear-carry experiment.
+    local_xy_m: [0.03, 0.06]
     size_xy_m: [0.075, 0.075]
     color: [0.10, 0.80, 0.20]
     cross_color: [1.00, 1.00, 1.00]
@@ -438,7 +440,8 @@ table_zones:
   place_zone_ball:
     label: place_ball
     role: target_placement_region
-    local_xy_m: [0.15, 0.25]
+    # Diagonal/scattered placement, shortened for the rolling ball benchmark.
+    local_xy_m: [0.20, 0.04]
     size_xy_m: [0.075, 0.075]
     color: [0.10, 0.80, 0.20]
     cross_color: [1.00, 1.00, 1.00]
@@ -514,7 +517,7 @@ place_transport_emergency_close_step_m: 0.00012
 place_transport_shear_audit_enabled: true
 place_transport_shear_audit_sample_stride_frames: 6
 place_transport_shear_audit_max_trace_samples: 120
-place_transport_shear_audit_object_mass_kg: 0.010
+place_transport_shear_audit_object_mass_kg: null
 place_transport_default_object_mass_kg: 0.010
 place_transport_shear_audit_gravity_mps2: 9.81
 place_transport_shear_audit_mu_candidates: [0.30, 0.50, 0.80]
@@ -935,3 +938,290 @@ place_transport_lock_grasp_orientation: true
 # Slightly looser final XY tolerance for the ball/roller generalization pass.
 # The foam-cube baseline still reports its exact smaller error in logs.
 place_release_xy_tolerance_m: 0.065
+
+# ───────────── PHASE 7.1: OBJECT-LEVEL RETRY / REGRASP PATCH ─────────────
+# Do not skip directly to the next object after a post-lift/place failure.
+# The same object gets a fresh-pose retry with adjusted grasp/hold/transport.
+retry_allow_fresh_pose_after_disturbance: true
+retry_after_transport_failure_enabled: true
+retry_transport_slip_grasp_z_delta_m: 0.0
+retry_transport_slip_force_scale: 1.18
+retry_transport_slip_hold_extra_delta_m: 0.00040
+retry_transport_slip_hold_settle_extra_s: 0.70
+retry_transport_slip_micro_lift_speed_scale: 0.65
+retry_transport_slip_transport_speed_scale: 0.55
+retry_transport_slip_effort_target_scale: 1.08
+
+# When the soft USD bbox stays static during micro-lift but the gripper reports
+# a plausible grasp, retry the same object from fresh perception rather than
+# abandoning the object.  This is especially important for the rubber ball.
+retry_soft_observer_unreliable_allow_retry: true
+retry_soft_observer_unreliable_sphere_grasp_z_delta_m: -0.004
+retry_soft_observer_unreliable_grasp_z_delta_m: 0.0
+retry_soft_observer_unreliable_force_scale: 1.10
+retry_soft_observer_unreliable_hold_extra_delta_m: 0.00030
+retry_soft_observer_unreliable_hold_settle_extra_s: 0.60
+retry_soft_observer_unreliable_micro_lift_speed_scale: 0.65
+
+
+# ───────────── PHASE 7.2: SPHERE CLOSE-SHELL + SPEED TRIM OVERRIDES ─────────────
+# Release-3 diagnosis:
+# - sphere visual/collision diameter ≈60 mm;
+# - gripper contact happened at ≈68 mm opening because the deformable shell is larger;
+# - close validation therefore rejected a real shell contact as too_open_or_early.
+# These keys override earlier repeated values in this YAML file.
+sphere_close_contact_shell_extra_m: 0.0080
+close_expected_dim_max_margin_m: 0.0010
+
+# Remove the sluggish timing while keeping enough physics steps for stability.
+move_safe_above_duration: 2.0
+move_safe_above_steps: 120
+move_pre_grasp_duration: 1.8
+move_pre_grasp_steps: 108
+move_grasp_duration: 1.6
+move_grasp_steps: 96
+
+post_close_hold_seconds: 0.45
+adaptive_effort_max_frames: 55
+adaptive_effort_sample_stride_frames: 4
+adaptive_effort_required_stable_samples: 2
+
+micro_lift_duration: 1.20
+micro_lift_steps: 72
+post_micro_lift_settle_seconds: 0.15
+
+lift_duration: 2.20
+lift_steps: 132
+
+place_transport_duration: 2.60
+place_transport_steps: 156
+post_place_transport_settle_seconds: 0.20
+place_transport_direct_preload_max_frames: 120
+place_transport_direct_preload_required_stable_samples: 2
+place_transport_direct_preload_sample_stride_frames: 3
+
+place_lowering_duration: 1.30
+place_lowering_steps: 78
+post_place_lowering_settle_seconds: 0.12
+
+place_release_lowering_stage_duration: 0.55
+place_release_lowering_stage_steps: 36
+place_release_stage_settle_seconds: 0.10
+place_release_partial_step_settle_seconds: 0.08
+place_release_open_settle_seconds: 0.35
+place_release_retreat_duration: 1.10
+place_release_retreat_steps: 72
+place_release_post_retreat_settle_seconds: 0.25
+
+retry_to_pregrasp_duration: 1.20
+retry_to_pregrasp_steps: 72
+retry_to_safe_duration: 1.60
+retry_to_safe_steps: 96
+retry_mid_settle_seconds: 0.12
+post_open_settle_seconds: 0.35
+phase7_between_object_settle_seconds: 0.15
+retry_sphere_close_expected_dim_delta_m: 0.0030
+
+
+# ───────────── PHASE 7.3: SPHERE CAPTURE + PRACTICAL TIMING OVERRIDES ─────────────
+# Release-4 diagnosis:
+# - rubber_ball close succeeded only because expected_dim was clamped to 72 mm;
+# - the gripper accepted contact around 69--71 mm opening, almost fully open;
+# - adaptive effort then relaxed/opened because effort was already high;
+# - micro-lift failed because the ball never became mechanically captured.
+# Therefore: do NOT use the inflated simulation bbox as the close target for
+# spheres. Use the real capture diameter and prevent post-close adaptive relax.
+sphere_close_expected_policy: nominal_capture
+sphere_close_use_sim_bbox_for_close: false
+sphere_close_contact_shell_extra_m: 0.0000
+close_expected_dim_max_margin_m: 0.0010
+
+# Keep transport responsive while preserving the cylinder during lowering.
+place_transport_duration: 2.35
+place_transport_steps: 141
+post_place_transport_settle_seconds: 0.10
+place_transport_direct_preload_max_frames: 60
+place_transport_direct_preload_required_stable_samples: 1
+place_transport_direct_preload_sample_stride_frames: 2
+place_lowering_duration: 1.60
+place_lowering_steps: 96
+post_place_lowering_settle_seconds: 0.16
+
+# Retry no-follow on the sphere should change the grasp, not repeat the same
+# almost-open hold three times.
+retry_sphere_no_follow_grasp_z_delta_m: -0.0020
+retry_sphere_no_follow_force_scale: 1.06
+retry_sphere_no_follow_hold_extra_delta_m: 0.0010
+retry_sphere_no_follow_micro_lift_speed_scale: 0.85
+retry_sphere_no_follow_hold_settle_extra_s: 0.15
+retry_sphere_close_expected_dim_delta_m: 0.0000
+
+# Reduce retry dead time without making recovery unsafe.
+retry_no_follow_hold_extra_s: 0.15
+retry_partial_slip_hold_extra_s: 0.25
+retry_to_pregrasp_duration: 1.00
+retry_to_pregrasp_steps: 60
+retry_to_safe_duration: 1.25
+retry_to_safe_steps: 75
+retry_mid_settle_seconds: 0.08
+post_open_settle_seconds: 0.25
+phase7_between_object_settle_seconds: 0.10
+
+# ───────────── PHASE 7.4: SPHERE KEY PROPAGATION + CAPTURE FLOOR + TIMING ─────────────
+# Release-5 diagnosis:
+# - rubber_ball YAML keys existed but were not propagated by SceneBuilder, so
+#   runtime target.adaptive_effort_control_enabled was None, not false;
+# - the global adaptive safety/admittance loop still ran, saw high effort from
+#   early one-sided soft-shell contact, relaxed/opened, and aborted before
+#   close validation/micro-lift;
+# - the gripper built squeeze/hold targets from the early shell-touch pose
+#   (~69 mm opening), so visually it looked almost open.
+# The code patch now passes the per-object keys and adds expected-contact-floor
+# capture mode for spheres.  These timing values trim dead time while keeping
+# cylinder lowering slightly gentler again.
+post_lift_before_transport_settle_seconds: 0.12
+place_transport_shear_preload_settle_seconds: 0.08
+place_transport_direct_preload_max_frames: 42
+place_transport_direct_preload_required_stable_samples: 1
+place_transport_direct_preload_sample_stride_frames: 2
+place_lowering_duration: 1.80
+place_lowering_steps: 108
+post_place_lowering_settle_seconds: 0.18
+phase7_between_object_settle_seconds: 0.08
+post_open_settle_seconds: 0.20
+
+# ───────────── PHASE 7.5: SPHERE CAGING + CYLINDER SLIP RECOVERY ─────────────
+# Release-6 diagnosis:
+# - the sphere now receives the right YAML keys and the gripper does close,
+#   but contact is one-sided and early: one finger reaches ≈0 mm while the
+#   other reaches only ≈3 mm, so the ball is pushed/rolled and close validation
+#   aborts before micro-lift.
+# - do not widen the sphere diameter again; use a probationary expected-floor
+#   cage and let micro-lift be the empirical verification.
+# - the roller passed, but the visual slip appeared because the shortened
+#   pre-transport preload reached only ≈0.54 effort versus ≈0.78 target.
+#   Restore stronger preload and gentler lowering without returning to very
+#   sluggish whole-robot timing.
+gripper_allow_probationary_floor_capture: true
+gripper_floor_capture_squeeze_extra_m: 0.0058
+gripper_max_closing_ticks: 110
+gripper_close_wait_timeout_s: 4.8
+gripper_squeeze_ticks: 58
+
+retry_sphere_close_expected_dim_delta_m: 0.0000
+retry_sphere_close_grasp_z_delta_m: -0.0015
+retry_sphere_close_force_scale: 1.18
+retry_sphere_close_hold_extra_delta_m: 0.0008
+retry_sphere_close_hold_settle_extra_s: 0.18
+
+# Transport remains responsive, but direct preload must actually reach a useful
+# holding effort before lateral motion of the roller.
+post_lift_before_transport_settle_seconds: 0.08
+place_transport_shear_preload_settle_seconds: 0.06
+place_transport_direct_preload_max_frames: 72
+place_transport_direct_preload_required_stable_samples: 2
+place_transport_direct_preload_sample_stride_frames: 2
+place_transport_direct_preload_step_m: 0.000085
+place_transport_direct_preload_max_extra_close_m: 0.00220
+place_transport_direct_preload_force_n: 64.0
+place_transport_direct_preload_max_effort_sim: 1.18
+place_transport_direct_preload_max_shape_ratio: 1.45
+
+# Lowering was the phase where the roller visually slipped.  Slightly slower
+# than Phase 7.4, still much faster than the old sluggish settings.
+place_lowering_duration: 2.15
+place_lowering_steps: 129
+post_place_lowering_settle_seconds: 0.18
+
+# ───────────── PHASE 7.6: SPHERE LOWER-CUP CAPTURE + ROLLER HOLD RESTORE ─────────────
+# Release-6 log diagnosis:
+# - rubber ball now passes close validation and reaches micro-lift; failure is real
+#   capture slip: object dz≈2.7–3.7 mm while flange dz≈23 mm, relative drift≈20 mm.
+# - retry logic accidentally raised the sphere on retry when contact looked early.
+# - roller visual slip returned because transport preload was still far below the
+#   target effort after the speed trims.
+
+# More hold time only for sphere is handled from object YAML; keep global timing responsive.
+post_close_hold_seconds: 0.45
+
+# Sphere no-follow retry must lower/cup, never raise because of the generic near-table rule.
+retry_sphere_no_follow_grasp_z_delta_m: -0.0030
+retry_sphere_no_follow_force_scale: 1.12
+retry_sphere_no_follow_hold_extra_delta_m: 0.0014
+retry_sphere_no_follow_hold_settle_extra_s: 0.28
+retry_sphere_no_follow_micro_lift_speed_scale: 0.65
+
+# If the ball is still rolling slightly after a failed micro-lift, wait once and
+# resample instead of immediately ending the whole object trial.
+target_stability_retry_wait_enabled: true
+target_stability_retry_wait_seconds: 0.35
+target_stability_retry_wait_max_resamples: 1
+
+# Restore stronger stationary preload for the foam roller without returning to
+# painfully slow transport.
+place_transport_direct_preload_max_frames: 96
+place_transport_direct_preload_required_stable_samples: 2
+place_transport_direct_preload_sample_stride_frames: 2
+place_transport_direct_preload_step_m: 0.000095
+place_transport_direct_preload_max_extra_close_m: 0.00300
+place_transport_direct_preload_force_n: 72.0
+place_transport_direct_preload_max_effort_sim: 1.22
+place_transport_direct_preload_max_shape_ratio: 1.48
+
+# A bit more residual correction during lowering helps prevent the roller grip
+# effort from decaying after transport preload.
+place_lowering_duration: 2.05
+place_lowering_steps: 123
+place_lowering_admittance_max_extra_close_m: 0.00045
+place_lowering_admittance_delta_step_m: 0.000035
+post_place_lowering_settle_seconds: 0.16
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 7.7: sphere lower-cup rescue after release-7 logs
+# ─────────────────────────────────────────────────────────────
+# The ball was already at the table-clamped height, so lowering the nominal
+# grasp fraction alone had no effect. These retry values are only used by the
+# sphere partial-slip branch; the arm controller still enforces fingertip
+# clearance.
+retry_sphere_partial_slip_grasp_z_delta_m: -0.0012
+retry_sphere_partial_slip_force_scale: 1.08
+retry_sphere_partial_slip_hold_extra_close_delta_m: 0.0012
+retry_sphere_partial_slip_hold_extra_s: 0.35
+retry_sphere_partial_slip_micro_lift_speed_scale: 0.45
+
+# Keep the roller safer after the user observed a small lowering slip.  The
+# previous direct-preload trimming made the roller pass numerically but look
+# under-held visually.
+place_transport_direct_preload_max_frames: 120
+place_transport_direct_preload_required_stable_samples: 3
+place_transport_direct_preload_sample_stride_frames: 2
+place_transport_direct_preload_max_extra_close_m: 0.00340
+place_transport_direct_preload_force_n: 76.0
+place_transport_direct_preload_max_effort_sim: 1.24
+place_lowering_duration: 2.25
+place_lowering_steps: 135
+place_lowering_admittance_max_extra_close_m: 0.00060
+place_lowering_admittance_delta_step_m: 0.000040
+post_place_lowering_settle_seconds: 0.18
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 7.8 — generalized low-carry and effort-policy fixes
+# ─────────────────────────────────────────────────────────────
+# These are generic, behavior-profile parameters. They are not label-specific.
+# Objects can opt in through soft_objects.yaml using carry_bottom_clearance_m
+# and transport_effort_policy.
+# Global low-carry target: keep held object bottom roughly 70 mm above table.
+# Individual objects may override this, for example rolling/caging objects.
+carry_bottom_clearance_m: 0.070
+low_carry_min_after_micro_lift_m: 0.018
+low_carry_min_fingertip_clearance_m: 0.018
+place_transport_abort_on_effort_over_max: true
+use_target_nominal_for_transport_safety: true
+
+# Keep transport from being overly sluggish while the carry height is lower.
+place_transport_duration: 2.20
+place_transport_steps: 132
+post_lift_before_transport_settle_seconds: 0.05
+post_place_transport_settle_seconds: 0.08

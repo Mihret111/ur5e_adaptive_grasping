@@ -31,7 +31,7 @@ class Gripper2FG7:
     FAILED_CLOSE = "FAILED_CLOSE"  # close resolved, but no physically plausible two-finger grasp
 
     # ── Version marker ─────────────────────────────────────────────
-    VERSION = "v5-balanced-contact-close" # pair-aware contact + balanced hold
+    VERSION = "v7-probationary-sphere-cage" # pair-aware contact + forced floor-capture probation for spheres
 
     def __init__(
         self,
@@ -146,7 +146,21 @@ class Gripper2FG7:
         self._contact_quality = None
         self._squeeze_phase    = False
         self._squeeze_ticks    = 0
-        self._had_contact      = False 
+        self._had_contact      = False
+        # Phase 7.4/7.5: for spherical soft objects, an early asymmetric shell
+        # contact can be detected while the gripper is still almost fully open.
+        # The executor can request an expected-contact floor so squeeze/hold
+        # targets do not remain at that early shell-touch pose.
+        self._use_expected_contact_floor = False
+        # Phase 7.5: if a soft sphere stalls early, command a caging squeeze
+        # toward the expected floor and let micro-lift prove/reject capture.
+        # This prevents the symbolic close validator from vetoing the only
+        # useful test for a rolling ball.
+        self._allow_probationary_floor_capture = bool(
+            self.config.get("gripper_allow_probationary_floor_capture", True)
+        )
+        self._probationary_floor_capture = False
+        self._floor_capture_reason = None
 
         # ── Find joints ────────────────────────────────────────────
         self.left_joint  = self.stage.GetPrimAtPath(Sdf.Path(left_joint_path))
@@ -391,6 +405,8 @@ class Gripper2FG7:
         self._close_failure_reason = None
         self._expected_grip_dim_m = None
         self._expected_contact_position = None
+        self._probationary_floor_capture = False
+        self._floor_capture_reason = None
 
         self._set_drive(
             target=self.OPEN_POS,
@@ -568,15 +584,26 @@ class Gripper2FG7:
         target may open the finger that had already closed farther.  This
         balanced rule closes the lagging finger toward the pair average while
         never commanding any finger to open.
+
+        Phase 7.4 adds an optional expected-contact floor.  For a soft sphere,
+        PhysX can report a high effort / shell contact while the opening is
+        still about 69--71 mm.  If we build hold targets from that early pose,
+        the ball is touched but not captured.  When enabled, the base target is
+        at least expected_contact_position + extra_close, so the gripper cups
+        the actual 60 mm sphere instead of accepting the inflated shell touch.
         """
         positions = self._clamp_joint_positions(positions)
         if not positions:
             return [self.CLOSED_POS, self.CLOSED_POS]
 
-        base = min(
-            self.CLOSED_POS,
-            (sum(positions) / len(positions)) + float(extra_close),
-        )
+        avg_based = (sum(positions) / len(positions)) + float(extra_close)
+        base = avg_based
+        expected_floor = None
+        if self._use_expected_contact_floor and self._expected_contact_position is not None:
+            expected_floor = float(self._expected_contact_position) + float(extra_close)
+            base = max(base, expected_floor)
+
+        base = min(self.CLOSED_POS, base)
 
         return [
             min(self.CLOSED_POS, max(float(p), base))
@@ -597,6 +624,8 @@ class Gripper2FG7:
 
         self._state = self.FAILED_CLOSE
         self._had_contact = False
+        self._probationary_floor_capture = False
+        self._floor_capture_reason = None
         self._close_failure_reason = reason
         self._contact_positions = positions if positions else None
         self._contact_position = min(positions) if positions else None
@@ -622,6 +651,7 @@ class Gripper2FG7:
         force_n: Optional[float] = None,
         expected_grip_dim_m: Optional[float] = None,
         hold_extra_close_m: Optional[float] = None,
+        use_expected_contact_floor: bool = False,
     ):
         """
         Close gripper — velocity-controlled approach.
@@ -649,7 +679,10 @@ class Gripper2FG7:
         self._hold_targets = None
         self._hold_target_mode = "scalar_legacy"
         self._contact_quality = None
-        self._had_contact = False 
+        self._had_contact = False
+        self._use_expected_contact_floor = bool(use_expected_contact_floor)
+        self._probationary_floor_capture = False
+        self._floor_capture_reason = None
 
         # Object-size-aware expected contact position.
         self._close_failure_reason = None
@@ -670,7 +703,8 @@ class Gripper2FG7:
             f"→ CLOSING  F={self._close_force:.0f}N  "
             f"v={self._approach_speed:.3f}m/s  "
             f"expected_dim={self._expected_grip_dim_m}  "
-            f"expected_contact={self._expected_contact_position}"
+            f"expected_contact={self._expected_contact_position}  "
+            f"expected_floor={self._use_expected_contact_floor}"
         )
 
     def hold(self):
@@ -701,6 +735,15 @@ class Gripper2FG7:
         self._contact_quality = self._contact_quality_from_positions(
             self._contact_positions
         )
+        if (
+            self._use_expected_contact_floor
+            and self._allow_probationary_floor_capture
+            and self._contact_quality
+            and not self._contact_quality.get("plausible", False)
+            and self._contact_quality.get("quality") in ("too_open_or_early", "too_asymmetric")
+        ):
+            self._probationary_floor_capture = True
+            self._floor_capture_reason = self._floor_capture_reason or "hold_entered_with_expected_floor_cage"
         self._hold_targets = self._make_balanced_more_closed_targets(
             self._contact_positions,
             self._active_hold_extra_close,
@@ -931,7 +974,27 @@ class Gripper2FG7:
                 self._fail_close("fully_closed_no_object_or_missed_object", cur)
                 return
 
-            # Case 3: implausibly early or too asymmetric stall. Keep closing.
+            # Case 3: soft-sphere caging.  With a rolling sphere, the first
+            # finger can touch the deformable shell early and the object shifts
+            # a few millimetres, so the pair average may never enter the nominal
+            # contact window.  If the executor explicitly requested expected
+            # contact-floor mode, do not wait until timeout. Build a balanced
+            # floor-capture squeeze/hold target and let micro-lift be the real
+            # verification step.
+            if (
+                self._use_expected_contact_floor
+                and self._allow_probationary_floor_capture
+                and self._expected_contact_position is not None
+                and quality.get("quality") in ("too_open_or_early", "too_asymmetric")
+            ):
+                self._start_squeeze_from_positions(
+                    cur,
+                    probationary_floor_capture=True,
+                    floor_capture_reason="early_stall_floor_cage_micro_lift_will_validate",
+                )
+                return
+
+            # Case 4: implausibly early or too asymmetric stall. Keep closing.
             self._close_failure_reason = "ignored_implausible_pair_stall"
             self._log(
                 "Ignoring implausible pair stall: "
@@ -947,12 +1010,19 @@ class Gripper2FG7:
 
         self._last_positions = cur
 
-    def _start_squeeze_from_positions(self, positions: list):
-        """Enter squeeze phase from a plausible contact configuration.
+    def _start_squeeze_from_positions(
+        self,
+        positions: list,
+        probationary_floor_capture: bool = False,
+        floor_capture_reason: Optional[str] = None,
+    ):
+        """Enter squeeze phase from a contact/caging configuration.
 
-        We keep a per-finger record of the contact configuration. A single
-        scalar contact position is still logged for backward compatibility,
-        but motor commands use separate targets for left and right fingers.
+        Normal mode starts only from a plausible pair-contact configuration.
+        Phase 7.5 adds a probationary floor-capture mode for rolling spheres:
+        if the pair stalls early but the executor requested expected-floor
+        caging, we command the squeeze/hold target to the expected contact
+        floor and let micro-lift validate the grasp empirically.
         """
         positions = self._clamp_joint_positions(positions)
         if not positions:
@@ -961,9 +1031,17 @@ class Gripper2FG7:
         self._contact_positions = positions
         self._contact_position = min(positions)
         self._contact_quality = self._contact_quality_from_positions(positions)
+        self._probationary_floor_capture = bool(probationary_floor_capture)
+        self._floor_capture_reason = floor_capture_reason
+        squeeze_extra = float(
+            self.config.get(
+                "gripper_floor_capture_squeeze_extra_m",
+                self._active_hold_extra_close if self._probationary_floor_capture else 0.001,
+            )
+        )
         self._squeeze_targets = self._make_balanced_more_closed_targets(
             positions,
-            0.001,
+            squeeze_extra,
         )
         self._hold_targets = None
         self._hold_target_mode = "balanced_pair_pending_hold"
@@ -984,8 +1062,10 @@ class Gripper2FG7:
             velocity=0.0,
         )
         self._log(
-            f"Plausible contact at positions "
+            f"Contact/cage start at positions "
             f"{[f'{p:.5f}' for p in positions]} "
+            f"probationary={self._probationary_floor_capture} "
+            f"reason={self._floor_capture_reason} "
             f"→ squeeze targets {[f'{t:.5f}' for t in self._squeeze_targets]}"
         )
 
@@ -1055,6 +1135,16 @@ class Gripper2FG7:
             return False
 
         if self._contact_quality and not self._contact_quality.get("plausible", False):
+            if (
+                self._use_expected_contact_floor
+                and self._probationary_floor_capture
+                and self._hold_targets is not None
+            ):
+                self._log(
+                    "has_object: probationary expected-floor sphere cage → True; "
+                    "micro-lift will verify capture"
+                )
+                return True
             self._log(
                 "has_object: stored contact quality is not plausible "
                 f"({self._contact_quality.get('quality')}) → False"
@@ -1133,6 +1223,10 @@ class Gripper2FG7:
             "close_failure_reason": self._close_failure_reason,
             "expected_grip_dim_m": self._expected_grip_dim_m,
             "expected_contact_position_m": self._expected_contact_position,
+            "use_expected_contact_floor": self._use_expected_contact_floor,
+            "probationary_floor_capture": self._probationary_floor_capture,
+            "floor_capture_reason": self._floor_capture_reason,
+            "allow_probationary_floor_capture": self._allow_probationary_floor_capture,
             "expected_contact_window_m": (
                 list(self._contact_position_window())
                 if self._expected_contact_position is not None

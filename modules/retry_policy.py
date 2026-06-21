@@ -257,9 +257,25 @@ class RetryPolicy:
 
         return result
 
-    def _safe_z_delta(self, requested_delta: float, thin_object: bool, near_table: bool) -> float:
-        """Clamp retry lowering for risky near-table/thin cases."""
-        if requested_delta < 0.0 and (thin_object or near_table):
+    def _safe_z_delta(
+        self,
+        requested_delta: float,
+        thin_object: bool,
+        near_table: bool,
+        *,
+        allow_near_table_lowering: bool = False,
+    ) -> float:
+        """Clamp retry lowering for risky near-table/thin cases.
+
+        Phase 7.7 exception:
+        a small rubber sphere can fail because the fingers are still above the
+        useful lower-cup band.  If the object explicitly enters the sphere-cup
+        recovery branch, allow a small negative delta even near the table.  The
+        arm controller still enforces the final fingertip clearance.
+        """
+        if requested_delta < 0.0 and thin_object:
+            return 0.0
+        if requested_delta < 0.0 and near_table and not allow_near_table_lowering:
             return 0.0
         return float(requested_delta)
 
@@ -452,6 +468,7 @@ class RetryPolicy:
         failure_reason = attempt_log.get("failure_reason")
 
         target = trial_log.get("target", {}) or {}
+        target_full = trial_log.get("target_full", {}) or target
         target_feas = attempt_log.get(
             "target_feasibility",
             trial_log.get("target_feasibility", {}) or {},
@@ -459,11 +476,11 @@ class RetryPolicy:
         micro = attempt_log.get("micro_lift_validation", {}) or {}
 
         grip_class = target_feas.get("grip_feasibility_class", "unknown")
-        material = target.get("material", "unknown")
-        shape = target.get("shape", "unknown")
+        material = target_full.get("material_name", target.get("material", "unknown"))
+        shape = target_full.get("shape", target.get("shape", "unknown"))
 
-        fragile = self._is_fragile_material(material)
-        thin_object = self._is_thin_object(target, attempt_log)
+        fragile = self._is_fragile_material(material) or bool(target_full.get("fragile", False))
+        thin_object = self._is_thin_object(target_full, attempt_log)
         near_table = self._is_near_table_grasp(attempt_log)
         contact_info = self._classify_contact_quality(attempt_log)
         contact_quality = contact_info.get("quality")
@@ -581,16 +598,55 @@ class RetryPolicy:
                 )
                 decision["reason"] = "retry_close_failed_geometry_first"
 
+            expected_grip_dim_delta_m = 0.0
+            force_scale = 1.0 if fragile else float(
+                self.config.get("retry_close_fail_force_scale", 1.05)
+            )
+            hold_delta = 0.0
+            hold_extra_s = float(
+                self.config.get("retry_close_fail_hold_extra_s", 0.3)
+            )
+
+            if (
+                str(shape).lower() == "sphere"
+                and contact_quality in (
+                    "too_open_or_early",
+                    "contact_too_early_or_not_reached",
+                    "no_plausible_contact_or_early_stall",
+                    "too_asymmetric",
+                )
+            ):
+                # Release-6 diagnosis: the ball is not a wrong-diameter problem
+                # anymore.  It is a one-sided rolling/caging problem: one finger
+                # touches the soft shell early, the ball shifts a few mm, and
+                # the pair never reaches the nominal window.  Do not widen the
+                # expected diameter again.  Retry lower, stronger, and with more
+                # hold target so micro-lift can empirically validate capture.
+                expected_grip_dim_delta_m = float(
+                    self.config.get("retry_sphere_close_expected_dim_delta_m", 0.0)
+                )
+                z_delta = float(
+                    self.config.get("retry_sphere_close_grasp_z_delta_m", -0.0015)
+                )
+                force_scale = float(
+                    self.config.get("retry_sphere_close_force_scale", 1.20)
+                )
+                hold_delta = float(
+                    self.config.get("retry_sphere_close_hold_extra_delta_m", 0.0008)
+                )
+                hold_extra_s = float(
+                    self.config.get("retry_sphere_close_hold_settle_extra_s", 0.18)
+                )
+                decision["reason"] = "retry_sphere_close_failed_lower_stronger_floor_cage"
+
             decision["adjustments"] = {
                 "refresh_object_pose": True,
                 "grasp_z_delta_m": z_delta,
-                "force_scale": 1.0 if fragile else float(
-                    self.config.get("retry_close_fail_force_scale", 1.05)
-                ),
-                "hold_settle_extra_s": float(
-                    self.config.get("retry_close_fail_hold_extra_s", 0.3)
-                ),
+                "force_scale": force_scale,
+                "hold_extra_close_delta_m": hold_delta,
+                "hold_settle_extra_s": hold_extra_s,
                 "micro_lift_speed_scale": 1.0,
+                "expected_grip_dim_delta_m": expected_grip_dim_delta_m,
             }
             return decision
 
@@ -598,16 +654,37 @@ class RetryPolicy:
             cls = micro.get("failure_classification", "")
 
             if cls == "SOFT_OBJECT_MOTION_OBSERVER_UNRELIABLE":
-                # Fail closed.  A retry should not drive back to a stale USD-bbox
-                # pose after a deformable object has visibly moved but cannot be
-                # reacquired by the current observer.  This is a perception
-                # limitation, not a manipulation retry condition.
-                decision["retry"] = False
-                decision["reason"] = "no_retry_soft_object_pose_observer_unreliable"
+                # Phase 7.1: for the rubber ball this classification meant the
+                # USD-bbox observer stayed static while the gripper diagnostics
+                # still reported a plausible clean grasp.  Do not jump to the
+                # next object; retry from fresh pose with a lower equator grasp.
+                allow = bool(self.config.get("retry_soft_observer_unreliable_allow_retry", True))
+                if not allow:
+                    decision["retry"] = False
+                    decision["reason"] = "no_retry_soft_object_pose_observer_unreliable"
+                    decision["adjustments"] = {
+                        "refresh_object_pose": False,
+                        "requires_reacquisition": True,
+                        "recommended_next_step": "use runtime deformable/vision observer or reset object before retry",
+                    }
+                    return decision
+
+                shape_l = str(shape or "").lower()
+                if shape_l == "sphere":
+                    z_delta = float(self.config.get("retry_soft_observer_unreliable_sphere_grasp_z_delta_m", -0.004))
+                else:
+                    z_delta = float(self.config.get("retry_soft_observer_unreliable_grasp_z_delta_m", 0.0))
+                decision["retry"] = True
+                decision["reason"] = "retry_soft_observer_static_regrasp_from_fresh_pose"
                 decision["adjustments"] = {
-                    "refresh_object_pose": False,
-                    "requires_reacquisition": True,
-                    "recommended_next_step": "use runtime deformable/vision observer or reset object before retry",
+                    "refresh_object_pose": True,
+                    "grasp_z_delta_m": self._safe_z_delta(z_delta, thin_object, near_table),
+                    "force_scale": float(self.config.get("retry_soft_observer_unreliable_force_scale", 1.10)),
+                    "hold_extra_close_delta_m": float(self.config.get("retry_soft_observer_unreliable_hold_extra_delta_m", 0.00030)),
+                    "hold_settle_extra_s": float(self.config.get("retry_soft_observer_unreliable_hold_settle_extra_s", 0.6)),
+                    "micro_lift_speed_scale": float(self.config.get("retry_soft_observer_unreliable_micro_lift_speed_scale", 0.65)),
+                    "fresh_reperception_retry": True,
+                    "observer_unreliable_retry": True,
                 }
                 return decision
 
@@ -621,11 +698,11 @@ class RetryPolicy:
                 "missing_close_diagnostics",
             )
 
-            if bool(self.config.get("retry_block_after_disturbed_micro_lift", True)) and motion.get("disturbed_for_normal_retry"):
+            if bool(self.config.get("retry_block_after_disturbed_micro_lift", True)) and object_motion.get("disturbed_for_normal_retry"):
                 decision["retry"] = False
                 decision["reason"] = "no_retry_object_disturbed_after_failed_micro_lift"
                 decision["adjustments"] = {
-                    "object_motion": motion,
+                    "object_motion": object_motion,
                     "recommended_next_step": "reset object or run fresh perception after a controlled retreat; do not chase disturbed soft object",
                 }
                 return decision
@@ -633,12 +710,38 @@ class RetryPolicy:
             if cls == "NO_SECURE_CAPTURE_OBJECT_DID_NOT_FOLLOW":
                 decision["retry"] = True
 
+                # Phase 7.6: a rubber sphere can report early/asymmetric contact
+                # even while the object visibly rolls out during micro-lift.
+                # The old branch used the generic near-table rule and sometimes
+                # RAISED the retry grasp by +2 mm, exactly the opposite of the
+                # useful recovery.  For spheres, always retry lower with stronger
+                # caging, independent of whether the contact classifier called it
+                # plausible or too-open.  The arm controller/table-clearance clamp
+                # remains the safety guard.
+                if str(shape or "").lower() == "sphere":
+                    z_delta = float(
+                        self.config.get("retry_sphere_no_follow_grasp_z_delta_m", -0.003)
+                    )
+                    force_scale = float(self.config.get("retry_sphere_no_follow_force_scale", 1.12))
+                    hold_extra_delta = float(self.config.get("retry_sphere_no_follow_hold_extra_delta_m", 0.0014))
+                    hold_settle_extra = float(self.config.get("retry_sphere_no_follow_hold_settle_extra_s", 0.28))
+                    micro_speed = float(self.config.get("retry_sphere_no_follow_micro_lift_speed_scale", 0.65))
+                    decision["reason"] = "retry_sphere_no_follow_lower_cup_regrasp"
+                    decision["adjustments"] = {
+                        "refresh_object_pose": True,
+                        "grasp_z_delta_m": z_delta,
+                        "force_scale": force_scale,
+                        "hold_extra_close_delta_m": hold_extra_delta,
+                        "hold_settle_extra_s": hold_settle_extra,
+                        "micro_lift_speed_scale": micro_speed,
+                        "sphere_lower_cup_retry": True,
+                    }
+                    return decision
+
                 if plausible_contact:
                     # The gripper contacted at the expected width, but the object
-                    # did not follow. So the next attempt should not blindly lower.
-                    # For thin discs with low-edge contact, raise slightly: this
-                    # often means the fingers touched a table/edge artifact before
-                    # truly wrapping the object.
+                    # did not follow. So the next attempt must actually change the
+                    # capture conditions.
                     if thin_object and self._is_low_edge_contact(contact_info):
                         z_delta = float(
                             self.config.get("retry_low_edge_thin_raise_z_delta_m", 0.002)
@@ -666,23 +769,67 @@ class RetryPolicy:
                     )
                     decision["reason"] = "retry_no_secure_capture"
 
+                if str(shape or "").lower() == "sphere":
+                    force_scale = float(self.config.get("retry_sphere_no_follow_force_scale", 1.06))
+                    hold_extra_delta = float(self.config.get("retry_sphere_no_follow_hold_extra_delta_m", 0.0010))
+                    hold_settle_extra = float(self.config.get("retry_sphere_no_follow_hold_settle_extra_s", 0.15))
+                    micro_speed = float(self.config.get("retry_sphere_no_follow_micro_lift_speed_scale", 0.85))
+                else:
+                    force_scale = 1.0 if fragile else float(
+                        self.config.get("retry_no_follow_force_scale", 1.10)
+                    )
+                    hold_extra_delta = 0.0
+                    hold_settle_extra = float(
+                        self.config.get("retry_no_follow_hold_extra_s", 0.4)
+                    )
+                    micro_speed = float(
+                        self.config.get("retry_no_follow_micro_lift_speed_scale", 0.80)
+                    )
+
                 decision["adjustments"] = {
                     "refresh_object_pose": True,
                     "grasp_z_delta_m": z_delta,
-                    "force_scale": 1.0 if fragile else float(
-                        self.config.get("retry_no_follow_force_scale", 1.10)
-                    ),
-                    "hold_settle_extra_s": float(
-                        self.config.get("retry_no_follow_hold_extra_s", 0.4)
-                    ),
-                    "micro_lift_speed_scale": float(
-                        self.config.get("retry_no_follow_micro_lift_speed_scale", 0.80)
-                    ),
+                    "force_scale": force_scale,
+                    "hold_extra_close_delta_m": hold_extra_delta,
+                    "hold_settle_extra_s": hold_settle_extra,
+                    "micro_lift_speed_scale": micro_speed,
                 }
                 return decision
 
             if cls == "PARTIAL_SLIP_OR_WEAK_CAPTURE":
                 decision["retry"] = True
+
+                # Phase 7.7: the release-7 sphere attempts all failed in the
+                # same way: the ball partially followed the micro-lift but then
+                # slipped/rolled out.  Retrying with z_delta=0.0 repeats the
+                # same clamped grasp.  For a spherical rubber target, explicitly
+                # lower the next cup grasp and add a little more hold margin.
+                if shape == "Sphere":
+                    requested_z = float(
+                        self.config.get("retry_sphere_partial_slip_grasp_z_delta_m", -0.0012)
+                    )
+                    z_delta = self._safe_z_delta(
+                        requested_z,
+                        thin_object,
+                        near_table,
+                        allow_near_table_lowering=True,
+                    )
+                    decision["reason"] = "retry_sphere_partial_slip_lower_table_cup"
+                    decision["adjustments"] = {
+                        "refresh_object_pose": True,
+                        "grasp_z_delta_m": z_delta,
+                        "force_scale": float(self.config.get("retry_sphere_partial_slip_force_scale", 1.08)),
+                        "hold_extra_close_delta_m": float(
+                            self.config.get("retry_sphere_partial_slip_hold_extra_close_delta_m", 0.0012)
+                        ),
+                        "hold_settle_extra_s": float(
+                            self.config.get("retry_sphere_partial_slip_hold_extra_s", 0.35)
+                        ),
+                        "micro_lift_speed_scale": float(
+                            self.config.get("retry_sphere_partial_slip_micro_lift_speed_scale", 0.45)
+                        ),
+                    }
+                    return decision
 
                 if plausible_contact:
                     if significant_object_motion:
@@ -736,6 +883,32 @@ class RetryPolicy:
                 "hold_settle_extra_s": 0.4 if borderline else 0.3,
                 "micro_lift_speed_scale": 0.80 if borderline else 0.85,
                 "fresh_reperception_retry": bool(borderline or significant_object_motion),
+            }
+            return decision
+
+
+        if failure_reason in (
+            "place_transport_aborted_due_to_slip_or_drop",
+            "place_transport_validation_failed",
+            "place_transport_motion_failed",
+            "transport_preload_force_unavailable",
+        ):
+            if not bool(self.config.get("retry_after_transport_failure_enabled", True)):
+                decision["retry"] = False
+                decision["reason"] = "no_retry_transport_failure_retry_disabled"
+                return decision
+            decision["retry"] = True
+            decision["reason"] = "retry_after_transport_slip_regrasp_with_stronger_hold"
+            decision["adjustments"] = {
+                "refresh_object_pose": True,
+                "grasp_z_delta_m": float(self.config.get("retry_transport_slip_grasp_z_delta_m", 0.0)),
+                "force_scale": float(self.config.get("retry_transport_slip_force_scale", 1.18)),
+                "hold_extra_close_delta_m": float(self.config.get("retry_transport_slip_hold_extra_delta_m", 0.00040)),
+                "hold_settle_extra_s": float(self.config.get("retry_transport_slip_hold_settle_extra_s", 0.7)),
+                "micro_lift_speed_scale": float(self.config.get("retry_transport_slip_micro_lift_speed_scale", 0.65)),
+                "place_transport_speed_scale": float(self.config.get("retry_transport_slip_transport_speed_scale", 0.55)),
+                "place_transport_effort_target_scale": float(self.config.get("retry_transport_slip_effort_target_scale", 1.08)),
+                "transport_slip_retry": True,
             }
             return decision
 

@@ -1172,30 +1172,90 @@ class UR5EController:
         """
         Compute tool0 Z for external grasping.
 
-        full_wrap:    object shorter than fingers → fingers reach table
-        partial_wrap: object taller than fingers → fingers wrap top portion
+        Old rule:
+          - short object  -> full_wrap at table height
+          - tall object   -> partial_wrap near top
+
+        Phase 7.1 correction:
+          imported soft USD objects are not all cube-like.  A sphere should be
+          grasped around its equator, not near its upper cap; a roller should be
+          held around its central band.  The object registry can therefore set
+          grasp_height_mode and grasp_center_height_fraction.
         """
         obj_h = self._get_object_height(obj_meta)
+        obj_meta = obj_meta or {}
 
-        if obj_h <= self._finger_grasp_height:
-            # Fingers can fully wrap the object
+        mode = str(obj_meta.get("grasp_height_mode", "auto") or "auto").lower()
+        center_modes = {
+            "center_band",
+            "object_center",
+            "midline_full_wrap",
+            "spherical_equator",
+            "sphere_equator",
+        }
+
+        object_grasp_z_offset = 0.0
+        try:
+            object_grasp_z_offset = float(obj_meta.get("grasp_z_offset_m", 0.0) or 0.0)
+        except Exception:
+            object_grasp_z_offset = 0.0
+
+        if mode in center_modes:
+            default_fraction = 0.50
+            if mode in ("spherical_equator", "sphere_equator"):
+                # A tiny downward bias helps the 2FG7 pads catch the ball below
+                # the upper cap while still staying well above the table.
+                default_fraction = 0.48
+            try:
+                fraction = float(obj_meta.get("grasp_center_height_fraction", default_fraction))
+            except Exception:
+                fraction = default_fraction
+            fraction = max(0.20, min(0.80, fraction))
+            grasp_target_z = table_height + fraction * obj_h
+            tool0_z = grasp_target_z + self._flange_to_grasp_centre
+            strategy = "spherical_equator" if mode in ("spherical_equator", "sphere_equator") else "center_band"
+        elif obj_h <= self._finger_grasp_height:
+            # Fingers can fully wrap the object.  This is still valid for the
+            # cube, but not forced on every short soft object anymore.
             grasp_target_z = table_height
             tool0_z        = grasp_target_z + self._flange_to_fingertips
             strategy       = "full_wrap"
         else:
-            # Fingers wrap the top portion
+            # Fingers wrap the top portion.
             grasp_target_z = table_height + obj_h
             tool0_z        = grasp_target_z + self._flange_to_finger_base
             strategy       = "partial_wrap"
 
         tool0_z += self._grasp_z_offset
+        tool0_z += object_grasp_z_offset
         tool0_z += self._runtime_grasp_z_delta
 
-        # check if the tool0_z is too close to the table
+        # Check if the tool0_z is too close to the table.
         raw_tool0_z = tool0_z
         min_fingertip_clearance = float(
             self.config.get("min_fingertip_table_clearance_m", 0.0015)
         )
+        # Phase 7.7: the rubber sphere needs a lower cup/cage grasp.  Earlier
+        # code used max(global_clearance, object_clearance), which meant an
+        # object could request *more* clearance but never less.  The release-7
+        # logs showed the ball grasp was already clamped at the table limit
+        # (finger_bottom_z = table_z + 1.5 mm), so lowering grasp_center_height
+        # had no effect.  Allow an explicitly marked object to override the
+        # global clearance downward, while still clamping to a tiny non-negative
+        # safety margin.
+        try:
+            object_clearance = obj_meta.get("min_fingertip_clearance_m", None)
+            if object_clearance is not None:
+                object_clearance = max(0.0002, float(object_clearance))
+                if bool(obj_meta.get("allow_lower_than_global_fingertip_clearance", False)):
+                    min_fingertip_clearance = object_clearance
+                else:
+                    min_fingertip_clearance = max(
+                        min_fingertip_clearance,
+                        object_clearance,
+                    )
+        except Exception:
+            pass
         min_tool0_z = (
             table_height
             + self._flange_to_fingertips
@@ -1206,11 +1266,14 @@ class UR5EController:
         if tool0_z < min_tool0_z:
             tool0_z = min_tool0_z
             grasp_z_was_clamped = True
-        
-        # log tool0_z
+
+        finger_top_z = tool0_z - self._flange_to_finger_base
+        finger_bottom_z = tool0_z - self._flange_to_fingertips
+        finger_centre_z = tool0_z - self._flange_to_grasp_centre
+
         self._log(
             f"  [Height] {strategy}  obj={obj_h * 1000:.0f}mm  "
-            f"tool0_z={tool0_z:.4f}"
+            f"tool0_z={tool0_z:.4f}  finger_band=[{finger_bottom_z:.4f},{finger_top_z:.4f}]"
         )
 
         return {
@@ -1218,8 +1281,12 @@ class UR5EController:
             "strategy":        strategy,
             "object_height":   obj_h,
             "grasp_target_z":  grasp_target_z,
-            "finger_top_z":    tool0_z - self._flange_to_finger_base,
-            "finger_bottom_z": tool0_z - self._flange_to_fingertips,
+            "desired_grasp_centre_z": grasp_target_z,
+            "finger_centre_z": finger_centre_z,
+            "finger_top_z":    finger_top_z,
+            "finger_bottom_z": finger_bottom_z,
+            "grasp_height_mode": mode,
+            "object_grasp_z_offset_m": object_grasp_z_offset,
             "runtime_grasp_z_delta_m": self._runtime_grasp_z_delta,
             "grasp_ok":        True,
             "raw_tool0_z_before_table_clamp": raw_tool0_z,
@@ -1578,12 +1645,72 @@ class UR5EController:
 
         # ── Full lift (only after micro-lift validation) ───────
         flange_lift    = flange_grasp.copy()
-        flange_lift[2] = (
+
+        # Original conservative lift: high enough for generic transit, but it
+        # lifted small objects about 20+ cm above the table before transport.
+        # For rolling/caged soft objects this is unnecessary and makes recovery
+        # look like the gripper is opening/drop-testing in mid-air.  Phase 7.8
+        # allows a generic per-object/property low-carry target expressed as
+        # desired object-bottom clearance, not as a hard-coded label rule.
+        default_lift_z = (
             table_height
             + self._lift_above_table
             + self._flange_to_finger_base
             + self.ARM_BODY_CLEARANCE
         )
+        lift_policy = {
+            "mode": "default_high_clearance",
+            "default_lift_z": default_lift_z,
+        }
+        carry_bottom_clearance = None
+        if isinstance(object_metadata, dict):
+            carry_bottom_clearance = object_metadata.get(
+                "carry_bottom_clearance_m",
+                object_metadata.get("full_lift_bottom_clearance_m", None),
+            )
+        if carry_bottom_clearance is None:
+            carry_bottom_clearance = self.config.get("carry_bottom_clearance_m", None)
+
+        if carry_bottom_clearance is not None:
+            try:
+                carry_bottom_clearance = max(0.0, float(carry_bottom_clearance))
+                grasp_object_center_z = table_height + 0.5 * float(obj_height)
+                # Preserve the vertical tool0/object-center relation from the
+                # planned grasp; then lift only until the object bottom has the
+                # requested clearance.
+                tool0_to_object_center_z = float(height_info["tool0_z"]) - grasp_object_center_z
+                target_object_center_z = table_height + carry_bottom_clearance + 0.5 * float(obj_height)
+                low_carry_z = target_object_center_z + tool0_to_object_center_z
+
+                min_after_micro = float(self.config.get("low_carry_min_after_micro_lift_m", 0.018))
+                low_carry_z = max(low_carry_z, float(flange_micro_lift[2]) + min_after_micro)
+
+                min_tip_clearance = float(self.config.get("low_carry_min_fingertip_clearance_m", 0.018))
+                low_carry_z = max(low_carry_z, table_height + self._flange_to_fingertips + min_tip_clearance)
+
+                flange_lift[2] = low_carry_z
+                lift_policy.update({
+                    "mode": "object_bottom_clearance_low_carry",
+                    "carry_bottom_clearance_m": carry_bottom_clearance,
+                    "grasp_object_center_z": grasp_object_center_z,
+                    "target_object_center_z": target_object_center_z,
+                    "tool0_to_object_center_z": tool0_to_object_center_z,
+                    "low_carry_z_before_final_clamp": low_carry_z,
+                    "min_after_micro_lift_m": min_after_micro,
+                    "min_fingertip_clearance_at_carry_m": min_tip_clearance,
+                })
+            except Exception as e:
+                flange_lift[2] = default_lift_z
+                lift_policy.update({
+                    "mode": "default_high_clearance_fallback",
+                    "fallback_reason": str(e),
+                })
+        else:
+            flange_lift[2] = default_lift_z
+
+        # Keep normal table/arm-body collision clamp as final guard.
+        flange_lift = self._clamp_flange_z_above_table(flange_lift, "lift")
+        lift_policy["final_lift_z"] = float(flange_lift[2])
 
         # ── Safe retreat (back to transit height) ─────────────
         flange_safe_retreat    = flange_lift.copy()
@@ -1624,6 +1751,7 @@ class UR5EController:
             "grasp_strategy":     grasp_strategy,
             "object_height":      obj_height,
             "height_info":        height_info,
+            "lift_policy":        lift_policy,
         }
 
     # ══════════════════════════════════════════════════════════

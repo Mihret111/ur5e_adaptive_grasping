@@ -1056,11 +1056,63 @@ class SceneBuilder:
             ),
             "micro_lift_speed_scale": tmpl.get("micro_lift_speed_scale"),
             "close_speed_scale": tmpl.get("close_speed_scale"),
+            # Phase 7.4: preserve per-object runtime control keys.  Earlier
+            # patches wrote these in soft_objects.yaml, but they were silently
+            # dropped here, so the rubber_ball still used global adaptive safety
+            # and generic gripper behavior.
+            "close_expected_grip_dim_mm": tmpl.get("close_expected_grip_dim_mm"),
+            "close_contact_shell_extra_m": tmpl.get("close_contact_shell_extra_m"),
+            "adaptive_effort_control_enabled": tmpl.get("adaptive_effort_control_enabled"),
+            "adaptive_effort_target_sim": tmpl.get("adaptive_effort_target_sim"),
+            "adaptive_effort_max_relax_open_m": tmpl.get("adaptive_effort_max_relax_open_m"),
+            "adaptive_effort_max_extra_close_m": tmpl.get("adaptive_effort_max_extra_close_m"),
+            "soft_pose_source": tmpl.get("soft_pose_source"),
+            "grasp_height_mode": tmpl.get("grasp_height_mode"),
+            "grasp_center_height_fraction": tmpl.get("grasp_center_height_fraction"),
+            "grasp_z_offset_m": tmpl.get("grasp_z_offset_m"),
+            "min_fingertip_clearance_m": tmpl.get("min_fingertip_clearance_m"),
+            "allow_lower_than_global_fingertip_clearance": tmpl.get("allow_lower_than_global_fingertip_clearance"),
+            "sphere_allow_probationary_partial_micro_lift": tmpl.get("sphere_allow_probationary_partial_micro_lift"),
+            "sphere_partial_micro_lift_min_dz_m": tmpl.get("sphere_partial_micro_lift_min_dz_m"),
+            "sphere_partial_micro_lift_min_following_ratio": tmpl.get("sphere_partial_micro_lift_min_following_ratio"),
+            "sphere_partial_micro_lift_max_drift_m": tmpl.get("sphere_partial_micro_lift_max_drift_m"),
+            "sphere_micro_lift_rescue_delta_m": tmpl.get("sphere_micro_lift_rescue_delta_m"),
+            "sphere_micro_lift_rescue_settle_seconds": tmpl.get("sphere_micro_lift_rescue_settle_seconds"),
+            "sphere_micro_lift_rescue_force_n": tmpl.get("sphere_micro_lift_rescue_force_n"),
+            "gripper_use_expected_contact_floor": tmpl.get("gripper_use_expected_contact_floor"),
+            "gripper_capture_floor_note": tmpl.get("gripper_capture_floor_note"),
+            "sphere_micro_lift_preload_enabled": tmpl.get("sphere_micro_lift_preload_enabled"),
+            "sphere_micro_lift_preload_delta_m": tmpl.get("sphere_micro_lift_preload_delta_m"),
+            "sphere_micro_lift_preload_settle_seconds": tmpl.get("sphere_micro_lift_preload_settle_seconds"),
+            "sphere_micro_lift_preload_force_n": tmpl.get("sphere_micro_lift_preload_force_n"),
+            "target_stability_max_drift_m": tmpl.get("target_stability_max_drift_m"),
+            "target_stability_max_xy_drift_m": tmpl.get("target_stability_max_xy_drift_m"),
+            "target_stability_retry_wait_seconds": tmpl.get("target_stability_retry_wait_seconds"),
+            # Phase 7.8: generic behavior-profile and transport policy keys.
+            # These avoid hard-coding one label (for example rubber_ball) in the executor.
+            "grasp_behavior_profile": tmpl.get("grasp_behavior_profile"),
+            "transport_effort_policy": tmpl.get("transport_effort_policy"),
+            "transport_abort_on_effort_over_max": tmpl.get("transport_abort_on_effort_over_max"),
+            "place_transport_admittance_max_effort_sim": tmpl.get("place_transport_admittance_max_effort_sim"),
+            "adaptive_safety_effort_enabled": tmpl.get("adaptive_safety_effort_enabled"),
+            "use_target_nominal_for_safety": tmpl.get("use_target_nominal_for_safety"),
+            "carry_bottom_clearance_m": tmpl.get("carry_bottom_clearance_m"),
+            "full_lift_bottom_clearance_m": tmpl.get("full_lift_bottom_clearance_m"),
+            "target_nominal_width_m": tmpl.get("target_nominal_width_m"),
+            "target_nominal_depth_m": tmpl.get("target_nominal_depth_m"),
+            "target_nominal_height_m": tmpl.get("target_nominal_height_m"),
             "strategy_hint": tmpl.get("strategy_hint", "delicate_pick"),
             "validation_profile": tmpl.get("validation_profile", "soft"),
             "fallback_primitive": tmpl.get("fallback_primitive"),
             "soft_object": True,
         })
+
+        # Phase 7.6A hotfix: do not propagate optional keys with explicit None.
+        # Python dict.get(key, fallback) returns None when key exists with None,
+        # so these None values can later crash float(None) in the executor.
+        for _optional_key in list(obj_def.keys()):
+            if obj_def.get(_optional_key) is None:
+                obj_def.pop(_optional_key, None)
 
         # If the USD is authored as a 1-unit object, derive a metres scale from
         # the scientific height declared in the catalogue.  This prevents a
@@ -1588,12 +1640,42 @@ class SceneBuilder:
                 "asset_type", "asset_path", "resolved_asset_path", "asset_scale",
                 "preferred_force_n", "max_force_n",
                 "gripper_hold_extra_close_m", "micro_lift_speed_scale",
-                "close_speed_scale", "strategy_hint", "validation_profile",
+                "close_speed_scale",
+                "close_expected_grip_dim_mm", "close_contact_shell_extra_m",
+                "adaptive_effort_control_enabled", "adaptive_effort_target_sim",
+                "adaptive_effort_max_relax_open_m", "adaptive_effort_max_extra_close_m",
+                "soft_pose_source", "grasp_height_mode", "grasp_center_height_fraction",
+                "grasp_z_offset_m", "min_fingertip_clearance_m",
+                "allow_lower_than_global_fingertip_clearance",
+                "sphere_allow_probationary_partial_micro_lift",
+                "sphere_partial_micro_lift_min_dz_m",
+                "sphere_partial_micro_lift_min_following_ratio",
+                "sphere_partial_micro_lift_max_drift_m",
+                "sphere_micro_lift_rescue_delta_m",
+                "sphere_micro_lift_rescue_settle_seconds",
+                "sphere_micro_lift_rescue_force_n",
+                "gripper_use_expected_contact_floor", "gripper_capture_floor_note",
+                "sphere_micro_lift_preload_enabled",
+                "sphere_micro_lift_preload_delta_m",
+                "sphere_micro_lift_preload_settle_seconds",
+                "sphere_micro_lift_preload_force_n",
+                "target_stability_max_drift_m",
+                "target_stability_max_xy_drift_m",
+                "target_stability_retry_wait_seconds",
+                "grasp_behavior_profile", "transport_effort_policy",
+                "transport_abort_on_effort_over_max",
+                "place_transport_admittance_max_effort_sim",
+                "adaptive_safety_effort_enabled",
+                "use_target_nominal_for_safety",
+                "carry_bottom_clearance_m", "full_lift_bottom_clearance_m",
+                "target_nominal_width_m", "target_nominal_depth_m",
+                "target_nominal_height_m",
+                "strategy_hint", "validation_profile",
                 "fallback_primitive",
                 "place_zone_key", "pickup_zone_key",
                 "phase7_object_role", "batch_order",
             ):
-                if key in obj_def:
+                if key in obj_def and obj_def[key] is not None:
                     obj_record[key] = obj_def[key]
 
             self._spawned_objects.append((prim_path, obj_record))
