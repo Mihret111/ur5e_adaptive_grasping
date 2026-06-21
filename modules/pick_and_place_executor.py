@@ -800,6 +800,221 @@ class PickAndPlaceExecutor:
             summary.update({"success": False, "reason": f"exception: {e}"})
         return json_safe(summary)
 
+    async def _direct_transport_preload_boost(self, *, target=None, target_effort_sim=None):
+        """Direct stationary preload booster for Phase 4.1h.
+
+        The Phase 4.1g log showed that the formal scalar admittance preload had
+        the right target but did not reach it before transport.  This booster is
+        still conservative, but it is direct: while stationary, close the hold
+        targets in small increments until measured effort is near the shear
+        target, deformation becomes too high, or the configured extra closure is
+        exhausted.  It is intentionally only used before transport, not as a
+        general policy during motion.
+        """
+        summary = {
+            "enabled": bool(self.config.get("place_transport_direct_preload_enabled", True)),
+            "phase": "4.1h_direct_stationary_shear_preload_booster",
+            "ran": False,
+            "target_effort_sim": target_effort_sim,
+            "trace": [],
+            "action_counts": {},
+        }
+        if not summary["enabled"]:
+            summary["reason"] = "place_transport_direct_preload_disabled"
+            return summary
+        try:
+            target_effort = float(target_effort_sim)
+        except Exception:
+            summary["reason"] = "invalid_target_effort"
+            return summary
+
+        app = omni.kit.app.get_app()
+        target_band = float(self.config.get("place_transport_direct_preload_target_band_sim", 0.035))
+        max_frames = max(1, int(self.config.get("place_transport_direct_preload_max_frames", 180)))
+        sample_stride = max(1, int(self.config.get("place_transport_direct_preload_sample_stride_frames", 4)))
+        step_m = float(self.config.get("place_transport_direct_preload_step_m", 0.00008))
+        max_extra = float(self.config.get("place_transport_direct_preload_max_extra_close_m", 0.00120))
+        max_effort = float(self.config.get("place_transport_direct_preload_max_effort_sim", self.config.get("adaptive_effort_max_sim", 1.20)))
+        max_shape_ratio = float(self.config.get("place_transport_direct_preload_max_shape_ratio", 1.45))
+        force_n = self.config.get("place_transport_direct_preload_force_n", None)
+        if force_n is not None:
+            try:
+                force_n = float(force_n)
+            except Exception:
+                force_n = None
+
+        summary.update({
+            "ran": True,
+            "target_band_sim": target_band,
+            "max_frames": max_frames,
+            "sample_stride_frames": sample_stride,
+            "step_m": step_m,
+            "max_extra_close_m": max_extra,
+            "max_effort_sim": max_effort,
+            "max_shape_ratio": max_shape_ratio,
+            "force_n": force_n,
+        })
+
+        total_extra = 0.0
+        stable_samples = 0
+        final_reason = "max_frames_reached"
+
+        def count(action):
+            d = summary.setdefault("action_counts", {})
+            d[action] = d.get(action, 0) + 1
+
+        for frame in range(max_frames):
+            self.gripper.update()
+            await app.next_update_async()
+            if frame % sample_stride != 0:
+                continue
+
+            try:
+                effort_obs = self.force_observer.observe(stage_name=f"direct_transport_preload_frame_{frame}") if hasattr(self, "force_observer") else None
+            except Exception as e:
+                effort_obs = {"available": False, "reason": str(e)}
+            try:
+                soft_obs = self._observe_target(target, stage_name=f"direct_transport_preload_frame_{frame}")
+            except Exception as e:
+                soft_obs = {"available": False, "reason": str(e)}
+
+            effort = None
+            if isinstance(effort_obs, dict) and effort_obs.get("available"):
+                try:
+                    effort = float(effort_obs.get("grip_effort_sim"))
+                except Exception:
+                    effort = None
+            err = None if effort is None else (target_effort - effort)
+
+            # Prefer rotation-aware OBB ratio if available; otherwise fall back
+            # to world-AABB ratio.  The booster should not overreact to simple
+            # rigid rotation.
+            shape_ratio_source = "none"
+            shape_ratio = None
+            if isinstance(soft_obs, dict):
+                try:
+                    if soft_obs.get("oriented_max_ratio") is not None and bool(self.config.get("place_transport_use_oriented_shape_for_deformation", True)):
+                        shape_ratio = float(soft_obs.get("oriented_max_ratio"))
+                        shape_ratio_source = "oriented_pca_bbox"
+                    else:
+                        ratios = []
+                        for key in ("width_ratio_x", "width_ratio_y"):
+                            if soft_obs.get(key) is not None:
+                                ratios.append(float(soft_obs.get(key)))
+                        h = soft_obs.get("height_m")
+                        nominal_h = float(self.config.get("adaptive_safety_nominal_height_m", 0.040))
+                        if h is not None and nominal_h > 1.0e-9:
+                            ratios.append(float(h) / nominal_h)
+                        if ratios:
+                            shape_ratio = max(ratios)
+                            shape_ratio_source = "world_aabb"
+                except Exception:
+                    pass
+
+            action = "hold"
+            adjustment = None
+            if effort is not None and effort >= target_effort - target_band:
+                stable_samples += 1
+                action = "stable_near_shear_target"
+                if stable_samples >= int(self.config.get("place_transport_direct_preload_required_stable_samples", 2)):
+                    final_reason = "stable_near_shear_target"
+                    count(action)
+                    summary["trace"].append(json_safe({
+                        "frame": frame,
+                        "action": action,
+                        "effort_sim": effort,
+                        "error_sim": err,
+                        "shape_ratio": shape_ratio,
+                        "shape_ratio_source": shape_ratio_source,
+                        "total_extra_close_m": total_extra,
+                        "effort_observation": effort_obs,
+                        "soft_observation": soft_obs,
+                    }))
+                    break
+            elif effort is not None and effort >= max_effort:
+                action = "stop_over_effort"
+                final_reason = "over_max_effort"
+                count(action)
+                summary["trace"].append(json_safe({
+                    "frame": frame,
+                    "action": action,
+                    "effort_sim": effort,
+                    "error_sim": err,
+                    "shape_ratio": shape_ratio,
+                    "shape_ratio_source": shape_ratio_source,
+                    "total_extra_close_m": total_extra,
+                    "effort_observation": effort_obs,
+                    "soft_observation": soft_obs,
+                }))
+                break
+            elif shape_ratio is not None and shape_ratio >= max_shape_ratio:
+                action = "stop_shape_ratio_limit"
+                final_reason = "shape_ratio_limit"
+                count(action)
+                summary["trace"].append(json_safe({
+                    "frame": frame,
+                    "action": action,
+                    "effort_sim": effort,
+                    "error_sim": err,
+                    "shape_ratio": shape_ratio,
+                    "shape_ratio_source": shape_ratio_source,
+                    "total_extra_close_m": total_extra,
+                    "effort_observation": effort_obs,
+                    "soft_observation": soft_obs,
+                }))
+                break
+            else:
+                stable_samples = 0
+                if total_extra < max_extra:
+                    delta = min(step_m, max_extra - total_extra)
+                    adjustment = self.gripper.adjust_hold_targets(
+                        delta_close_m=delta,
+                        reason="direct_pre_transport_shear_preload",
+                        force_n=force_n,
+                    )
+                    if isinstance(adjustment, dict) and adjustment.get("applied"):
+                        total_extra += delta
+                    action = "close_toward_shear_target"
+                else:
+                    action = "stop_extra_close_limit"
+                    final_reason = "extra_close_limit"
+                    count(action)
+                    summary["trace"].append(json_safe({
+                        "frame": frame,
+                        "action": action,
+                        "effort_sim": effort,
+                        "error_sim": err,
+                        "shape_ratio": shape_ratio,
+                        "shape_ratio_source": shape_ratio_source,
+                        "total_extra_close_m": total_extra,
+                        "adjustment": adjustment,
+                        "effort_observation": effort_obs,
+                        "soft_observation": soft_obs,
+                    }))
+                    break
+
+            count(action)
+            summary["trace"].append(json_safe({
+                "frame": frame,
+                "action": action,
+                "effort_sim": effort,
+                "error_sim": err,
+                "shape_ratio": shape_ratio,
+                "shape_ratio_source": shape_ratio_source,
+                "total_extra_close_m": total_extra,
+                "adjustment": adjustment,
+                "effort_observation": effort_obs,
+                "soft_observation": soft_obs,
+            }))
+
+        summary.update(json_safe({
+            "final_reason": final_reason,
+            "frames_used": frame if 'frame' in locals() else 0,
+            "total_extra_close_m": total_extra,
+            "trace_len": len(summary.get("trace", [])),
+        }))
+        return json_safe(summary)
+
     async def _apply_transport_shear_preload(self, *, target=None, shear_reference=None):
         """Stationary pre-transport preload using the shear-aware effort target.
 
@@ -848,6 +1063,18 @@ class PickAndPlaceExecutor:
             target_effort_override_sim=target_effort,
         )
         summary["regulation"] = json_safe(preload_result)
+
+        # Phase 4.1h: the 4.1g log showed that the formal preload target was
+        # computed correctly but not actually reached before transport.  Add a
+        # direct stationary booster so the predicted shear target is achieved
+        # before the object is exposed to transport shear.
+        direct_boost = None
+        if bool(self.config.get("place_transport_direct_preload_enabled", True)):
+            direct_boost = await self._direct_transport_preload_boost(
+                target=target,
+                target_effort_sim=target_effort,
+            )
+        summary["direct_preload_boost"] = json_safe(direct_boost)
 
         settle_s = float(self.config.get("place_transport_shear_preload_settle_seconds", 0.25))
         if settle_s > 0.0:
@@ -1254,6 +1481,8 @@ class PickAndPlaceExecutor:
         slip_close_m = float(self.config.get("place_transport_slip_close_relative_drift_m", 0.0060))
         slip_critical_m = float(self.config.get("place_transport_slip_critical_relative_drift_m", 0.0120))
         deformation_warn_score = float(self.config.get("place_transport_admittance_warn_deformation_score", 0.20))
+        slip_close_effort_margin = float(self.config.get("place_transport_slip_close_effort_margin_sim", 0.040))
+        slip_close_max_shape_ratio = float(self.config.get("place_transport_slip_close_max_shape_ratio", 1.34))
         disable_relax_during_motion = bool(self.config.get("place_transport_disable_relax_during_motion", True))
         abort_on_critical_slip = bool(self.config.get("place_transport_abort_on_critical_slip", True))
         abort_on_effort_loss = bool(self.config.get("place_transport_abort_on_effort_loss", True))
@@ -1315,6 +1544,8 @@ class PickAndPlaceExecutor:
             "slip_close_relative_drift_m": slip_close_m,
             "slip_critical_relative_drift_m": slip_critical_m,
             "deformation_warn_score": deformation_warn_score,
+            "slip_close_effort_margin_sim": slip_close_effort_margin,
+            "slip_close_max_shape_ratio": slip_close_max_shape_ratio,
             "disable_relax_during_motion": disable_relax_during_motion,
             "abort_on_critical_slip": abort_on_critical_slip,
             "abort_on_effort_loss": abort_on_effort_loss,
@@ -1356,6 +1587,8 @@ class PickAndPlaceExecutor:
             width_ratio_x = None
             width_ratio_y = None
             max_width_ratio = None
+            transport_shape_ratio = None
+            transport_shape_ratio_source = None
             deformation_score = None
             combined_risk_score = None
             table_gap_m = None
@@ -1406,6 +1639,12 @@ class PickAndPlaceExecutor:
                 max_width_ratio = max(width_ratio_x, width_ratio_y)
                 old = state.get("max_width_ratio")
                 state["max_width_ratio"] = max_width_ratio if old is None else max(old, max_width_ratio)
+                if bool(self.config.get("place_transport_use_oriented_shape_for_deformation", True)) and (soft_obs or {}).get("oriented_max_ratio") is not None:
+                    transport_shape_ratio = _safe_float((soft_obs or {}).get("oriented_max_ratio"))
+                    transport_shape_ratio_source = "pca_oriented_bbox"
+                else:
+                    transport_shape_ratio = max_width_ratio
+                    transport_shape_ratio_source = "world_aabb"
             except Exception:
                 pass
 
@@ -1486,8 +1725,23 @@ class PickAndPlaceExecutor:
                     requested_delta = 0.0
                     action = "transport_abort_over_effort"
                 elif relative_drift is not None and relative_drift >= slip_close_m:
-                    requested_delta = emergency_close_step
-                    action = "transport_close_from_relative_slip"
+                    # Phase 4.1i: do not keep squeezing just because drift exists.
+                    # If the effort is already above the shear target, or the
+                    # object is already visibly elongated, more closure tends to
+                    # create extrusion rather than useful anti-slip friction.
+                    effort_ok_for_extra_close = effort <= (target_effort + slip_close_effort_margin)
+                    shape_ok_for_extra_close = (
+                        transport_shape_ratio is None or transport_shape_ratio <= slip_close_max_shape_ratio
+                    )
+                    if effort_ok_for_extra_close and shape_ok_for_extra_close:
+                        requested_delta = emergency_close_step
+                        action = "transport_close_from_relative_slip"
+                    else:
+                        requested_delta = 0.0
+                        if not effort_ok_for_extra_close:
+                            action = "transport_slip_high_effort_no_extra_close"
+                        else:
+                            action = "transport_slip_shape_limit_no_extra_close"
                 elif effort_error is not None and effort_error > deadband:
                     requested_delta = delta_step
                     action = "transport_close_from_low_effort"
@@ -1537,6 +1791,8 @@ class PickAndPlaceExecutor:
                 "width_ratio_x": width_ratio_x,
                 "width_ratio_y": width_ratio_y,
                 "max_width_ratio": max_width_ratio,
+                "transport_shape_ratio": transport_shape_ratio,
+                "transport_shape_ratio_source": transport_shape_ratio_source,
                 "deformation_score": deformation_score,
                 "combined_risk_score": combined_risk_score,
                 "table_gap_m": table_gap_m,
@@ -2217,9 +2473,9 @@ class PickAndPlaceExecutor:
             "place_transport_fail_on_excessive_deformation": fail_on_deformation,
         })
 
-        # Phase 4.1b: transport is not only about XY arrival.  The object can
-        # reach the place zone while being stretched/slipped in the gripper.
-        # Therefore check the live deformable mesh after transport.
+        # Phase 4.1h: shape validation should not confuse rigid rotation with
+        # true soft-body deformation.  Prefer the PCA-oriented bbox metric when
+        # available; log both world-AABB and OBB metrics for research analysis.
         if isinstance(soft_obs_after, dict):
             wx_ratio = soft_obs_after.get("width_ratio_x")
             wy_ratio = soft_obs_after.get("width_ratio_y")
@@ -2232,25 +2488,47 @@ class PickAndPlaceExecutor:
             except Exception:
                 height_ratio = None
 
-            ratios = []
+            world_ratios = []
             for v in (wx_ratio, wy_ratio, height_ratio):
                 try:
                     if v is not None:
-                        ratios.append(float(v))
+                        world_ratios.append(float(v))
                 except Exception:
                     pass
-            max_ratio = max(ratios) if ratios else None
+            world_max_ratio = max(world_ratios) if world_ratios else None
+            world_deformation_score = max(abs(r - 1.0) for r in world_ratios) if world_ratios else None
+
+            use_oriented = bool(self.config.get("place_transport_use_oriented_shape_for_deformation", True))
+            oriented_max_ratio = soft_obs_after.get("oriented_max_ratio")
+            oriented_ratio_sorted = soft_obs_after.get("oriented_ratio_sorted")
+            oriented_bbox = soft_obs_after.get("oriented_bbox")
+
+            max_ratio = world_max_ratio
             deformation_score = soft_obs_after.get("deformation_score")
-            if deformation_score is None and ratios:
-                deformation_score = max(abs(r - 1.0) for r in ratios)
+            shape_metric_source = "world_aabb"
+            if use_oriented and oriented_max_ratio is not None:
+                try:
+                    max_ratio = float(oriented_max_ratio)
+                    deformation_score = abs(max_ratio - 1.0)
+                    shape_metric_source = "pca_oriented_bbox"
+                except Exception:
+                    pass
+            if deformation_score is None:
+                deformation_score = world_deformation_score
 
             result["transport_shape_safety"] = {
-                "width_ratio_x": wx_ratio,
-                "width_ratio_y": wy_ratio,
-                "height_ratio": height_ratio,
+                "shape_metric_source": shape_metric_source,
+                "width_ratio_x_world_aabb": wx_ratio,
+                "width_ratio_y_world_aabb": wy_ratio,
+                "height_ratio_world_aabb": height_ratio,
+                "world_aabb_max_dimension_ratio": world_max_ratio,
+                "world_aabb_deformation_score_proxy": world_deformation_score,
+                "oriented_max_ratio": oriented_max_ratio,
+                "oriented_ratio_sorted": oriented_ratio_sorted,
+                "oriented_bbox": oriented_bbox,
                 "max_dimension_ratio": max_ratio,
                 "deformation_score_proxy": deformation_score,
-                "interpretation": "large ratios during transport indicate soft-object stretch/slip/oscillation while held",
+                "interpretation": "PCA-oriented bbox helps separate cube rotation from real soft-object deformation/extrusion.",
             }
             if max_ratio is not None and max_ratio > max_width_ratio:
                 msg = f"soft object stretched during transport: max_ratio={max_ratio:.3f} > {max_width_ratio:.3f}"

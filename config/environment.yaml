@@ -539,3 +539,93 @@ place_transport_shear_audit_assumed_normal_axis_local: AUTO_HORIZONTAL_MAX_SHEAR
 place_transport_duration: 5.0
 place_transport_steps: 300
 post_place_transport_settle_seconds: 0.6
+# ───────────── PHASE 4.1h: STRONGER STATIONARY PRELOAD + ROTATION-AWARE SHAPE ─────────────
+# Phase 4.1g improved transport but preload did not actually reach the predicted
+# shear target before motion.  This phase strengthens the *stationary* preload
+# before transport and adds PCA/OBB shape metrics so rotation is not mistaken for
+# material stretch.
+place_transport_shear_preload_enabled: true
+place_transport_direct_preload_enabled: true
+place_transport_direct_preload_target_band_sim: 0.035
+place_transport_direct_preload_max_frames: 220
+place_transport_direct_preload_sample_stride_frames: 4
+place_transport_direct_preload_step_m: 0.00008
+place_transport_direct_preload_max_extra_close_m: 0.00120
+place_transport_direct_preload_required_stable_samples: 2
+place_transport_direct_preload_max_effort_sim: 1.20
+place_transport_direct_preload_max_shape_ratio: 1.45
+place_transport_direct_preload_force_n: 45.0
+
+# Slightly stronger shear reference.  The previous target was ~0.53, but the
+# stationary preload only reached ~0.39 before transport.  Keep the target capped
+# and let the shape monitor stop preload if the object begins over-deforming.
+place_transport_shear_mu_effective: 0.30
+place_transport_shear_safety_factor: 2.0
+place_transport_proxy_effort_bias_sim: 0.27
+place_transport_shear_target_min_sim: 0.48
+place_transport_shear_target_max_sim: 0.70
+
+# Transport residual feedback remains small; most holding should be achieved
+# before transport begins, not chased after the cube starts slipping.
+place_transport_admittance_max_extra_close_m: 0.00080
+place_transport_admittance_delta_step_m: 0.00004
+place_transport_admittance_sample_stride_frames: 3
+
+# Rotation-aware shape validation.
+place_transport_use_oriented_shape_for_deformation: true
+place_transport_max_width_ratio: 1.42
+place_transport_max_deformation_score: 0.42
+place_transport_fail_on_excessive_deformation: true
+
+# Keep audit/logging active.
+place_transport_shear_audit_enabled: true
+post_place_transport_settle_seconds: 0.6
+# ───────────── PHASE 4.1i: PRELOAD-PLUS-CREEP REDUCTION TUNING ─────────────
+# Phase 4.1h nearly succeeded: placement XY was good, object stayed held,
+# post-transport effort stayed nonzero, and oriented deformation only exceeded
+# the threshold by ~0.01-0.02.  Remaining failure is slow creep/stretch during
+# the 5 s carry.  Since gravity shear dominates over dynamic acceleration, a
+# slightly faster carry plus stronger stationary preload is more rational than
+# slow transport plus repeated squeezing during motion.
+
+# Stronger predicted shear preload.  Conservative mu raises required normal
+# effort, but max target prevents blind crushing.
+place_transport_shear_mu_effective: 0.27
+place_transport_shear_safety_factor: 2.0
+place_transport_proxy_effort_bias_sim: 0.29
+place_transport_shear_target_min_sim: 0.56
+place_transport_shear_target_max_sim: 0.72
+
+# Make the stationary preload get closer to the shear target before moving.
+place_transport_direct_preload_target_band_sim: 0.025
+place_transport_direct_preload_max_frames: 260
+place_transport_direct_preload_sample_stride_frames: 4
+place_transport_direct_preload_step_m: 0.00008
+place_transport_direct_preload_max_extra_close_m: 0.00160
+place_transport_direct_preload_required_stable_samples: 3
+place_transport_direct_preload_max_effort_sim: 1.05
+place_transport_direct_preload_max_shape_ratio: 1.32
+place_transport_direct_preload_force_n: 48.0
+
+# Residual transport feedback is now restrained: if effort is already above
+# target, additional closure may produce extrusion rather than useful friction.
+place_transport_admittance_max_extra_close_m: 0.00040
+place_transport_admittance_delta_step_m: 0.000035
+place_transport_admittance_sample_stride_frames: 3
+place_transport_slip_close_effort_margin_sim: 0.040
+place_transport_slip_close_max_shape_ratio: 1.34
+place_transport_slip_close_relative_drift_m: 0.0035
+
+# Carry a bit faster to reduce time-dependent creep.  The audit showed transport
+# acceleration is tiny compared with gravity shear, so this is unlikely to be
+# the dominant load increase.
+place_transport_duration: 4.0
+place_transport_steps: 240
+post_place_transport_settle_seconds: 0.45
+
+# Rotation-aware validation.  Keep it meaningful, but avoid failing on a tiny
+# empirical overshoot when object is still held, above table, and close to zone.
+place_transport_use_oriented_shape_for_deformation: true
+place_transport_max_width_ratio: 1.48
+place_transport_max_deformation_score: 0.48
+place_transport_fail_on_excessive_deformation: true

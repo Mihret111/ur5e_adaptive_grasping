@@ -12,6 +12,11 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import math
 
+try:
+    import numpy as np
+except Exception:  # pragma: no cover - Isaac normally ships numpy
+    np = None
+
 import omni.usd
 from pxr import Usd, UsdGeom, Sdf, Gf
 
@@ -145,6 +150,28 @@ class SoftObjectObserver:
             width_ratio_x = width_x / nominal_width
             width_ratio_y = width_y / nominal_width
 
+        oriented_bbox = pose_bbox.get("oriented_bbox") if isinstance(pose_bbox, dict) else None
+        oriented_size_m = None
+        oriented_size_sorted_m = None
+        oriented_max_ratio = None
+        oriented_min_ratio = None
+        oriented_ratio_sorted = None
+        if isinstance(oriented_bbox, dict) and oriented_bbox.get("size") is not None:
+            try:
+                oriented_size_m = [float(v) for v in oriented_bbox.get("size", [])]
+                oriented_size_sorted_m = [float(v) for v in oriented_bbox.get("size_sorted", sorted(oriented_size_m))]
+                if nominal_width and nominal_width > 1e-9 and oriented_size_m:
+                    ratios = [float(v) / nominal_width for v in oriented_size_m]
+                    oriented_ratio_sorted = [float(v) / nominal_width for v in oriented_size_sorted_m]
+                    oriented_max_ratio = max(ratios)
+                    oriented_min_ratio = min(ratios)
+            except Exception:
+                oriented_size_m = None
+                oriented_size_sorted_m = None
+                oriented_max_ratio = None
+                oriented_min_ratio = None
+                oriented_ratio_sorted = None
+
         obs = {
             "observer": "SoftObjectObserver",
             "prim_path": prim_path,
@@ -173,6 +200,12 @@ class SoftObjectObserver:
             "visible_bbox": visible_bbox,
             "collision_bbox": collision_bbox,
             "wrapper_bbox": wrapper_bbox,
+            "oriented_bbox": oriented_bbox,
+            "oriented_size_m": oriented_size_m,
+            "oriented_size_sorted_m": oriented_size_sorted_m,
+            "oriented_ratio_sorted": oriented_ratio_sorted,
+            "oriented_max_ratio": oriented_max_ratio,
+            "oriented_min_ratio": oriented_min_ratio,
         }
 
         # Useful warning flags for logs/research analysis.
@@ -254,6 +287,55 @@ class SoftObjectObserver:
             # centroid is useful later for deformation statistics.
             centroid = [sum(xs) / len(xs), sum(ys) / len(ys), sum(zs) / len(zs)]
 
+            # Rotation-aware geometry audit.
+            # A world-axis aligned bbox grows when a cube rotates, even if the
+            # material has not stretched.  A PCA-oriented bbox is not perfect for
+            # a deformable body, but it separates "rotated cube" from "actually
+            # expanded point cloud" much better than AABB alone.  We keep this as
+            # an audit signal and let higher-level validation decide whether to
+            # use it as a pass/fail metric.
+            oriented_bbox = None
+            try:
+                if np is not None and len(xs) >= 4:
+                    P = np.column_stack([np.asarray(xs, dtype=float), np.asarray(ys, dtype=float), np.asarray(zs, dtype=float)])
+                    C = np.mean(P, axis=0)
+                    Pc = P - C
+                    cov = np.cov(Pc, rowvar=False)
+                    vals_e, vecs = np.linalg.eigh(cov)
+                    order = np.argsort(vals_e)[::-1]
+                    vals_e = vals_e[order]
+                    vecs = vecs[:, order]
+                    # Normalize/sign-stabilize axes for readable logs.
+                    for j in range(3):
+                        axis = vecs[:, j]
+                        n = np.linalg.norm(axis)
+                        if n > 1.0e-12:
+                            axis = axis / n
+                        # make dominant component positive for less log jitter
+                        k = int(np.argmax(np.abs(axis)))
+                        if axis[k] < 0.0:
+                            axis = -axis
+                        vecs[:, j] = axis
+                    Q = Pc @ vecs
+                    qmin = np.min(Q, axis=0)
+                    qmax = np.max(Q, axis=0)
+                    obb_size = qmax - qmin
+                    obb_center_local = (qmin + qmax) / 2.0
+                    obb_center = C + vecs @ obb_center_local
+                    oriented_bbox = {
+                        "source": "pca_oriented_points",
+                        "center": [float(v) for v in obb_center],
+                        "axes_world": [[float(vecs[i, j]) for i in range(3)] for j in range(3)],
+                        "eigenvalues": [float(v) for v in vals_e],
+                        "size": [float(v) for v in obb_size],
+                        "size_sorted": [float(v) for v in sorted(obb_size.tolist())],
+                        "min_local": [float(v) for v in qmin],
+                        "max_local": [float(v) for v in qmax],
+                        "note": "PCA oriented bbox reduces false deformation caused by rigid rotation of the object in world axes.",
+                    }
+            except Exception as exc:
+                oriented_bbox = {"available": False, "reason": f"pca_oriented_bbox_failed: {exc}"}
+
             return {
                 "path": path,
                 "source": "points",
@@ -264,6 +346,7 @@ class SoftObjectObserver:
                 "size": size,
                 "center": center,
                 "centroid": centroid,
+                "oriented_bbox": oriented_bbox,
             }
         except Exception as exc:
             if self.config.get("soft_observer_verbose_errors", False):
