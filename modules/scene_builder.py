@@ -929,7 +929,15 @@ class SceneBuilder:
         if not catalog:
             return None
 
-        tmpl = dict(self._select_weighted_entry(catalog))
+        # Phase 7: for multi-object benchmark mode we need deterministic,
+        # ordered catalogue spawning rather than weighted random sampling.
+        # This lets one trial contain exactly the prepared object set
+        # (cube, roller, ball, later disc) and makes repeatability tables
+        # meaningful.
+        if bool(self.config.get("soft_object_spawn_catalog_in_order", False)):
+            tmpl = dict(catalog[index % len(catalog)])
+        else:
+            tmpl = dict(self._select_weighted_entry(catalog))
         shape = tmpl.get("shape", "Cube")
         obj_def = {"shape": shape}
 
@@ -961,6 +969,10 @@ class SceneBuilder:
         elif shape == "Sphere":
             radius = grip_dim / 2.0
             obj_def["radius"] = round(radius, 4)
+            # Keep a height/diameter field for all downstream modules.
+            # Without this, the safety monitor may fall back to the global
+            # 40 mm nominal height, which is wrong for larger soft balls.
+            obj_def["height"] = round(2.0 * radius, 4)
             grip_mm = grip_dim * 1000
 
         else:
@@ -1018,8 +1030,16 @@ class SceneBuilder:
             "asset_scale": tmpl.get("asset_scale", None),
             "asset_reference_height_m": tmpl.get("asset_reference_height_m", 1.0),
             "asset_origin_z": tmpl.get("asset_origin_z", "auto_bbox"),
+            "spawn_pose_mode": tmpl.get("spawn_pose_mode"),
             "spawn_local_xy_m": tmpl.get("spawn_local_xy_m"),
             "spawn_yaw_deg_fixed": tmpl.get("spawn_yaw_deg"),
+            # Preserve benchmark semantics from soft_objects.yaml.  These keys
+            # were previously lost, so Phase 7 fell back to generic
+            # place_zone_0/1/2 and logs looked like the old single-object path.
+            "place_zone_key": tmpl.get("place_zone_key"),
+            "pickup_zone_key": tmpl.get("pickup_zone_key"),
+            "phase7_object_role": tmpl.get("phase7_object_role"),
+            "batch_order": tmpl.get("batch_order"),
             "compliance": tmpl.get("compliance", "soft"),
             "deformable": bool(tmpl.get("deformable", True)),
             "fragile": bool(tmpl.get("fragile", True)),
@@ -1125,6 +1145,10 @@ class SceneBuilder:
         elif shape == "Sphere":
             radius = grip_dim / 2.0
             obj_def["radius"] = round(radius, 4)
+            # Keep a height/diameter field for all downstream modules.
+            # Without this, the safety monitor may fall back to the global
+            # 40 mm nominal height, which is wrong for larger soft balls.
+            obj_def["height"] = round(2.0 * radius, 4)
             grip_mm = grip_dim * 1000
 
         else:
@@ -1566,6 +1590,8 @@ class SceneBuilder:
                 "gripper_hold_extra_close_m", "micro_lift_speed_scale",
                 "close_speed_scale", "strategy_hint", "validation_profile",
                 "fallback_primitive",
+                "place_zone_key", "pickup_zone_key",
+                "phase7_object_role", "batch_order",
             ):
                 if key in obj_def:
                     obj_record[key] = obj_def[key]

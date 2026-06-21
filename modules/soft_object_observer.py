@@ -447,6 +447,13 @@ class SoftObjectObserver:
                 return float(target["size_mm"]) / 1000.0
             except Exception:
                 pass
+        # Sphere records often carry radius but no explicit height.
+        # The nominal height is the diameter.
+        if target.get("radius") is not None:
+            try:
+                return 2.0 * float(target["radius"])
+            except Exception:
+                pass
         return None
 
     def _nominal_width_m(self, target: dict) -> Optional[float]:

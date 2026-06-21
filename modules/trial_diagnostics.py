@@ -195,6 +195,13 @@ def selected_config_snapshot(config: dict) -> Dict[str, Any]:
         "retry_abort_object_horizontal_displacement_threshold_m",
         "place_transport_lock_grasp_orientation",
         "place_transport_seed_place_ik_from_current_carry",
+        "phase7_multi_object_batch_enabled",
+        "phase7_reset_robot_between_objects",
+        "phase7_between_object_settle_seconds",
+        "phase7_stop_batch_on_first_failure",
+        "phase7_max_objects_per_batch",
+        "phase7_object_run_order",
+        "soft_object_spawn_catalog_in_order",
     ]
     snap = {k: config.get(k) for k in keys if k in config}
 

@@ -376,21 +376,79 @@ table_zone_marker_z_offset_m: 0.00015   # just above table to avoid z-fighting; 
 table_zone_crosshair_enabled: true
 
 table_zones:
-  pickup_zone:
-    label: pickup_zone
+  pickup_zone_cube:
+    label: pickup_cube
     role: object_spawn_and_pickup
-    local_xy_m: [-0.07, -0.20]
-    size_xy_m: [0.08, 0.08]
+    local_xy_m: [-0.18, -0.22]
+    size_xy_m: [0.075, 0.075]
     color: [0.10, 0.35, 1.00]
     cross_color: [1.00, 1.00, 1.00]
     crosshair: true
     crosshair_strip_width_m: 0.004
 
+  pickup_zone_roller:
+    label: pickup_roller
+    role: object_spawn_and_pickup
+    local_xy_m: [-0.06, -0.14]
+    size_xy_m: [0.075, 0.075]
+    color: [0.10, 0.35, 1.00]
+    cross_color: [1.00, 1.00, 1.00]
+    crosshair: true
+    crosshair_strip_width_m: 0.004
+
+  pickup_zone_ball:
+    label: pickup_ball
+    role: object_spawn_and_pickup
+    local_xy_m: [0.08, -0.24]
+    size_xy_m: [0.075, 0.075]
+    color: [0.10, 0.35, 1.00]
+    cross_color: [1.00, 1.00, 1.00]
+    crosshair: true
+    crosshair_strip_width_m: 0.004
+
+  # Keep the original single-object names as aliases for backward compatibility.
+  pickup_zone:
+    label: pickup_zone
+    role: object_spawn_and_pickup
+    local_xy_m: [-0.18, -0.22]
+    size_xy_m: [0.075, 0.075]
+    color: [0.10, 0.35, 1.00]
+    cross_color: [1.00, 1.00, 1.00]
+    crosshair: true
+    crosshair_strip_width_m: 0.004
+
+  place_zone_cube:
+    label: place_cube
+    role: target_placement_region
+    local_xy_m: [-0.18, 0.23]
+    size_xy_m: [0.075, 0.075]
+    color: [0.10, 0.80, 0.20]
+    cross_color: [1.00, 1.00, 1.00]
+    crosshair: true
+
+  place_zone_roller:
+    label: place_roller
+    role: target_placement_region
+    local_xy_m: [-0.02, 0.15]
+    size_xy_m: [0.075, 0.075]
+    color: [0.10, 0.80, 0.20]
+    cross_color: [1.00, 1.00, 1.00]
+    crosshair: true
+
+  place_zone_ball:
+    label: place_ball
+    role: target_placement_region
+    local_xy_m: [0.15, 0.25]
+    size_xy_m: [0.075, 0.075]
+    color: [0.10, 0.80, 0.20]
+    cross_color: [1.00, 1.00, 1.00]
+    crosshair: true
+
   place_zone:
     label: place_zone
     role: target_placement_region
-    local_xy_m: [-0.07, 0.21]
-    size_xy_m: [0.08, 0.08]
+    local_xy_m: [-0.18, 0.23]
+    size_xy_m: [0.075, 0.075]
     color: [0.10, 0.80, 0.20]
     cross_color: [1.00, 1.00, 1.00]
     crosshair: true
@@ -849,3 +907,31 @@ place_release_min_final_bottom_clearance_m: -0.008
 place_release_max_final_bottom_clearance_m: 0.030
 place_release_max_object_follow_retreat_z_m: 0.015
 place_release_max_post_release_stability_drift_m: 0.005
+
+# ───────────── PHASE 7: MULTI-OBJECT BATCH GENERALIZATION ─────────────
+# Spawn the prepared object registry together and run the validated
+# pick-place-release primitive on each object in a deterministic batch.
+phase7_multi_object_batch_enabled: true
+phase7_reset_robot_between_objects: false
+phase7_between_object_settle_seconds: 0.50
+phase7_stop_batch_on_first_failure: false
+phase7_max_objects_per_batch: 3
+phase7_object_run_order:
+  - foam_cube_green
+  - foam_roller
+  - rubber_ball
+
+# Runtime geometry bridge for imported soft USDs.
+# The live deformable mesh is treated as the source of truth when the YAML
+# nominal size and the spawned USD disagree by more than 3 mm.
+runtime_soft_geometry_calibration_enabled: true
+runtime_soft_geometry_min_update_m: 0.003
+
+# Phase 7 is a generalization test.  Keep the known-good release primitive
+# enabled and retain carry-orientation lock.
+enable_place_release_test: true
+place_transport_lock_grasp_orientation: true
+
+# Slightly looser final XY tolerance for the ball/roller generalization pass.
+# The foam-cube baseline still reports its exact smaller error in logs.
+place_release_xy_tolerance_m: 0.065

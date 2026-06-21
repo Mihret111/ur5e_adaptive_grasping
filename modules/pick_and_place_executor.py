@@ -7,6 +7,8 @@ from modules.soft_object_observer import SoftObjectObserver
 from modules.retry_policy import RetryPolicy
 from modules.force_observer import ArticulationEffortForceObserver
 from modules.adaptive_safety_monitor import AdaptiveSafetyMonitor
+import math
+
 from modules.trial_diagnostics import (
     compact_pick_result,
     grip_feasibility,
@@ -2022,6 +2024,174 @@ class PickAndPlaceExecutor:
             print(f"[SoftObserver:{stage_name}] unavailable; falling back to root transform")
         return obs
 
+    def _update_soft_target_geometry_from_observation(self, target: dict, obs: dict, stage_name: str = "geometry"):
+        """Update target metadata from live soft-object geometry.
+
+        Why this exists:
+        imported deformable USDs do not always match the declared YAML size.
+        In Phase 7 the foam roller was declared as a 70 mm tall cylinder while
+        the live simulation mesh was about 40 mm tall.  The arm therefore aimed
+        the fingers near the upper edge and the safety monitor falsely thought
+        the object was crushed.  The ball had the opposite problem: declared
+        50 mm while the live object behaved closer to 60+ mm, so the gripper
+        rejected a real contact as "too open".
+
+        This is not a vision estimator; it is a simulation-side calibration
+        bridge between the spawned USD asset and the manipulation model.
+        """
+        if not bool(self.config.get("runtime_soft_geometry_calibration_enabled", True)):
+            return None
+        if not isinstance(target, dict) or not isinstance(obs, dict):
+            return None
+        if not self._is_soft_target(target):
+            return None
+
+        def dim(name):
+            try:
+                v = float(obs.get(name))
+                if math.isfinite(v) and 0.005 <= v <= 0.120:
+                    return v
+            except Exception:
+                pass
+            return None
+
+        width_x = dim("width_x_m")
+        width_y = dim("width_y_m")
+        height = dim("height_m")
+        if width_x is None or width_y is None or height is None:
+            return None
+
+        shape = str(target.get("shape", "")).lower()
+        old_grip_m = None
+        try:
+            old_grip_m = float(target.get("grip_dim_mm")) / 1000.0
+        except Exception:
+            pass
+        old_height_m = None
+        try:
+            old_height_m = float(self.arm._get_object_height(target))
+        except Exception:
+            pass
+
+        xy_grip = max(width_x, width_y)
+        dims_sorted = sorted([width_x, width_y, height])
+
+        def robust_bbox_median_size(bbox_dict):
+            """Return a robust object diameter/width estimate from nested bbox data."""
+            if not isinstance(bbox_dict, dict):
+                return None
+            candidates = []
+            oriented = bbox_dict.get("oriented_bbox")
+            if isinstance(oriented, dict):
+                ss = oriented.get("size_sorted") or oriented.get("size_sorted_m")
+                if isinstance(ss, (list, tuple)) and len(ss) >= 3:
+                    try:
+                        vals = sorted(float(v) for v in ss[:3])
+                        if all(math.isfinite(v) and 0.005 <= v <= 0.120 for v in vals):
+                            candidates.append(vals[1])
+                    except Exception:
+                        pass
+            size = bbox_dict.get("size") or bbox_dict.get("size_m")
+            if isinstance(size, (list, tuple)) and len(size) >= 3:
+                try:
+                    vals = sorted(float(v) for v in size[:3])
+                    if all(math.isfinite(v) and 0.005 <= v <= 0.120 for v in vals):
+                        candidates.append(vals[1])
+                except Exception:
+                    pass
+            if not candidates:
+                return None
+            candidates = sorted(candidates)
+            return candidates[len(candidates) // 2]
+
+        if shape in ("cylinder", "disc"):
+            observed_grip_m = xy_grip
+            observed_height_m = height
+        elif shape == "sphere":
+            # For the rubber ball the simulation TetMesh AABB can be inflated
+            # by solver deformation/table contact.  Prefer collision/visible
+            # mesh dimensions when available; these match the intended 30 mm
+            # half-scale -> about 60 mm diameter.
+            sphere_candidates = []
+            for bbox_key in ("collision_bbox", "visible_bbox"):
+                v = robust_bbox_median_size(obs.get(bbox_key))
+                if v is not None:
+                    sphere_candidates.append(v)
+            if sphere_candidates:
+                sphere_candidates = sorted(sphere_candidates)
+                observed_grip_m = sphere_candidates[len(sphere_candidates) // 2]
+            else:
+                observed_grip_m = dims_sorted[1]
+            observed_height_m = observed_grip_m
+        elif shape == "cube":
+            # Cubes can rotate/deform; median is robust to one inflated axis.
+            observed_grip_m = dims_sorted[1]
+            observed_height_m = dims_sorted[1]
+        else:
+            observed_grip_m = xy_grip
+            observed_height_m = height
+
+        min_update = float(self.config.get("runtime_soft_geometry_min_update_m", 0.003))
+        changed = False
+        changes = {}
+
+        if old_grip_m is None or abs(observed_grip_m - old_grip_m) >= min_update:
+            target["grip_dim_mm"] = round(observed_grip_m * 1000.0, 2)
+            changes["grip_dim_mm"] = target["grip_dim_mm"]
+            changed = True
+
+        if old_height_m is None or abs(observed_height_m - old_height_m) >= min_update:
+            target["height"] = round(observed_height_m, 5)
+            changes["height_m"] = target["height"]
+            changed = True
+
+        if shape == "sphere":
+            new_radius = observed_grip_m / 2.0
+            try:
+                old_radius = float(target.get("radius", -1.0))
+            except Exception:
+                old_radius = -1.0
+            if old_radius < 0.0 or abs(new_radius - old_radius) >= min_update / 2.0:
+                target["radius"] = round(new_radius, 5)
+                changes["radius_m"] = target["radius"]
+                changed = True
+        elif shape in ("cylinder", "disc"):
+            new_radius = observed_grip_m / 2.0
+            try:
+                old_radius = float(target.get("radius", -1.0))
+            except Exception:
+                old_radius = -1.0
+            if old_radius < 0.0 or abs(new_radius - old_radius) >= min_update / 2.0:
+                target["radius"] = round(new_radius, 5)
+                changes["radius_m"] = target["radius"]
+                changed = True
+        elif shape == "cube":
+            target["size"] = round(observed_grip_m, 5)
+            changes["size_m"] = target["size"]
+
+        calibration = {
+            "enabled": True,
+            "stage": stage_name,
+            "pose_source": obs.get("pose_source"),
+            "observed_width_x_m": width_x,
+            "observed_width_y_m": width_y,
+            "observed_height_m": height,
+            "old_grip_m": old_grip_m,
+            "old_height_m": old_height_m,
+            "updated": changed,
+            "changes": changes,
+            "note": "Runtime soft USD geometry calibration used for planning, expected contact, and safety nominal dimensions.",
+        }
+        target["runtime_soft_geometry_calibration"] = calibration
+
+        if changed:
+            print(
+                f"[SoftGeometry:{stage_name}] calibrated {target.get('label')} "
+                f"grip={target.get('grip_dim_mm')}mm height={target.get('height')}m "
+                f"from live bbox=({width_x:.4f},{width_y:.4f},{height:.4f})"
+            )
+        return calibration
+
     def _get_observed_object_pos(self, target: dict, stage_name: str = "object"):
         """Return grasp-relevant object centre.
 
@@ -2638,11 +2808,22 @@ class PickAndPlaceExecutor:
         The place zone is a semantic goal region.  The desired final object
         center uses the place marker XY and the current/estimated object height.
         """
-        place_zone = self._get_table_zone(scene_info, "place_zone")
+        # Phase 7: each object in a multi-object batch can have its own
+        # semantic place zone.  Fall back to the original single-object zone.
+        zone_key = (
+            target.get("place_zone_key")
+            or scene_info.get("place_zone_key")
+            or scene_info.get("active_place_zone_key")
+            or "place_zone"
+        )
+        place_zone = self._get_table_zone(scene_info, zone_key)
+        if not place_zone and zone_key != "place_zone":
+            place_zone = self._get_table_zone(scene_info, "place_zone")
         if not place_zone:
             return {
                 "available": False,
-                "reason": "missing_place_zone",
+                "reason": f"missing_place_zone:{zone_key}",
+                "place_zone_key": zone_key,
                 "place_zone": {},
                 "place_object_center": None,
             }
@@ -2665,6 +2846,7 @@ class PickAndPlaceExecutor:
         return {
             "available": True,
             "reason": None,
+            "place_zone_key": zone_key,
             "place_zone": place_zone,
             "object_height_m": object_height,
             "place_object_center": place_center,
@@ -3588,6 +3770,11 @@ class PickAndPlaceExecutor:
         print("\n[Executor] Arm status before planning:")
         print(self.arm.get_status())
 
+        initial_soft_obs = self._observe_target(target, stage_name="trial_start")
+        self._update_soft_target_geometry_from_observation(
+            target, initial_soft_obs, stage_name="trial_start"
+        )
+
         trial_log = {
             "schema_version": "b2b_validation_v2_analysis",
             "target": {
@@ -3599,7 +3786,8 @@ class PickAndPlaceExecutor:
                 "prim_path": target.get("prim_path", "unknown"),
             },
             "target_full": json_safe(target),
-            "initial_soft_observation": json_safe(self._observe_target(target, stage_name="trial_start")),
+            "initial_soft_observation": json_safe(initial_soft_obs),
+            "initial_soft_geometry_calibration": json_safe(target.get("runtime_soft_geometry_calibration")),
             "target_feasibility": grip_feasibility(target, self.config),
             "table_info": json_safe(table_info),
             "table_zones": json_safe(scene_info.get("table_zones", table_info.get("zones", {}))),
@@ -3693,6 +3881,13 @@ class PickAndPlaceExecutor:
             )
 
             actual_object_pos = self._get_observed_object_pos(target, stage_name="before_planning")
+            before_plan_obs = self._observe_target(target, stage_name="before_planning_geometry")
+            before_plan_calib = self._update_soft_target_geometry_from_observation(
+                target, before_plan_obs, stage_name="before_planning"
+            )
+            if before_plan_calib is not None:
+                attempt_log["runtime_soft_geometry_calibration_before_planning"] = json_safe(before_plan_calib)
+                attempt_log["target_feasibility"] = grip_feasibility(target, self.config)
 
             if actual_object_pos is None:
                 actual_object_pos = target["world_pos"]
@@ -3852,6 +4047,13 @@ class PickAndPlaceExecutor:
 
             ## read actual object pose again 
             actual_object_pos = self._get_observed_object_pos(target, stage_name="after_safe_above")
+            after_safe_obs = self._observe_target(target, stage_name="after_safe_above_geometry")
+            after_safe_calib = self._update_soft_target_geometry_from_observation(
+                target, after_safe_obs, stage_name="after_safe_above"
+            )
+            if after_safe_calib is not None:
+                attempt_log["runtime_soft_geometry_calibration_after_safe_above"] = json_safe(after_safe_calib)
+                attempt_log["target_feasibility"] = grip_feasibility(target, self.config)
             if actual_object_pos is None:
                 actual_object_pos = target["world_pos"]
             
@@ -4100,15 +4302,18 @@ class PickAndPlaceExecutor:
 
             # Object pose just before closing; used for close/contact validation, NOT lift validation.
             object_pos_before_close = self._get_observed_object_pos(target, stage_name="before_close")
+            before_close_obs = self._observe_target(target, stage_name="before_close_geometry")
+            before_close_calib = self._update_soft_target_geometry_from_observation(
+                target, before_close_obs, stage_name="before_close"
+            )
+            if before_close_calib is not None:
+                attempt_log["runtime_soft_geometry_calibration_before_close"] = json_safe(before_close_calib)
 
             # TODO: use the same approach as in compute_pick_joints to get target force
             target_force = pick_result.get("target_force_n", None)
 
-            target_feasibility_for_close = (
-                attempt_log.get("target_feasibility")
-                or trial_log.get("target_feasibility")
-                or {}
-            )
+            target_feasibility_for_close = grip_feasibility(target, self.config)
+            attempt_log["target_feasibility_before_close"] = json_safe(target_feasibility_for_close)
 
             expected_grip_dim_m = target_feasibility_for_close.get(
                 "estimated_object_grip_dim_m"

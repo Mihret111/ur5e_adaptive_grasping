@@ -1,16 +1,12 @@
 # ===================================================================
-# soft_objects.yaml — Green foam deformable commissioning configuration
+# soft_objects.yaml — Phase 7 multi-object benchmark registry
 # ===================================================================
 # Purpose:
-#   Commission exactly one real deformable foam cube in the B2B pipeline.
-#   The asset is authored at 40 mm side length, with root frame at bottom centre:
-#
-#       /World/FoamCube_Green          root at bottom centre
-#       /World/FoamCube_Green/CubeSoft_10 translate z = 0.02 m
-#
-#   Therefore SceneBuilder must place the asset root at the table surface,
-#   not at table + height/2. A tiny negative penetration is allowed to cancel
-#   visible contact-offset hovering during commissioning.
+#   Spawn the prepared soft-object assets together on the table and run the
+#   validated pick-place-release primitive on each object in a deterministic
+#   batch.  Foam cube remains the regression-control object; foam roller tests
+#   elongated soft-object generalization; rubber ball is a high-risk diagnostic
+#   object because it can roll and has ambiguous orientation.
 # ===================================================================
 
 soft_object_catalog_enabled: true
@@ -18,25 +14,18 @@ soft_object_spawn_probability: 1.0
 soft_object_force_all_targets: true
 soft_asset_missing_fallback_to_proxy: false
 
-# Commissioning mode: deterministic single object, no random clutter.
+# Phase 7 deterministic multi-object mode.
 soft_object_commissioning_mode: true
-soft_object_override_num_objects: 1
-soft_object_spawn_local_xy_m: [-0.07, -0.20]
+soft_object_override_num_objects: 3
+soft_object_spawn_catalog_in_order: true
 soft_object_spawn_jitter_m: 0.0
 
 # USD placement policy.
 soft_asset_align_bottom_to_table: true
 soft_asset_table_clearance_m: 0.0
-
-# Small visual/contact-offset compensation.
-# If the cube still visibly floats, increase magnitude gradually: 0.001 -> 0.002 -> 0.003.
-# Do not go below -0.004 m for the 40 mm foam cube unless we inspect the log.
 soft_asset_table_penetration_m: 0.0
 
 # Contact offset commissioning.
-# A 40 mm deformable object cannot tolerate default ~20 mm contact shells.
-# Keep table and soft-object contact offsets small so collision geometry rests
-# where the visible object appears.
 table_contact_offset_m: 0.001
 table_rest_offset_m: 0.0
 soft_asset_contact_offset_m: 0.001
@@ -48,56 +37,136 @@ soft_physics_materials:
     static_friction: 2.7
     dynamic_friction: 2.25
     restitution: 0.02
+  - name: foam_roller
+    static_friction: 2.4
+    dynamic_friction: 2.0
+    restitution: 0.02
+  - name: rubber_ball
+    static_friction: 2.8
+    dynamic_friction: 2.2
+    restitution: 0.04
 
 soft_objects:
   - label: foam_cube_green
+    name: foam_cube_green
+    batch_order: 0
+    phase7_object_role: baseline_control
+    place_zone_key: place_zone_cube
+    pickup_zone_key: pickup_zone_cube
     asset_type: deformable_usd
     asset_path: assets/soft_objects/foam_cube/foam_cube_green_aligned_v3_deformable.usd
     asset_prim_path: /World/FoamCube_Green
-
-    # The USD is already authored in metres as a 40 mm cube. Do NOT rescale.
     asset_scale: 1.0
     asset_origin_z: bottom_center
     spawn_pose_mode: bottom_on_table
-
-    spawn_local_xy_m: [-0.07, -0.20]
+    spawn_local_xy_m: [-0.18, -0.22]
     spawn_yaw_deg: 0.0
-
     shape: Cube
     material: foam_green
     compliance: soft
     deformable: true
     fragility: medium
     thin_object: false
-
-    # Authored dimensions: half-scale 0.02 m -> full side 0.04 m.
     grip_dim_mm: 40.0
     height_mm: 40.0
     size_mm: 40.0
-
-    # Mass estimate: 150 kg/m^3 * (0.04 m)^3 = 0.0096 kg.
     mass_kg: 0.010
     density_kg_m3: 150.0
     youngs_modulus_pa: 50000.0
     poissons_ratio: 0.25
     elasticity_damping: 0.08
-
     static_friction: 2.7
     dynamic_friction: 2.25
     restitution: 0.02
-
     preferred_force_n: 20.0
     max_force_n: 28.0
-
     close_speed_scale: 0.45
     hold_extra_m: 0.0005
     micro_lift_speed_scale: 0.45
-
     strategy_hint: delicate_pick
-    validation_profile: soft_deformable
+    validation_profile: soft_deformable_cube
     fallback_primitive: none
 
-# The commissioned foam cube spawn_local_xy_m is intentionally aligned with
-# environment.table_zones.pickup_zone.local_xy_m so the object starts on the
-# smaller blue pickup marker. The green place marker is separated farther away and used later by the gentle
-# place/release primitive.
+  - label: foam_roller
+    name: foam_roller
+    batch_order: 1
+    phase7_object_role: elongated_generalization
+    place_zone_key: place_zone_roller
+    pickup_zone_key: pickup_zone_roller
+    asset_type: deformable_usd
+    asset_path: assets/soft_objects/foam_roller/FoamRoller.usd
+    asset_prim_path: /World/FoamRoller
+    asset_scale: 1.0
+    asset_origin_z: bottom_center
+    spawn_pose_mode: bottom_on_table
+    spawn_local_xy_m: [-0.06, -0.14]
+    spawn_yaw_deg: 0.0
+    shape: Cylinder
+    material: foam_roller
+    compliance: soft
+    deformable: true
+    fragility: medium
+    thin_object: false
+    # Isaac USD was authored with half scale ≈20 mm, so the live mesh is
+    # about 40 mm across/tall.  Keep YAML nominal geometry consistent with
+    # the asset to avoid upper-edge grasps and false compression alarms.
+    grip_dim_mm: 40.0
+    height_mm: 40.0
+    mass_kg: 0.018
+    density_kg_m3: 180.0
+    youngs_modulus_pa: 100000.0
+    poissons_ratio: 0.35
+    elasticity_damping: 0.10
+    static_friction: 2.4
+    dynamic_friction: 2.0
+    restitution: 0.02
+    preferred_force_n: 22.0
+    max_force_n: 32.0
+    close_speed_scale: 0.42
+    hold_extra_m: 0.0006
+    micro_lift_speed_scale: 0.42
+    strategy_hint: delicate_pick_elongated
+    validation_profile: soft_deformable_roller
+    fallback_primitive: none
+
+  - label: rubber_ball
+    name: rubber_ball
+    batch_order: 2
+    phase7_object_role: high_risk_diagnostic
+    place_zone_key: place_zone_ball
+    pickup_zone_key: pickup_zone_ball
+    asset_type: deformable_usd
+    asset_path: assets/soft_objects/rubber_ball/RubberBall.usd
+    asset_prim_path: /World/RubberBall
+    asset_scale: 1.0
+    asset_origin_z: bottom_center
+    spawn_pose_mode: bottom_on_table
+    spawn_local_xy_m: [0.08, -0.24]
+    spawn_yaw_deg: 0.0
+    shape: Sphere
+    material: rubber_ball
+    compliance: soft_elastic
+    deformable: true
+    fragility: low
+    thin_object: false
+    # Isaac USD was authored with half scale ≈30 mm, so the physical
+    # diameter is about 60 mm.  The gripper expected-contact window must use
+    # this value; otherwise a real ball contact is rejected as too-open.
+    grip_dim_mm: 60.0
+    height_mm: 60.0
+    mass_kg: 0.030
+    density_kg_m3: 900.0
+    youngs_modulus_pa: 500000.0
+    poissons_ratio: 0.47
+    elasticity_damping: 0.04
+    static_friction: 2.8
+    dynamic_friction: 2.2
+    restitution: 0.04
+    preferred_force_n: 24.0
+    max_force_n: 36.0
+    close_speed_scale: 0.38
+    hold_extra_m: 0.0007
+    micro_lift_speed_scale: 0.38
+    strategy_hint: delicate_pick_spherical
+    validation_profile: soft_elastic_ball
+    fallback_primitive: none

@@ -4,6 +4,8 @@ import os
 import json
 from modules.trial_diagnostics import json_safe
 from datetime import datetime
+import copy
+
 
 class TrialRunner:
     def __init__(self, config, table_materials, table_slots, step_fn, step_seconds_fn):
@@ -30,132 +32,215 @@ class TrialRunner:
         print("[TRACE] TrialRunner: after SceneBuilder")
         print("[TrialRunner] Ready.")
 
+    def _run_dir(self):
+        return self.config.get("paths", {}).get("run_outputs_dir", "runs/isaac_run")
+
+    def _target_slug(self, target):
+        label = str((target or {}).get("label", "target"))
+        safe = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in label)
+        return safe[:64] or "target"
+
+    def _ordered_phase7_targets(self, objects):
+        order = self.config.get("phase7_object_run_order", []) or []
+        if order:
+            rank = {str(label): i for i, label in enumerate(order)}
+            return sorted(
+                list(objects),
+                key=lambda o: (rank.get(str(o.get("label")), 999), int(o.get("batch_order", 999)), str(o.get("label", ""))),
+            )
+        return sorted(list(objects), key=lambda o: (int(o.get("batch_order", 999)), str(o.get("label", ""))))
+
+    def _scene_for_target(self, scene_info, target, object_index):
+        scene_copy = dict(scene_info)
+        target_copy = dict(target)
+        place_zone_key = target_copy.get("place_zone_key") or f"place_zone_{object_index}"
+        target_copy["place_zone_key"] = place_zone_key
+        scene_copy["pick_target"] = target_copy
+        scene_copy["active_place_zone_key"] = place_zone_key
+        scene_copy["phase7_object_index"] = object_index
+        scene_copy["phase7_object_label"] = target_copy.get("label")
+        return scene_copy
+
+    def _save_trial_log(self, *, trial_log, trial_index, ok, object_index=None, target=None):
+        if trial_log is None:
+            return None
+        trial_log["trial_index"] = trial_index
+        trial_log["ok_returned"] = ok
+        if object_index is not None:
+            trial_log["phase7_object_index"] = object_index
+            trial_log["phase7_object_label"] = (target or {}).get("label")
+            trial_log["phase7_place_zone_key"] = (target or {}).get("place_zone_key")
+
+        run_dir = self._run_dir()
+        trial_dir = os.path.join(run_dir, f"trial_{trial_index}")
+        os.makedirs(trial_dir, exist_ok=True)
+
+        run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if object_index is None:
+            log_name = f"validation_log_{run_stamp}.json"
+        else:
+            log_name = f"object_{object_index:02d}_{self._target_slug(target)}_validation_log_{run_stamp}.json"
+        log_path = os.path.join(trial_dir, log_name)
+
+        with open(log_path, "w") as f:
+            json.dump(json_safe(trial_log), f, indent=2)
+        print(f"[TrialRunner] Validation log saved to: {log_path}")
+        return log_path
+
+    def _print_validation_summary(self, trial_log):
+        if not trial_log:
+            return
+        print("\n[TrialRunner] Validation summary:")
+        print(f"  target: {trial_log['target']['label']}")
+        print(f"  shape: {trial_log['target']['shape']}")
+        print(f"  material: {trial_log['target']['material']}")
+        print(f"  success: {trial_log['trial_success']}")
+        print(f"  final_reason: {trial_log['final_reason']}")
+
+        for a in trial_log.get("attempts", []):
+            print(f"  attempt {a['attempt']}:")
+            print(f"    safe_above_ok: {a['safe_above_ok']}")
+            print(f"    pre_grasp_ok: {a['pre_grasp_ok']}")
+            print(f"    grasp_ok: {a['grasp_ok']}")
+            print(f"    failure_reason: {a['failure_reason']}")
+
+            if a.get("preclose_diagnostics"):
+                d = a["preclose_diagnostics"]
+                print("    preclose_closest_axis: " f"{d['closest_axis_candidate']}")
+                print("    preclose_axis_distance_m: " f"{d['closest_axis_distance_m']:.4f}")
+                print("    preclose_tracking_error_m: " f"{d['planned_flange_tracking_error_m']}")
+
+            if a.get("preclose_geometry_gate"):
+                g = a["preclose_geometry_gate"]
+                print("    preclose_geometry_ok: " f"{g['geometry_ok']}")
+                print("    preclose_xy_error_m: " f"{g['grasp_centre_xy_error_m']:.4f}")
+                print("    preclose_vertical_overlap_m: " f"{g['vertical_overlap_m']:.4f}")
+                print("    preclose_gate_reasons: " f"{g['reasons']}")
+
+            if a.get("close_validation"):
+                print(f"    close_success: {a['close_validation']['success']}")
+                print(f"    close_reasons: {a['close_validation']['reasons']}")
+
+            if a.get("micro_lift_validation"):
+                m = a["micro_lift_validation"]
+                print(f"    micro_lift_success: {m['success']}")
+                print(f"    micro_lift_object_dz_m: {m['object_lift_delta_z_m']}")
+                print(f"    micro_lift_following_ratio: {m['following_ratio']}")
+                print(f"    micro_lift_relative_drift_m: {m['relative_grasp_drift_m']}")
+                print(f"    micro_lift_reasons: {m['reasons']}")
+
+            if a.get("lift_validation"):
+                print(f"    lift_success: {a['lift_validation']['success']}")
+                print(f"    lift_reasons: {a['lift_validation']['reasons']}")
+
+            if a.get("place_release_result"):
+                v = (a["place_release_result"].get("validation") or {})
+                print(f"    release_success: {v.get('success')}")
+                print(f"    release_reasons: {v.get('reasons')}")
+
     async def run_all(self):
         num_trials = int(self.config.get("num_trials", 1))
 
         for i in range(num_trials):
             print(f"\n[TrialRunner] Trial {i + 1}/{num_trials}")
-            self._total_attempts += 1
 
-            # 1. Reset robot before spawning a new trial
-            # This prevents the arm/gripper from colliding with newly spawned objects
-            # and removes stale drive states from previous runs.
             if self.config.get("reset_robot_before_trial", True):
-                # resetting the arm before spawning new objects to reduce accidental contacts with newly spawned objects
                 await self.pick_executor.reset_robot_for_trial()
             else:
                 print("\n[TrialRunner] Skipping home reset; starting from current pose.")
                 await self.pick_executor.open_gripper()
 
-            # 2. Build randomized trial scene
             scene_info = self.scene_builder.build_trial(i)
-
-            # Check if any objects were spawned successfully
             if not scene_info["all_objects"]:
                 print("❌ No objects spawned in this trial. Moving to next trial.")
                 continue
 
-            # 3. Let spawned objects settle before reading actual prim poses
             settle_seconds = float(self.config.get("post_spawn_settle_seconds", 1.0))
             print(f"[TrialRunner] Settling spawned objects for {settle_seconds:.2f}s...")
             await self.step_seconds_fn(settle_seconds)
 
-            # 4. Run pick and place for the current trial
-            ok = await self.pick_executor.run_generic_pick(scene_info)
+            if bool(self.config.get("phase7_multi_object_batch_enabled", False)):
+                await self._run_phase7_multi_object_batch(i, scene_info)
+            else:
+                self._total_attempts += 1
+                ok = await self.pick_executor.run_generic_pick(scene_info)
+                if ok:
+                    self._total_successes += 1
+                    print(f"[TrialRunner] Trial {i + 1} pick success")
+                else:
+                    print(f"[TrialRunner] Trial {i + 1} pick failed")
 
-            ## Update trial statistics and print
+                trial_log = self.pick_executor.get_last_trial_log()
+                self._save_trial_log(trial_log=trial_log, trial_index=i, ok=ok)
+                self._print_validation_summary(trial_log)
+
+            await self.pick_executor.park_robot_after_trial()
+
+    async def _run_phase7_multi_object_batch(self, trial_index, scene_info):
+        objects = self._ordered_phase7_targets(scene_info.get("all_objects", []))
+        max_objects = self.config.get("phase7_max_objects_per_batch", None)
+        if max_objects is not None:
+            objects = objects[: int(max_objects)]
+
+        batch_log = {
+            "schema_version": "phase7_multi_object_batch_v1",
+            "trial_index": trial_index,
+            "objects_total": len(objects),
+            "objects": [],
+            "success_count": 0,
+            "failure_count": 0,
+        }
+
+        print("\n[TrialRunner] Phase 7 multi-object batch enabled")
+        print(f"  objects: {[o.get('label') for o in objects]}")
+
+        for object_index, target in enumerate(objects):
+            print("\n" + "─" * 60)
+            print(f"[TrialRunner] Phase 7 object {object_index + 1}/{len(objects)}: {target.get('label')}")
+            print("─" * 60)
+            self._total_attempts += 1
+
+            if object_index > 0 and bool(self.config.get("phase7_reset_robot_between_objects", True)):
+                await self.pick_executor.reset_robot_for_trial()
+                await self.step_seconds_fn(float(self.config.get("phase7_between_object_settle_seconds", 0.50)))
+
+            scene_for_target = self._scene_for_target(scene_info, target, object_index)
+            ok = await self.pick_executor.run_generic_pick(scene_for_target)
             if ok:
                 self._total_successes += 1
-                print(f"[TrialRunner] Trial {i + 1} pick success")
+                batch_log["success_count"] += 1
             else:
-                print(f"[TrialRunner] Trial {i + 1} pick failed")
+                batch_log["failure_count"] += 1
 
-            # 5. Save validation log if available.
             trial_log = self.pick_executor.get_last_trial_log()
-            if trial_log is not None:
-                trial_log["trial_index"] = i
-                trial_log["ok_returned"] = ok
+            self._save_trial_log(
+                trial_log=trial_log,
+                trial_index=trial_index,
+                ok=ok,
+                object_index=object_index,
+                target=scene_for_target["pick_target"],
+            )
+            self._print_validation_summary(trial_log)
+            batch_log["objects"].append(json_safe({
+                "object_index": object_index,
+                "label": target.get("label"),
+                "shape": target.get("shape"),
+                "place_zone_key": scene_for_target["pick_target"].get("place_zone_key"),
+                "success": bool(ok),
+                "final_reason": trial_log.get("final_reason") if trial_log else None,
+            }))
 
-                run_dir = self.config.get("paths", {}).get(
-                    "run_outputs_dir",
-                    "runs/isaac_run",
-                )
+            if (not ok) and bool(self.config.get("phase7_stop_batch_on_first_failure", False)):
+                print("[TrialRunner] Stopping Phase 7 batch after first failure.")
+                break
 
-                trial_dir = os.path.join(run_dir, f"trial_{i}")
-                os.makedirs(trial_dir, exist_ok=True)
-
-                run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                log_path = os.path.join(trial_dir, f"validation_log_{run_stamp}.json")
-
-
-                with open(log_path, "w") as f:
-                    json.dump(json_safe(trial_log), f, indent=2)
-
-                print(f"[TrialRunner] Validation log saved to: {log_path}")
-
-                print("\n[TrialRunner] Validation summary:")
-                print(f"  target: {trial_log['target']['label']}")
-                print(f"  shape: {trial_log['target']['shape']}")
-                print(f"  material: {trial_log['target']['material']}")
-                print(f"  success: {trial_log['trial_success']}")
-                print(f"  final_reason: {trial_log['final_reason']}")
-
-                for a in trial_log["attempts"]:
-                    print(f"  attempt {a['attempt']}:")
-                    print(f"    safe_above_ok: {a['safe_above_ok']}")
-                    print(f"    pre_grasp_ok: {a['pre_grasp_ok']}")
-                    print(f"    grasp_ok: {a['grasp_ok']}")
-                    print(f"    failure_reason: {a['failure_reason']}")
-
-                    if a.get("preclose_diagnostics"):
-                        d = a["preclose_diagnostics"]
-                        print(
-                            "    preclose_closest_axis: "
-                            f"{d['closest_axis_candidate']}"
-                        )
-                        print(
-                            "    preclose_axis_distance_m: "
-                            f"{d['closest_axis_distance_m']:.4f}"
-                        )
-                        print(
-                            "    preclose_tracking_error_m: "
-                            f"{d['planned_flange_tracking_error_m']}"
-                        )
-
-                    if a.get("preclose_geometry_gate"):
-                        g = a["preclose_geometry_gate"]
-                        print(
-                            "    preclose_geometry_ok: "
-                            f"{g['geometry_ok']}"
-                        )
-                        print(
-                            "    preclose_xy_error_m: "
-                            f"{g['grasp_centre_xy_error_m']:.4f}"
-                        )
-                        print(
-                            "    preclose_vertical_overlap_m: "
-                            f"{g['vertical_overlap_m']:.4f}"
-                        )
-                        print(
-                            "    preclose_gate_reasons: "
-                            f"{g['reasons']}"
-                        )
-
-                    if a["close_validation"]:
-                        print(f"    close_success: {a['close_validation']['success']}")
-                        print(f"    close_reasons: {a['close_validation']['reasons']}")
-
-                    if a.get("micro_lift_validation"):
-                        m = a["micro_lift_validation"]
-                        print(f"    micro_lift_success: {m['success']}")
-                        print(f"    micro_lift_object_dz_m: {m['object_lift_delta_z_m']}")
-                        print(f"    micro_lift_following_ratio: {m['following_ratio']}")
-                        print(f"    micro_lift_relative_drift_m: {m['relative_grasp_drift_m']}")
-                        print(f"    micro_lift_reasons: {m['reasons']}")
-
-                    if a["lift_validation"]:
-                        print(f"    lift_success: {a['lift_validation']['success']}")
-                        print(f"    lift_reasons: {a['lift_validation']['reasons']}")
-
-            # 6. Park robot after trial.
-            await self.pick_executor.park_robot_after_trial()
+        run_dir = self._run_dir()
+        trial_dir = os.path.join(run_dir, f"trial_{trial_index}")
+        os.makedirs(trial_dir, exist_ok=True)
+        batch_path = os.path.join(
+            trial_dir,
+            f"phase7_batch_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+        )
+        with open(batch_path, "w") as f:
+            json.dump(json_safe(batch_log), f, indent=2)
+        print(f"[TrialRunner] Phase 7 batch summary saved to: {batch_path}")
