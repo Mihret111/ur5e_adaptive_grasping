@@ -1,5 +1,6 @@
 from modules.scene_builder import SceneBuilder
 from modules.pick_and_place_executor import PickAndPlaceExecutor
+from modules.manipulation_primitive_executor import ManipulationPrimitiveExecutor
 import os
 import json
 from modules.trial_diagnostics import json_safe
@@ -22,6 +23,11 @@ class TrialRunner:
         print("[TRACE] TrialRunner: before PickAndPlaceExecutor")
         self.pick_executor = PickAndPlaceExecutor(self.config)
         print("[TRACE] TrialRunner: after PickAndPlaceExecutor")
+
+        self.primitive_executor = ManipulationPrimitiveExecutor(
+            config=self.config,
+            pick_executor=self.pick_executor,
+        )
 
         print("[TRACE] TrialRunner: before SceneBuilder")
         self.scene_builder = SceneBuilder(
@@ -86,6 +92,88 @@ class TrialRunner:
             json.dump(json_safe(trial_log), f, indent=2)
         print(f"[TrialRunner] Validation log saved to: {log_path}")
         return log_path
+
+    def _save_primitive_log(self, *, primitive_log, trial_index):
+        if primitive_log is None:
+            return None
+        run_dir = self._run_dir()
+        trial_dir = os.path.join(run_dir, f"trial_{trial_index}")
+        os.makedirs(trial_dir, exist_ok=True)
+
+        path = os.path.join(
+            trial_dir,
+            f"phase8_manipulation_primitives_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+        )
+        with open(path, "w") as f:
+            json.dump(json_safe(primitive_log), f, indent=2)
+        print(f"[TrialRunner] Phase 8 primitive log saved to: {path}")
+        return path
+
+    async def _maybe_run_phase8_primitives(self, trial_index, scene_info, *, when: str):
+        if not bool(self.config.get("phase8_manipulation_primitives_enabled", False)):
+            return None
+
+        configured_when = str(self.config.get("phase8_run_timing", "standalone")).lower()
+        allowed = {"standalone", "after_phase7", "before_phase7", "after_pick_place", "after_batch"}
+        if configured_when not in allowed:
+            print(f"[TrialRunner] ⚠ Unknown phase8_run_timing={configured_when}; skipping primitives")
+            return None
+
+        # Protect the frozen pick-place benchmark by default.  Phase-8 primitives
+        # can be run standalone on a fresh scene, or after the Phase-7 batch when
+        # explicitly requested.
+        should_run = (
+            (configured_when == "standalone" and when == "standalone")
+            or (configured_when in ("after_phase7", "after_pick_place", "after_batch") and when == "after_phase7")
+            or (configured_when == "before_phase7" and when == "before_phase7")
+        )
+        if not should_run:
+            return None
+
+        primitive_log = await self.primitive_executor.run_from_scene(scene_info)
+        self._save_primitive_log(primitive_log=primitive_log, trial_index=trial_index)
+
+        # Phase 8 is a manipulation primitive benchmark, not a Phase-7 pick-place
+        # attempt.  Still, it should contribute to the final run counters so the
+        # terminal does not misleadingly print Attempts: 0 Successes: 0.
+        primitive_results_for_total = (primitive_log or {}).get("results", []) or []
+        primitive_attempts_for_total = len(primitive_results_for_total)
+        primitive_successes_for_total = int((primitive_log or {}).get("success_count", 0) or 0)
+        self._total_attempts += primitive_attempts_for_total
+        self._total_successes += primitive_successes_for_total
+        self._print_phase8_summary(primitive_log)
+
+        return primitive_log
+
+    def _print_phase8_summary(self, primitive_log):
+        """Print a compact terminal summary for Phase-8 primitives.
+
+        This is separate from the Phase-7 pick-place validation summary, but it
+        updates the same TrialRunner counters through _maybe_run_phase8_primitives
+        so main.py reports non-zero Attempts/Successes in standalone primitive mode.
+        """
+        if not primitive_log:
+            return
+
+        results = primitive_log.get("results", []) or []
+        success_count = int(primitive_log.get("success_count", 0) or 0)
+        failure_count = int(primitive_log.get("failure_count", 0) or 0)
+
+        print("\n[TrialRunner] Phase 8 primitive summary:")
+        print(f"  primitive_attempts: {len(results)}")
+        print(f"  primitive_successes: {success_count}")
+        print(f"  primitive_failures: {failure_count}")
+
+        for idx, r in enumerate(results, start=1):
+            primitive = r.get("primitive", "unknown")
+            label = r.get("target_label", "unknown_target")
+            ok = bool(r.get("success", False))
+            reason = r.get("reason")
+            metrics = r.get("metrics") or {}
+            along = metrics.get("along_command_m")
+            along_txt = "n/a" if along is None else f"{float(along):.4f} m"
+            mark = "✅ PASS" if ok else "❌ FAIL"
+            print(f"  {idx}. {mark}  {primitive} → {label}  along={along_txt}  reason={reason}")
 
     def _print_validation_summary(self, trial_log):
         if not trial_log:
@@ -159,8 +247,16 @@ class TrialRunner:
             print(f"[TrialRunner] Settling spawned objects for {settle_seconds:.2f}s...")
             await self.step_seconds_fn(settle_seconds)
 
-            if bool(self.config.get("phase7_multi_object_batch_enabled", False)):
+            phase7_enabled = bool(self.config.get("phase7_multi_object_batch_enabled", False))
+            phase8_enabled = bool(self.config.get("phase8_manipulation_primitives_enabled", False))
+            phase8_timing = str(self.config.get("phase8_run_timing", "standalone")).lower()
+
+            if phase7_enabled:
+                await self._maybe_run_phase8_primitives(i, scene_info, when="before_phase7")
                 await self._run_phase7_multi_object_batch(i, scene_info)
+                await self._maybe_run_phase8_primitives(i, scene_info, when="after_phase7")
+            elif phase8_enabled and phase8_timing == "standalone":
+                await self._maybe_run_phase8_primitives(i, scene_info, when="standalone")
             else:
                 self._total_attempts += 1
                 ok = await self.pick_executor.run_generic_pick(scene_info)

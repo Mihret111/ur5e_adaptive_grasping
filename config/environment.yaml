@@ -1225,3 +1225,103 @@ place_transport_duration: 2.20
 place_transport_steps: 132
 post_lift_before_transport_settle_seconds: 0.05
 post_place_transport_settle_seconds: 0.08
+# ─────────────────────────────────────────────────────────────
+# Phase 8 — standalone manipulation primitives
+# ─────────────────────────────────────────────────────────────
+# Keep disabled by default so the Phase-7 pick-place benchmark remains frozen.
+# To demo primitives without disturbing pick-place results, set:
+#   phase7_multi_object_batch_enabled: false
+#   phase8_manipulation_primitives_enabled: true
+#   phase8_run_timing: standalone
+# To run them after the Phase-7 batch, set phase8_run_timing: after_phase7.
+phase8_manipulation_primitives_enabled: false
+phase8_run_timing: standalone   # standalone | before_phase7 | after_phase7
+phase8_between_primitives_settle_seconds: 0.35
+
+# Generic timing/safety parameters used by soft_push, soft_slide, gentle_pull.
+phase8_default_object_radius_m: 0.025
+phase8_min_fingertip_clearance_m: 0.0025
+phase8_pre_contact_above_m: 0.080
+phase8_approach_duration: 1.15
+phase8_approach_steps: 69
+phase8_contact_approach_duration: 0.85
+phase8_contact_approach_steps: 51
+phase8_retreat_duration: 0.90
+phase8_retreat_steps: 54
+phase8_post_contact_settle_seconds: 0.25
+phase8_open_settle_seconds: 0.35
+phase8_pusher_close_seconds: 0.55
+phase8_grasp_close_seconds: 0.75
+
+# Soft-push: gentle table-supported displacement using the gripper as a compact pusher.
+phase8_soft_push_distance_m: 0.045
+phase8_soft_push_duration: 1.60
+phase8_soft_push_steps: 96
+phase8_soft_push_force_n: 38.0
+phase8_push_approach_margin_m: 0.030
+phase8_push_contact_height_fraction: 0.55
+phase8_push_min_success_displacement_m: 0.010
+
+# Soft-slide: longer table-supported contact motion, still deformation/force-audited.
+phase8_soft_slide_distance_m: 0.060
+phase8_soft_slide_duration: 2.10
+phase8_soft_slide_steps: 126
+phase8_slide_contact_height_fraction: 0.45
+phase8_slide_min_success_displacement_m: 0.018
+phase8_slide_max_table_gap_m: 0.012
+
+# Gentle-pull: close lightly, drag/pull on table without lifting, then release.
+phase8_gentle_pull_distance_m: 0.040
+phase8_gentle_pull_duration: 1.65
+phase8_gentle_pull_steps: 99
+phase8_gentle_pull_force_n: 45.0
+phase8_gentle_pull_hold_extra_m: 0.0010
+phase8_pull_contact_height_fraction: 0.50
+phase8_pull_min_success_displacement_m: 0.010
+
+# Default demonstration sequence. These labels are demo selections only; the
+# executor itself is primitive/profile-based and can also select targets by
+# primitive_affordances if target_label is omitted.
+phase8_primitive_sequence:
+  - primitive: soft_push
+    target_label: foam_cube_green
+    direction_xy_m: [0.0, 1.0]
+    distance_m: 0.045
+    min_success_displacement_m: 0.010
+
+  - primitive: soft_slide
+    target_label: foam_roller
+    direction_xy_m: [1.0, 0.0]
+    distance_m: 0.060
+    min_success_displacement_m: 0.018
+
+  - primitive: gentle_pull
+    target_label: foam_cube_green
+    direction_xy_m: [-1.0, 0.0]
+    distance_m: 0.040
+    min_success_displacement_m: 0.010
+
+# Phase 8B — primitive-only visualization and terminal accounting
+table_zones_hide_during_phase8_standalone: true
+phase8_destination_markers_enabled: true
+phase8_destination_marker_size_m: 0.045
+phase8_destination_marker_thickness_m: 0.0012
+phase8_destination_marker_z_offset_m: 0.0020
+phase8_destination_marker_color: [1.0, 0.65, 0.05]
+
+
+# run only pick-place
+phase7_multi_object_batch_enabled: true
+phase8_manipulation_primitives_enabled: false
+phase8_run_timing: standalone
+
+# run primitives only
+phase7_multi_object_batch_enabled: false
+phase8_manipulation_primitives_enabled: true
+phase8_run_timing: standalone
+
+
+# run primitives after pick-place
+# phase7_multi_object_batch_enabled: true
+# phase8_manipulation_primitives_enabled: true
+# phase8_run_timing: after_phase7

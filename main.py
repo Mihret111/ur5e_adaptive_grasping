@@ -62,6 +62,7 @@ MODULE_NAMES = [
     "modules.retry_policy",
     "modules.force_observer",
     "modules.adaptive_safety_monitor",
+    "modules.manipulation_primitive_executor"
 ]
 for mod_name in MODULE_NAMES:
     if mod_name in sys.modules:

@@ -86,6 +86,7 @@ soft_objects:
     strategy_hint: delicate_pick
     validation_profile: soft_deformable_cube
     fallback_primitive: none
+    primitive_affordances: [delicate_pick, soft_push, soft_slide, gentle_pull]
 
   - label: foam_roller
     name: foam_roller
@@ -134,6 +135,7 @@ soft_objects:
     strategy_hint: delicate_pick_elongated
     validation_profile: soft_deformable_roller
     fallback_primitive: none
+    primitive_affordances: [delicate_pick, soft_push, soft_slide]
 
   - label: rubber_ball
     name: rubber_ball
@@ -236,3 +238,4 @@ soft_objects:
     strategy_hint: delicate_pick_spherical
     validation_profile: soft_elastic_ball
     fallback_primitive: none
+    primitive_affordances: [diagnostic_delicate_pick, soft_push]

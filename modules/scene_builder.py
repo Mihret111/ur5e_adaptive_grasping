@@ -75,7 +75,12 @@ class SceneBuilder:
         # Phase 4.0: semantic table zones for reproducible pick-and-place.
         # These are visual/semantic markers only; by default they have no
         # collision so they behave like stickers on the table, not obstacles.
-        table_zones = self._create_table_zones(table_info)
+        if self._phase8_standalone_hides_table_zones():
+            table_zones = {}
+            print("  [TableZone] skipped for Phase-8 standalone primitive demo "
+                  "(destination markers will be created by the primitive executor).")
+        else:
+            table_zones = self._create_table_zones(table_info)
         if table_zones:
             table_info["zones"] = table_zones
 
@@ -175,6 +180,21 @@ class SceneBuilder:
             "target_local_base": target_local_base,
             "flange_local_base": flange_local_base,
         }
+
+    def _phase8_standalone_hides_table_zones(self) -> bool:
+        """Return True when Phase-8 standalone should hide pick/place markers.
+
+        In primitive-only demos, the old pickup/place zones are visually confusing
+        because the task is push/slide/pull rather than pick-and-place.  The
+        objects are still spawned exactly the same way; only the visual table-zone
+        stickers are skipped.
+        """
+        if not bool(self.config.get("table_zones_hide_during_phase8_standalone", True)):
+            return False
+        phase8_enabled = bool(self.config.get("phase8_manipulation_primitives_enabled", False))
+        phase7_enabled = bool(self.config.get("phase7_multi_object_batch_enabled", False))
+        phase8_timing = str(self.config.get("phase8_run_timing", "standalone")).lower()
+        return bool(phase8_enabled and (not phase7_enabled) and phase8_timing == "standalone")
 
     def get_pick_target(self) -> Optional[dict]:
         return self._pick_target
@@ -1672,6 +1692,7 @@ class SceneBuilder:
                 "target_nominal_height_m",
                 "strategy_hint", "validation_profile",
                 "fallback_primitive",
+                "primitive_affordances", "affordances",
                 "place_zone_key", "pickup_zone_key",
                 "phase7_object_role", "batch_order",
             ):
