@@ -6,7 +6,7 @@ num_trials: 1
 
 # ───────────── ROOM ─────────────
 build_room: true
-room_size: [5.0, 5.0, 3.0]
+room_size: [20.0, 20.0, 3.0]
 room_wall_thickness: 0.05
 floor_color: [0.6, 0.6, 0.6]
 room_color: [0.8, 0.8, 0.8]
@@ -1303,7 +1303,7 @@ phase8_primitive_sequence:
 
 # Phase 8B — primitive-only visualization and terminal accounting
 table_zones_hide_during_phase8_standalone: true
-phase8_destination_markers_enabled: true
+phase8_destination_markers_enabled: false
 phase8_destination_marker_size_m: 0.045
 phase8_destination_marker_thickness_m: 0.0012
 phase8_destination_marker_z_offset_m: 0.0020

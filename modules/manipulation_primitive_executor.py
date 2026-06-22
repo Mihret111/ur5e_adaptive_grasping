@@ -3,7 +3,6 @@ manipulation_primitive_executor.py
 ──────────────────────────────────
 manipulation primitives 
 
-Design goal
 -----------
 This module adds *separate* soft-contact primitives without touching the
 currently working pick-place benchmark.  It reuses the same perceptual and
@@ -511,10 +510,7 @@ class ManipulationPrimitiveExecutor:
             "results": [],
             "success_count": 0,
             "failure_count": 0,
-            "notes": [
-                "Phase 8 primitives are separate from the frozen Phase 7 pick-place benchmark.",
-                "They are selected by config/object affordances, not by hard-coded Python label rules.",
-            ],
+            "notes": ["They are selected by config/object affordances"],
         }
 
         dispatch = {
