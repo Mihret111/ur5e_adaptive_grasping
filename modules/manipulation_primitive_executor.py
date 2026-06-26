@@ -260,13 +260,47 @@ class ManipulationPrimitiveExecutor:
         min_tool_z = table_height + flange_to_fingertips + min_tip_clearance
         return max(tool_z, min_tool_z)
 
-    async def _move_world(self, pos: Sequence[float], *, duration: float, steps: int, check_table_collision: bool = True) -> bool:
+    def _downward_yaw_orientation(self, yaw_rad: float) -> list:
+        """Return tool0 quaternion [w, x, y, z] for a downward tool yaw.
+
+        Phase-8 push/slide uses this to keep the closed gripper acting like a
+        directional paddle instead of leaving the wrist at the default yaw.
+        It matches arm_controller.compute_grasp_orientation(), but is kept local
+        here so the primitive executor does not depend on private planner state.
+        """
+        half = 0.5 * float(yaw_rad)
+        return [0.0, math.cos(half), math.sin(half), 0.0]
+
+    def _push_paddle_orientation(self, direction_xy: Sequence[float], spec: dict) -> Optional[list]:
+        """Compute optional wrist yaw for closed-gripper push/slide contact.
+
+        The direction vector describes where the object should move.  By default
+        the gripper's forward/fingertip direction is aligned with that vector,
+        so the closed fingers act as an outside contact paddle.  If the visual
+        contact face in Isaac is 90 degrees off, tune
+        phase8_push_paddle_yaw_offset_rad to +/−1.5708 without changing code.
+        """
+        enabled = bool(spec.get(
+            "align_gripper_to_push_direction",
+            self.config.get("phase8_push_align_gripper_to_direction", True),
+        ))
+        if not enabled:
+            return None
+        d = self._normalise_xy(direction_xy)
+        yaw = math.atan2(float(d[1]), float(d[0]))
+        yaw += float(spec.get(
+            "paddle_yaw_offset_rad",
+            self.config.get("phase8_push_paddle_yaw_offset_rad", 0.0),
+        ))
+        return self._downward_yaw_orientation(yaw)
+
+    async def _move_world(self, pos: Sequence[float], *, duration: float, steps: int, check_table_collision: bool = True, orient: Optional[Sequence[float]] = None) -> bool:
         seed = None
         try:
             seed = self.arm.get_joint_targets_deg()
         except Exception:
             seed = None
-        joints = self.arm._solve_ik_for_world_pos(pos, seed_deg=seed)
+        joints = self.arm._solve_ik_for_world_pos(pos, orient=orient, seed_deg=seed)
         if joints is None:
             print(f"[PrimitiveExecutor] ❌ IK failed for world pos {pos}")
             return False
@@ -365,14 +399,15 @@ class ManipulationPrimitiveExecutor:
         end = [center[0] + direction[0] * (distance), center[1] + direction[1] * (distance), tool_z]
         pre = list(start)
         pre[2] += float(spec.get("pre_contact_above_m", self.config.get("phase8_pre_contact_above_m", 0.080)))
+        push_orient = self._push_paddle_orientation(direction, spec)
 
-        result["events"].append({"event": "planned", "before": before, "start": start, "end": end, "radius_m": radius})
+        result["events"].append({"event": "planned", "before": before, "start": start, "end": end, "radius_m": radius, "push_paddle_orientation": push_orient})
 
         await self._closed_pusher_posture(force_n)
-        ok = await self._move_world(pre, duration=self.config.get("phase8_approach_duration", 1.15), steps=self.config.get("phase8_approach_steps", 69))
-        ok = ok and await self._move_world(start, duration=self.config.get("phase8_contact_approach_duration", 0.85), steps=self.config.get("phase8_contact_approach_steps", 51))
-        result["events"].append({"event": "contact_pose", "ok": ok, "force": self._force(f"{primitive}_contact")})
-        ok = ok and await self._move_world(end, duration=spec.get("duration", self.config.get("phase8_soft_push_duration", 1.60)), steps=spec.get("steps", self.config.get("phase8_soft_push_steps", 96)))
+        ok = await self._move_world(pre, duration=self.config.get("phase8_approach_duration", 1.15), steps=self.config.get("phase8_approach_steps", 69), orient=push_orient)
+        ok = ok and await self._move_world(start, duration=self.config.get("phase8_contact_approach_duration", 0.85), steps=self.config.get("phase8_contact_approach_steps", 51), orient=push_orient)
+        result["events"].append({"event": "contact_pose", "ok": ok, "force": self._force(f"{primitive}_contact"), "push_paddle_orientation": push_orient})
+        ok = ok and await self._move_world(end, duration=spec.get("duration", self.config.get("phase8_soft_push_duration", 1.60)), steps=spec.get("steps", self.config.get("phase8_soft_push_steps", 96)), orient=push_orient)
         await self._step_seconds(self.config.get("phase8_post_contact_settle_seconds", 0.25))
         after = self._observe(target, f"{primitive}_after", table_h)
         metrics = self._displacement_metrics(before, after, direction)
@@ -391,7 +426,7 @@ class ManipulationPrimitiveExecutor:
             result["destination_marker"] = destination_marker
         result["events"].append({"event": "after_motion", "ok": ok, "after": after, "metrics": metrics, "intended_destination_center": intended_destination, "destination_marker": destination_marker, "force": self._force(f"{primitive}_after")})
         await self._move_world(pre, duration=self.config.get("phase8_retreat_duration", 0.90), steps=self.config.get("phase8_retreat_steps", 54), check_table_collision=True)
-        await self._open_gripper()
+        # await self._open_gripper()
 
         result["success"] = bool(ok and metrics.get("available") and metrics.get("along_command_m", 0.0) >= min_along)
         result["reason"] = "push_displacement_passed" if result["success"] else "push_displacement_too_small_or_motion_failed"

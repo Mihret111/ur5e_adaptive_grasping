@@ -982,10 +982,10 @@ close_expected_dim_max_margin_m: 0.0010
 # Remove the sluggish timing while keeping enough physics steps for stability.
 move_safe_above_duration: 2.0
 move_safe_above_steps: 120
-move_pre_grasp_duration: 1.8
-move_pre_grasp_steps: 108
-move_grasp_duration: 1.6
-move_grasp_steps: 96
+move_pre_grasp_duration: 1.5
+move_pre_grasp_steps: 70
+move_grasp_duration: 1.3
+move_grasp_steps: 55
 
 post_close_hold_seconds: 0.45
 adaptive_effort_max_frames: 55
@@ -1199,7 +1199,7 @@ retry_sphere_partial_slip_micro_lift_speed_scale: 0.45
 # Keep the roller safer after the user observed a small lowering slip.  The
 # previous direct-preload trimming made the roller pass numerically but look
 # under-held visually.
-place_transport_direct_preload_max_frames: 120
+place_transport_direct_preload_max_frames: 60
 place_transport_direct_preload_required_stable_samples: 3
 place_transport_direct_preload_sample_stride_frames: 2
 place_transport_direct_preload_max_extra_close_m: 0.00340
@@ -1259,6 +1259,9 @@ phase8_open_settle_seconds: 0.35
 phase8_pusher_close_seconds: 0.55
 phase8_grasp_close_seconds: 0.75
 
+phase8_slide_direction_mode: lateral
+phase8_slide_lateral_side: left
+
 # Soft-push: gentle table-supported displacement using the gripper as a compact pusher.
 phase8_soft_push_distance_m: 0.045
 phase8_soft_push_duration: 1.60
@@ -1284,6 +1287,14 @@ phase8_gentle_pull_force_n: 45.0
 phase8_gentle_pull_hold_extra_m: 0.0010
 phase8_pull_contact_height_fraction: 0.50
 phase8_pull_min_success_displacement_m: 0.010
+
+phase8_push_align_gripper_to_direction: true
+phase8_push_paddle_yaw_offset_rad: 0.0
+
+# reusing the same cascade-chain idea as the Phase-7 pick-place planner.
+phase8_use_chain_ik: true
+phase8_enable_beam_fallback: true
+phase8_tool_yaw_offset_rad: 0.0
 
 # Default demonstration sequence. These labels are demo selections only; the
 # executor itself is primitive/profile-based and can also select targets by
@@ -1317,14 +1328,14 @@ phase8_destination_marker_color: [1.0, 0.65, 0.05]
 
 
 # run only pick-place
-phase7_multi_object_batch_enabled: true
-phase8_manipulation_primitives_enabled: false
-phase8_run_timing: standalone
+# phase7_multi_object_batch_enabled: true
+# phase8_manipulation_primitives_enabled: false
+# phase8_run_timing: standalone
 
 # run primitives only
-# phase7_multi_object_batch_enabled: false
-# phase8_manipulation_primitives_enabled: true
-# phase8_run_timing: standalone
+phase7_multi_object_batch_enabled: false
+phase8_manipulation_primitives_enabled: true
+phase8_run_timing: standalone
 
 
 # run primitives after pick-place
