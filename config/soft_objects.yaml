@@ -192,7 +192,12 @@ soft_objects:
     sphere_micro_lift_preload_delta_m: 0.0018
     sphere_micro_lift_preload_settle_seconds: 0.30
     sphere_micro_lift_preload_force_n: 145.0
-    close_expected_grip_dim_mm: 60.0
+    # Runtime geometry observation now calibrates this value, so keep the
+    # static close-specific diameter disabled. grip_dim_mm remains a prior,
+    # but live mesh dimensions win when the USD asset is rescaled.
+    close_expected_grip_dim_mm: null
+    close_expected_grip_dim_policy: runtime_observed_then_profile
+    geometry_adaptation_note: "Close/contact dimension is calibrated from live observed geometry; static grip_dim_mm is only a prior."
     close_contact_shell_extra_m: 0.0000
     gripper_use_expected_contact_floor: true
     gripper_capture_floor_note: "For soft spheres, build squeeze/hold target from expected contact position, not early shell touch."
@@ -223,7 +228,7 @@ soft_objects:
 
     # Carry lower after successful lift; old high-carry placed the ball center at
     # about z≈1.0 m before transport, which is unnecessarily high for a table task.
-    carry_bottom_clearance_m: 0.055
+    carry_bottom_clearance_m: 0.045
 
     # The effort observer is a joint-effort proxy. A strong rolling-cage grasp can
     # produce high values without meaning slip/drop. For this profile, do not abort
@@ -239,3 +244,17 @@ soft_objects:
     validation_profile: soft_elastic_ball
     fallback_primitive: none
     primitive_affordances: [diagnostic_delicate_pick, soft_push]
+
+    ## Release behavior pa
+    release_behavior_profile: table_supported_cage_release
+    release_lowering_stage_fractions:
+      - 0.5
+      - 0.85
+      - 1.0
+    release_max_pre_release_bottom_clearance_m: 0.015
+    release_partial_open_steps: 10
+    release_partial_open_step_m: 0.00025
+    release_partial_step_settle_seconds: 0.12
+    release_xy_tolerance_m: 0.080
+    release_max_post_release_stability_drift_m: 0.025
+    release_max_final_bottom_clearance_m: 0.025

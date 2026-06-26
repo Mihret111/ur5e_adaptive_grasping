@@ -1708,8 +1708,22 @@ class UR5EController:
         else:
             flange_lift[2] = default_lift_z
 
-        # Keep normal table/arm-body collision clamp as final guard.
-        flange_lift = self._clamp_flange_z_above_table(flange_lift, "lift")
+        # Phase 7.10: match the pick-side carry/lift height to the
+        # place-side ``lift`` waypoint height.  The previous final clamp used
+        # the generic safe_above transit height over the table, which raised
+        # the object to safe_z before transport.  For this test we want the
+        # object to leave pick at the same vertical level used by the place
+        # plan's lift waypoint, and then transport directly to the place-side
+        # lift waypoint.
+        place_side_lift_z = (
+            table_height
+            + self._lift_above_table
+            + self._flange_to_finger_base
+            + self.ARM_BODY_CLEARANCE
+        )
+        flange_lift[2] = place_side_lift_z
+        lift_policy["phase"] = "7.10_pick_lift_matches_place_lift_height"
+        lift_policy["place_side_lift_z"] = float(place_side_lift_z)
         lift_policy["final_lift_z"] = float(flange_lift[2])
 
         # ── Safe retreat (back to transit height) ─────────────

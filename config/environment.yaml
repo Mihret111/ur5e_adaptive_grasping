@@ -441,12 +441,13 @@ table_zones:
     label: place_ball
     role: target_placement_region
     # Diagonal/scattered placement, shortened for the rolling ball benchmark.
-    local_xy_m: [0.20, 0.04]
+    # local_xy_m: [0.20, 0.04]
+    local_xy_m: [0.14, -0.08]
     size_xy_m: [0.075, 0.075]
     color: [0.10, 0.80, 0.20]
     cross_color: [1.00, 1.00, 1.00]
     crosshair: true
-
+ 
   place_zone:
     label: place_zone
     role: target_placement_region
@@ -918,7 +919,7 @@ phase7_multi_object_batch_enabled: true
 phase7_reset_robot_between_objects: false
 phase7_between_object_settle_seconds: 0.50
 phase7_stop_batch_on_first_failure: false
-phase7_max_objects_per_batch: 3
+phase7_max_objects_per_batch: 3   # make it three to spawn all objects at once
 phase7_object_run_order:
   - foam_cube_green
   - foam_roller
@@ -929,6 +930,11 @@ phase7_object_run_order:
 # nominal size and the spawned USD disagree by more than 3 mm.
 runtime_soft_geometry_calibration_enabled: true
 runtime_soft_geometry_min_update_m: 0.003
+
+# Runtime geometry should calibrate the close/contact dimension before static YAML priors.
+# This makes a rescaled USD asset (for example a 40 mm ball instead of 60 mm)
+# close according to observed geometry rather than an old hard-coded diameter.
+close_expected_grip_dim_policy: runtime_observed_then_profile
 
 # Phase 7 is a generalization test.  Keep the known-good release primitive
 # enabled and retain carry-orientation lock.
@@ -1235,7 +1241,7 @@ post_place_transport_settle_seconds: 0.08
 #   phase8_run_timing: standalone
 # To run them after the Phase-7 batch, set phase8_run_timing: after_phase7.
 phase8_manipulation_primitives_enabled: false
-phase8_run_timing: standalone   # standalone | before_phase7 | after_phase7
+phase8_run_timing: disabled   # standalone | before_phase7 | after_phase7
 phase8_between_primitives_settle_seconds: 0.35
 
 # Generic timing/safety parameters used by soft_push, soft_slide, gentle_pull.
@@ -1316,9 +1322,9 @@ phase8_manipulation_primitives_enabled: false
 phase8_run_timing: standalone
 
 # run primitives only
-phase7_multi_object_batch_enabled: false
-phase8_manipulation_primitives_enabled: true
-phase8_run_timing: standalone
+# phase7_multi_object_batch_enabled: false
+# phase8_manipulation_primitives_enabled: true
+# phase8_run_timing: standalone
 
 
 # run primitives after pick-place

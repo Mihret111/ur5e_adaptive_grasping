@@ -90,6 +90,65 @@ class PickAndPlaceExecutor:
             value = self.config.get(key, default)
         return self._float_or_default(value, default)
 
+    def _target_or_config_int(self, target: dict, key: str, default):
+        """Read optional integer from target/config without crashing on None."""
+        try:
+            return int(round(self._target_or_config_float(target, key, default)))
+        except Exception:
+            return int(default if default is not None else 0)
+
+    def _target_or_config_bool(self, target: dict, key: str, default=False):
+        """Read optional boolean from target/config.  Handles YAML strings safely."""
+        value = None
+        if isinstance(target, dict):
+            value = target.get(key)
+        if value is None:
+            value = self.config.get(key, default)
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on", "enabled")
+        return bool(value)
+
+    def _target_or_config_str(self, target: dict, key: str, default=""):
+        """Read optional string from target/config."""
+        value = None
+        if isinstance(target, dict):
+            value = target.get(key)
+        if value is None:
+            value = self.config.get(key, default)
+        return str(value if value is not None else default)
+
+    def _release_policy_for_target(self, target: dict) -> dict:
+        """Resolve release behaviour from object affordance/profile, not object label.
+
+        This intentionally avoids a rubber_ball-specific branch.  Objects that
+        need table-supported/caged release declare it in the object registry via
+        release_behavior_profile.  Other future objects can reuse the same
+        profile without changing Python code.
+        """
+        profile = self._target_or_config_str(target, "release_behavior_profile", "generic_table_release").strip().lower()
+        grasp_profile = self._target_or_config_str(target, "grasp_behavior_profile", "").strip().lower()
+        primitive_affordances = []
+        if isinstance(target, dict):
+            primitive_affordances = target.get("primitive_affordances") or []
+        if not isinstance(primitive_affordances, (list, tuple)):
+            primitive_affordances = []
+
+        table_supported_cage = profile in (
+            "table_supported_cage_release",
+            "caged_table_release",
+            "support_then_release",
+            "rolling_cage_release",
+        ) or "table_supported" in profile or "cage" in profile
+
+        return {
+            "release_behavior_profile": profile,
+            "grasp_behavior_profile": grasp_profile,
+            "primitive_affordances": list(primitive_affordances),
+            "table_supported_cage_release": bool(table_supported_cage),
+            "selection_basis": "object release_behavior_profile / affordance metadata",
+            "note": "Policy is selected from object profile, not from a hard-coded label.",
+        }
+
     async def _step_gripper_for_seconds(self, seconds: float):
         """
         Advance the gripper state machine while Isaac physics steps.
@@ -2404,10 +2463,11 @@ class PickAndPlaceExecutor:
             observed_grip_m = xy_grip
             observed_height_m = height
         elif shape == "sphere":
-            # For the rubber ball the simulation TetMesh AABB can be inflated
-            # by solver deformation/table contact.  Prefer collision/visible
-            # mesh dimensions when available; these match the intended 30 mm
-            # half-scale -> about 60 mm diameter.
+            # For spherical soft objects the simulation TetMesh AABB can be
+            # inflated by solver deformation/table contact.  Prefer
+            # collision/visible mesh dimensions when available.  This is a
+            # generic geometry policy for round objects, not a rubber_ball
+            # label special-case.
             sphere_candidates = []
             for bbox_key in ("collision_bbox", "visible_bbox"):
                 v = robust_bbox_median_size(obs.get(bbox_key))
@@ -2427,6 +2487,16 @@ class PickAndPlaceExecutor:
             observed_grip_m = xy_grip
             observed_height_m = height
 
+        # Keep a runtime measurement that downstream modules can use before
+        # falling back to static YAML metadata.  This is essential when the USD
+        # asset is rescaled (e.g. a 40 mm sphere instead of a 60 mm sphere): the
+        # grasp should adapt to the observed geometry rather than keep using an
+        # old nominal close diameter.
+        target["runtime_observed_grip_dim_m"] = float(observed_grip_m)
+        target["runtime_observed_height_m"] = float(observed_height_m)
+        target["runtime_observed_grip_dim_mm"] = round(float(observed_grip_m) * 1000.0, 2)
+        target["runtime_observed_height_mm"] = round(float(observed_height_m) * 1000.0, 2)
+
         min_update = float(self.config.get("runtime_soft_geometry_min_update_m", 0.003))
         changed = False
         changes = {}
@@ -2438,7 +2508,9 @@ class PickAndPlaceExecutor:
 
         if old_height_m is None or abs(observed_height_m - old_height_m) >= min_update:
             target["height"] = round(observed_height_m, 5)
+            target["height_mm"] = round(observed_height_m * 1000.0, 2)
             changes["height_m"] = target["height"]
+            changes["height_mm"] = target["height_mm"]
             changed = True
 
         if shape == "sphere":
@@ -2447,6 +2519,11 @@ class PickAndPlaceExecutor:
                 old_radius = float(target.get("radius", -1.0))
             except Exception:
                 old_radius = -1.0
+            # Diameter is a generic physical descriptor used by nominal-size
+            # safety and close-plausibility logic.  Update it from observation
+            # so a rescaled sphere is not treated as the old YAML diameter.
+            target["diameter_mm"] = round(observed_grip_m * 1000.0, 2)
+            changes["diameter_mm"] = target["diameter_mm"]
             if old_radius < 0.0 or abs(new_radius - old_radius) >= min_update / 2.0:
                 target["radius"] = round(new_radius, 5)
                 changes["radius_m"] = target["radius"]
@@ -2472,6 +2549,9 @@ class PickAndPlaceExecutor:
             "observed_width_x_m": width_x,
             "observed_width_y_m": width_y,
             "observed_height_m": height,
+            "observed_grip_dim_m": observed_grip_m,
+            "observed_grip_dim_mm": observed_grip_m * 1000.0,
+            "observed_height_used_m": observed_height_m,
             "old_grip_m": old_grip_m,
             "old_height_m": old_height_m,
             "updated": changed,
@@ -2523,98 +2603,181 @@ class PickAndPlaceExecutor:
         target_feasibility: dict,
         before_close_obs: dict,
     ):
-        """Choose the dimension used by the 2FG7 close validator.
+        """Choose the object span used by the 2FG7 close validator.
 
-        Important distinction:
-        - collision/visible geometry is good for object pose and nominal size;
-        - deformable simulation geometry can create a larger contact shell.
+        The close validator must adapt to the actual spawned geometry.  Static
+        YAML fields are useful priors, but a rescaled USD asset (for example a
+        40 mm sphere instead of an older 60 mm sphere) must not keep using the
+        old close diameter.  Priority is therefore:
 
-        The rubber-ball log showed exactly that mismatch: the visible/collision
-        sphere was about 60 mm, while the fingers stalled at an opening of about
-        68 mm because they contacted the inflated soft simulation shell. If we
-        pass 60 mm to the gripper state machine, that real shell contact is
-        mislabeled as ``too_open_or_early`` and micro-lift is skipped.
+          1. runtime soft-geometry calibration / live observation;
+          2. updated object profile grip dimension;
+          3. explicit ``close_expected_grip_dim_mm`` only as a fallback or when
+             an explicit override policy requests it.
+
+        This is architecture-valid: object metadata selects the release/grasp
+        behaviour, while perceptual geometry calibrates the numeric motor-schema
+        parameters.  No object label is hard-coded.
         """
-        base_dim = None
-        if isinstance(target_feasibility, dict):
+        target = target if isinstance(target, dict) else {}
+        before_close_obs = before_close_obs if isinstance(before_close_obs, dict) else {}
+
+        def _finite(value):
             try:
-                base_dim = float(target_feasibility.get("estimated_object_grip_dim_m"))
+                value = float(value)
+                if math.isfinite(value) and 0.005 <= value <= 0.120:
+                    return value
             except Exception:
-                base_dim = None
+                pass
+            return None
+
+        def _candidate(candidates, source, value, priority, kind):
+            value = _finite(value)
+            if value is not None:
+                candidates.append({
+                    "source": source,
+                    "dim_m": value,
+                    "dim_mm": value * 1000.0,
+                    "priority": int(priority),
+                    "kind": kind,
+                })
+
+        def _robust_bbox_middle_dimension(bbox_dict):
+            if not isinstance(bbox_dict, dict):
+                return None
+            vals = []
+            for key in ("size", "size_m"):
+                size = bbox_dict.get(key)
+                if isinstance(size, (list, tuple)) and len(size) >= 3:
+                    try:
+                        xs = sorted(float(v) for v in size[:3])
+                        if all(math.isfinite(v) and 0.005 <= v <= 0.120 for v in xs):
+                            vals.append(xs[1])
+                    except Exception:
+                        pass
+            obb = bbox_dict.get("oriented_bbox")
+            if isinstance(obb, dict):
+                for key in ("size_sorted", "size_sorted_m", "size", "size_m"):
+                    size = obb.get(key)
+                    if isinstance(size, (list, tuple)) and len(size) >= 3:
+                        try:
+                            xs = sorted(float(v) for v in size[:3])
+                            if all(math.isfinite(v) and 0.005 <= v <= 0.120 for v in xs):
+                                vals.append(xs[1])
+                        except Exception:
+                            pass
+            if not vals:
+                return None
+            vals = sorted(vals)
+            return vals[len(vals) // 2]
+
+        shape = str(target.get("shape", "")).lower()
+        profile = str(target.get("grasp_behavior_profile", "")).lower()
+        validation_profile = str(target.get("validation_profile", "")).lower()
+        release_profile = str(target.get("release_behavior_profile", "")).lower()
+        affordances = [str(a).lower() for a in (target.get("primitive_affordances") or [])]
+
+        # Geometry/affordance class.  This is generic: it identifies rolling
+        # spherical/caging behaviour from shape/profile/affordance metadata, not
+        # from a rubber_ball label.
+        rolling_or_spherical = (
+            shape == "sphere"
+            or "rolling" in profile
+            or "sphere" in validation_profile
+            or "ball" in validation_profile
+            or "cage" in release_profile
+            or any("rolling" in a or "cage" in a for a in affordances)
+        )
 
         candidates = []
-        if base_dim is not None and math.isfinite(base_dim):
-            candidates.append(("nominal_target_grip_dim", base_dim))
 
+        # 1) Runtime calibration written by _update_soft_target_geometry_from_observation.
+        cal = target.get("runtime_soft_geometry_calibration") or {}
+        if isinstance(cal, dict):
+            _candidate(candidates, "runtime_soft_geometry_calibration_observed_grip_dim", cal.get("observed_grip_dim_m"), 0, "runtime_observation")
+        _candidate(candidates, "target_runtime_observed_grip_dim", target.get("runtime_observed_grip_dim_m"), 1, "runtime_observation")
+
+        # 2) Live pre-close observation, using geometry policy appropriate to
+        # the object shape.  For spheres, prefer collision/visible median size
+        # over the possibly inflated simulation shell.
+        if before_close_obs:
+            if shape == "sphere":
+                for bbox_key in ("collision_bbox", "visible_bbox"):
+                    _candidate(candidates, f"{bbox_key}_middle_dim_live", _robust_bbox_middle_dimension(before_close_obs.get(bbox_key)), 2, "live_observation")
+            elif shape == "cube":
+                dims = []
+                for key in ("width_x_m", "width_y_m", "height_m"):
+                    v = _finite(before_close_obs.get(key))
+                    if v is not None:
+                        dims.append(v)
+                if len(dims) >= 3:
+                    _candidate(candidates, "live_world_aabb_median_dim", sorted(dims)[1], 2, "live_observation")
+            elif shape in ("cylinder", "disc"):
+                wx = _finite(before_close_obs.get("width_x_m"))
+                wy = _finite(before_close_obs.get("width_y_m"))
+                if wx is not None and wy is not None:
+                    _candidate(candidates, "live_xy_max_dim", max(wx, wy), 2, "live_observation")
+            else:
+                wx = _finite(before_close_obs.get("width_x_m"))
+                wy = _finite(before_close_obs.get("width_y_m"))
+                if wx is not None and wy is not None:
+                    _candidate(candidates, "live_xy_max_dim", max(wx, wy), 2, "live_observation")
+
+        # 3) Updated profile/feasibility dimension.  This may already have been
+        # corrected by runtime calibration before planning.
+        if isinstance(target_feasibility, dict):
+            _candidate(candidates, "target_feasibility_estimated_grip_dim", target_feasibility.get("estimated_object_grip_dim_m"), 3, "profile")
         try:
-            yaml_close_mm = float(target.get("close_expected_grip_dim_mm"))
-            if math.isfinite(yaml_close_mm):
-                candidates.append(("object_close_expected_grip_dim_mm", yaml_close_mm / 1000.0))
+            _candidate(candidates, "target_grip_dim_mm_current", float(target.get("grip_dim_mm")) / 1000.0, 4, "profile")
+        except Exception:
+            pass
+        try:
+            _candidate(candidates, "target_diameter_mm_current", float(target.get("diameter_mm")) / 1000.0, 4, "profile")
         except Exception:
             pass
 
-        shape = str((target or {}).get("shape", "")).lower()
-        label = str((target or {}).get("label", "")).lower()
-        profile = str((target or {}).get("validation_profile", "")).lower()
-        is_soft_sphere = shape == "sphere" or "ball" in label or "ball" in profile
+        # 4) Explicit close dimension is a manual prior/fallback.  It should not
+        # override a live observed dimension unless explicitly requested.
+        try:
+            _candidate(candidates, "object_close_expected_grip_dim_mm", float(target.get("close_expected_grip_dim_mm")) / 1000.0, 8, "explicit_config")
+        except Exception:
+            pass
 
-        if is_soft_sphere and isinstance(before_close_obs, dict):
-            # Simulation TetMesh size is not trusted for precise pose, but it is
-            # the right evidence for how wide the soft contact shell is.
+        # 5) Optional simulation shell diagnostic.  Only choose it when the
+        # policy explicitly asks for shell contact; otherwise keep it logged.
+        if rolling_or_spherical and before_close_obs:
             for bbox_key in ("simulation_bbox", "simulation_points_bbox", "wrapper_bbox"):
                 dim = self._bbox_max_dimension_m(before_close_obs.get(bbox_key))
                 if dim is not None:
-                    candidates.append((f"{bbox_key}_contact_shell_max_dim", dim))
-
-            # If configured, add a tiny shell margin on top of the visual/collision
-            # nominal size. Keep this smaller than using the measured simulation
-            # shell, so live evidence still dominates.
-            try:
-                shell_extra = float(
-                    target.get(
-                        "close_contact_shell_extra_m",
-                        self.config.get("sphere_close_contact_shell_extra_m", 0.0),
-                    )
-                )
-            except Exception:
-                shell_extra = 0.0
-            if base_dim is not None and shell_extra > 0.0:
-                candidates.append(("nominal_plus_configured_shell_extra", base_dim + shell_extra))
+                    _candidate(candidates, f"{bbox_key}_contact_shell_max_dim", dim, 20, "simulation_shell_diagnostic")
 
         if not candidates:
-            return base_dim, {
+            return None, {
                 "available": False,
                 "reason": "no_expected_grip_dimension_available",
             }
 
-        # Release-4 correction:
-        # Do NOT let the inflated simulation/TetMesh bbox dominate the gripper
-        # close command for a sphere.  The previous policy selected ~72 mm for a
-        # 60 mm ball, so the gripper accepted contact while almost fully open and
-        # never mechanically captured the object.
-        #
-        # New default for spheres: use the configured/nominal capture diameter.
-        # Keep the simulation bbox candidates in the log for diagnosis, but only
-        # use them when explicitly requested.
-        if is_soft_sphere:
-            policy = str(self.config.get("sphere_close_expected_policy", "nominal_capture")).lower()
-            use_sim_bbox = bool(self.config.get("sphere_close_use_sim_bbox_for_close", False))
-            if use_sim_bbox or policy in ("simulation_shell", "max_shell", "largest"):
-                source, chosen = max(candidates, key=lambda item: item[1])
-            else:
-                priority_sources = (
-                    "object_close_expected_grip_dim_mm",
-                    "nominal_plus_configured_shell_extra",
-                    "nominal_target_grip_dim",
-                )
-                source, chosen = candidates[0]
-                for wanted in priority_sources:
-                    match = next((item for item in candidates if item[0] == wanted), None)
-                    if match is not None:
-                        source, chosen = match
-                        break
+        policy = str(
+            target.get(
+                "close_expected_grip_dim_policy",
+                self.config.get("close_expected_grip_dim_policy", "runtime_observed_then_profile"),
+            )
+        ).lower()
+        use_sim_bbox = bool(self.config.get("sphere_close_use_sim_bbox_for_close", False))
+        legacy_sphere_policy = str(self.config.get("sphere_close_expected_policy", "nominal_capture")).lower()
+
+        if policy in ("explicit", "explicit_config", "config_only", "manual_override"):
+            chosen_item = next((c for c in candidates if c["source"] == "object_close_expected_grip_dim_mm"), None)
+            if chosen_item is None:
+                chosen_item = sorted(candidates, key=lambda c: c["priority"])[0]
+        elif use_sim_bbox or policy in ("simulation_shell", "max_shell", "largest") or legacy_sphere_policy in ("simulation_shell", "max_shell", "largest"):
+            shell = [c for c in candidates if c["kind"] == "simulation_shell_diagnostic"]
+            chosen_item = max(shell or candidates, key=lambda c: c["dim_m"])
         else:
-            source, chosen = candidates[0]
+            # Default: observed geometry first, then profile, then explicit config.
+            chosen_item = sorted(candidates, key=lambda c: c["priority"])[0]
+
+        chosen = float(chosen_item["dim_m"])
 
         grip_mode = self.config.get("grip_mode", "outwards")
         grip_cfg = self.config.get(f"{grip_mode}_grip", {}) or {}
@@ -2625,25 +2788,32 @@ class PickAndPlaceExecutor:
             grip_min, grip_max = 0.035, 0.073
 
         margin_to_max = float(self.config.get("close_expected_dim_max_margin_m", 0.0010))
-        chosen_clamped = max(grip_min, min(grip_max - margin_to_max, float(chosen)))
+        chosen_clamped = max(grip_min, min(grip_max - margin_to_max, chosen))
 
         return chosen_clamped, {
             "available": True,
             "shape": shape,
-            "label": label,
-            "is_soft_sphere": is_soft_sphere,
-            "base_dim_m": base_dim,
+            "grasp_behavior_profile": profile,
+            "validation_profile": validation_profile,
+            "release_behavior_profile": release_profile,
+            "rolling_or_spherical_geometry_class": bool(rolling_or_spherical),
+            "policy": policy,
+            "legacy_sphere_close_expected_policy": legacy_sphere_policy,
             "chosen_dim_m": chosen_clamped,
             "chosen_dim_mm": chosen_clamped * 1000.0,
-            "chosen_source": source,
-            "raw_candidates": [
-                {"source": name, "dim_m": value, "dim_mm": value * 1000.0}
-                for name, value in candidates
-            ],
+            "chosen_source": chosen_item["source"],
+            "chosen_kind": chosen_item["kind"],
+            "raw_chosen_dim_m_before_grip_range_clamp": chosen,
+            "raw_candidates": candidates,
             "grip_range_min_m": grip_min,
             "grip_range_max_m": grip_max,
             "close_expected_dim_max_margin_m": margin_to_max,
-            "note": "Dimension used only for close/contact plausibility; planning pose still uses calibrated collision/visible geometry.",
+            "note": (
+                "Close dimension is selected from live/runtime observed geometry first, "
+                "then current object profile, with explicit YAML close_expected_grip_dim_mm "
+                "only as fallback unless manual_override policy is set. This avoids hard-coded "
+                "diameter behaviour when an asset is rescaled."
+            ),
         }
 
     def _get_observed_object_pos(self, target: dict, stage_name: str = "object"):
@@ -3765,15 +3935,21 @@ class PickAndPlaceExecutor:
             return json_safe(release_log)
 
         app = omni.kit.app.get_app()
+        release_policy = self._release_policy_for_target(target)
+        release_log["release_policy"] = json_safe(release_policy)
 
         # ── 4.3a: staged approach from safe hover to actual table-place pose ──
         start_joints = list(self.arm.get_joint_targets_deg())
-        fractions = self.config.get("place_release_lowering_stage_fractions", [0.50, 1.00])
+        fractions = None
+        if isinstance(target, dict):
+            fractions = target.get("release_lowering_stage_fractions")
+        if fractions is None:
+            fractions = self.config.get("place_release_lowering_stage_fractions", [0.50, 1.00])
         if not isinstance(fractions, (list, tuple)):
             fractions = [0.50, 1.00]
-        duration_per_stage = float(self.config.get("place_release_lowering_stage_duration", 0.90))
-        steps_per_stage = int(self.config.get("place_release_lowering_stage_steps", 54))
-        settle_s = float(self.config.get("place_release_stage_settle_seconds", 0.20))
+        duration_per_stage = self._target_or_config_float(target, "release_lowering_stage_duration", self.config.get("place_release_lowering_stage_duration", 0.90))
+        steps_per_stage = self._target_or_config_int(target, "release_lowering_stage_steps", self.config.get("place_release_lowering_stage_steps", 54))
+        settle_s = self._target_or_config_float(target, "release_stage_settle_seconds", self.config.get("place_release_stage_settle_seconds", 0.20))
         for stage_idx, frac in enumerate(fractions):
             try:
                 f = max(0.0, min(1.0, float(frac)))
@@ -3808,8 +3984,8 @@ class PickAndPlaceExecutor:
         pre_pos, pre_obs = self._object_pos_from_soft_observation(target, stage_name="before_controlled_release")
         pre_bottom = self._bottom_clearance_from_observation(pre_obs, pre_pos, table_height)
         pre_xy = self._xy_error_to_place_zone(pre_pos, place_zone)
-        max_pre_bottom = float(self.config.get("place_release_max_pre_release_bottom_clearance_m", 0.030))
-        min_pre_bottom = float(self.config.get("place_release_min_pre_release_bottom_clearance_m", -0.006))
+        max_pre_bottom = self._target_or_config_float(target, "release_max_pre_release_bottom_clearance_m", self.config.get("place_release_max_pre_release_bottom_clearance_m", 0.030))
+        min_pre_bottom = self._target_or_config_float(target, "release_min_pre_release_bottom_clearance_m", self.config.get("place_release_min_pre_release_bottom_clearance_m", -0.006))
         pre_reasons = []
         if pre_bottom is None:
             pre_reasons.append("pre-release bottom clearance unavailable")
@@ -3833,14 +4009,18 @@ class PickAndPlaceExecutor:
             return json_safe(release_log)
 
         # ── 4.3b: relax grip in tiny stages while the object is close to table ──
-        n_steps = max(0, int(self.config.get("place_release_partial_open_steps", 6)))
-        step_open = float(self.config.get("place_release_partial_open_step_m", 0.00035))
-        step_settle = float(self.config.get("place_release_partial_step_settle_seconds", 0.16))
+        n_steps = max(0, self._target_or_config_int(target, "release_partial_open_steps", self.config.get("place_release_partial_open_steps", 6)))
+        step_open = self._target_or_config_float(target, "release_partial_open_step_m", self.config.get("place_release_partial_open_step_m", 0.00035))
+        step_settle = self._target_or_config_float(target, "release_partial_step_settle_seconds", self.config.get("place_release_partial_step_settle_seconds", 0.16))
+        partial_force = self._target_or_config_float(target, "release_partial_open_force_n", self.config.get("place_release_partial_open_force_n", 45.0))
+        partial_drift_warn = self._target_or_config_float(target, "release_partial_drift_warn_m", self.config.get("place_release_partial_drift_warn_m", 0.020))
+        partial_drift_abort = self._target_or_config_float(target, "release_partial_drift_abort_m", self.config.get("place_release_partial_drift_abort_m", 0.050))
+        abort_on_partial_drift = self._target_or_config_bool(target, "release_abort_on_partial_drift", self.config.get("place_release_abort_on_partial_drift", False))
         for i in range(n_steps):
             adj = self.gripper.adjust_hold_targets(
                 delta_close_m=-abs(step_open),
                 reason="controlled_table_release_partial_open",
-                force_n=float(self.config.get("place_release_partial_open_force_n", 45.0)),
+                force_n=partial_force,
             )
             await self._step_gripper_for_seconds(step_settle)
             pos, obs = self._object_pos_from_soft_observation(target, stage_name=f"partial_release_step_{i}")
@@ -3849,19 +4029,31 @@ class PickAndPlaceExecutor:
                 force_obs = self.force_observer.observe(stage_name=f"partial_release_step_{i}") if hasattr(self, "force_observer") else None
             except Exception as e:
                 force_obs = {"available": False, "reason": f"force_observer_exception: {e}"}
+            partial_drift = self._point_dist(pre_pos, pos) if (pre_pos is not None and pos is not None) else None
+            partial_warning = None
+            if partial_drift is not None and partial_drift > partial_drift_warn:
+                partial_warning = f"partial release drift warning: {partial_drift:.4f} > {partial_drift_warn:.4f}"
+                release_log["validation"].setdefault("warnings", []).append(partial_warning)
             release_log["partial_release_steps"].append(json_safe({
                 "step_index": i,
                 "adjustment": adj,
                 "object_pos": pos,
                 "bottom_clearance_m": self._bottom_clearance_from_observation(obs, pos, table_height),
                 "place_zone_xy_error_m": self._xy_error_to_place_zone(pos, place_zone),
+                "partial_drift_from_pre_release_m": partial_drift,
+                "partial_drift_warning": partial_warning,
                 "force_observation": force_obs,
                 "soft_observation": obs,
             }))
+            if abort_on_partial_drift and partial_drift is not None and partial_drift > partial_drift_abort:
+                release_log["validation"]["reasons"].append(
+                    f"partial release drift exceeded abort threshold: {partial_drift:.4f} > {partial_drift_abort:.4f}"
+                )
+                return json_safe(release_log)
 
         # ── 4.3c: full open/release, then retreat upward ──
         self.gripper.open()
-        await self._step_gripper_for_seconds(float(self.config.get("place_release_open_settle_seconds", 0.70)))
+        await self._step_gripper_for_seconds(self._target_or_config_float(target, "release_open_settle_seconds", self.config.get("place_release_open_settle_seconds", 0.70)))
         after_open_pos, after_open_obs = self._object_pos_from_soft_observation(target, stage_name="after_gripper_open_release")
         release_log["after_open_observation"] = json_safe({
             "object_pos": after_open_pos,
@@ -3876,12 +4068,12 @@ class PickAndPlaceExecutor:
         if retreat_target_joints_deg is not None:
             retreat_ok = await self.arm.move_to(
                 retreat_target_joints_deg,
-                duration=float(self.config.get("place_release_retreat_duration", 1.80)),
-                steps=int(self.config.get("place_release_retreat_steps", 108)),
+                duration=self._target_or_config_float(target, "release_retreat_duration", self.config.get("place_release_retreat_duration", 1.80)),
+                steps=self._target_or_config_int(target, "release_retreat_steps", self.config.get("place_release_retreat_steps", 108)),
                 check_table_collision=True,
                 step_callback=self.gripper.update,
             )
-            await self._step_gripper_for_seconds(float(self.config.get("place_release_post_retreat_settle_seconds", 0.60)))
+            await self._step_gripper_for_seconds(self._target_or_config_float(target, "release_post_retreat_settle_seconds", self.config.get("place_release_post_retreat_settle_seconds", 0.60)))
         else:
             release_log["validation"]["warnings"].append("missing retreat target; release validated without retreat")
 
@@ -3901,11 +4093,11 @@ class PickAndPlaceExecutor:
         # ── Validation: object must be on table, in zone, stable, not following retreat ──
         reasons = []
         warnings = release_log["validation"].get("warnings", [])
-        xy_tol = float(self.config.get("place_release_xy_tolerance_m", self.config.get("place_transport_xy_tolerance_m", 0.075)))
-        min_final_bottom = float(self.config.get("place_release_min_final_bottom_clearance_m", -0.008))
-        max_final_bottom = float(self.config.get("place_release_max_final_bottom_clearance_m", 0.030))
-        max_retreat_follow_z = float(self.config.get("place_release_max_object_follow_retreat_z_m", 0.015))
-        max_stability_drift = float(self.config.get("place_release_max_post_release_stability_drift_m", 0.005))
+        xy_tol = self._target_or_config_float(target, "release_xy_tolerance_m", self.config.get("place_release_xy_tolerance_m", self.config.get("place_transport_xy_tolerance_m", 0.075)))
+        min_final_bottom = self._target_or_config_float(target, "release_min_final_bottom_clearance_m", self.config.get("place_release_min_final_bottom_clearance_m", -0.008))
+        max_final_bottom = self._target_or_config_float(target, "release_max_final_bottom_clearance_m", self.config.get("place_release_max_final_bottom_clearance_m", 0.030))
+        max_retreat_follow_z = self._target_or_config_float(target, "release_max_object_follow_retreat_z_m", self.config.get("place_release_max_object_follow_retreat_z_m", 0.015))
+        max_stability_drift = self._target_or_config_float(target, "release_max_post_release_stability_drift_m", self.config.get("place_release_max_post_release_stability_drift_m", 0.005))
         final_xy = self._xy_error_to_place_zone(final_pos, place_zone)
         final_bottom = self._bottom_clearance_from_observation(final_obs, final_pos, table_height)
         if not retreat_ok:
