@@ -2,9 +2,13 @@
 
 A robotic manipulation framework designed to execute delicate, compliant, and force-regulated grasping behaviors on deformable, soft, or fragile objects. Built for **Universal Robots UR5e** equipped with an **OnRobot 2FG7** parallel gripper within **NVIDIA Isaac Sim**.
 
+#### Pick-and-Place Demonstration
+
+![Pick-place demonstration](Pick_Place.gif)
+
 ---
 
-## ✨ Key Features
+### ✨ Key Features
 
 - **🛡️ Adaptive Force & Compliance Regulation**: Monitors contact forces and material deformation in real-time to prevent crushing delicate objects.
 - **🤹 anipulation Primitives**: Supports a versatile library of primitives beyond simple picks, including *soft-push*, *pull*, *slide*, *delicate pick-and-place*, and *micro-lift validation*.
@@ -12,7 +16,7 @@ A robotic manipulation framework designed to execute delicate, compliant, and fo
 
 ---
 
-## 📂 Repository Structure
+### 📂 Repository Structure
 
 ```text
 ur5e_adaptive_grasping/
@@ -39,13 +43,13 @@ ur5e_adaptive_grasping/
 
 ---
 
-## 🚀 Quickstart Guide
+### 🚀 Guide on how to run
 
-### 1. Prerequisites
+#### 1. Prerequisites
 - **NVIDIA Isaac Sim**
 - **Python 3.10+** (bundled within Isaac Sim)
 
-### 2. Running Simulation Trials
+#### 2. Running Simulation Trials
 This project is designed to be executed directly inside Isaac Sim's embedded Python runtime.
 
 1. Launch **NVIDIA Isaac Sim**.
@@ -57,30 +61,41 @@ This project is designed to be executed directly inside Isaac Sim's embedded Pyt
    * Open `main.py` in your favorite editor, verify that `PROJECT_ROOT` matches your local absolute path.
    * Copy the contents of `main.py` into the Isaac Sim Script Editor window.
    * Press **`Ctrl + Enter`** to execute the simulation pipeline.
-   5. The last lines of "environment.yaml" should be changed to switch from one mode of opperation to another: 
+5. The last lines of "environment.yaml" should be changed to switch from one mode of opperation to anotheras follows: 
 
-# run only pick-place:
-# phase7_multi_object_batch_enabled: true
-# phase8_manipulation_primitives_enabled: false
-# phase8_run_timing: standalone
+### Running Modes
 
-# run primitives only:
-# phase7_multi_object_batch_enabled: false
-# phase8_manipulation_primitives_enabled: true
-# phase8_run_timing: standalone
+The experiment pipeline can be configured from the YAML settings using the following switches.
 
+#### Run only pick-place
 
-# run primitives after pick-place:
-# phase7_multi_object_batch_enabled: true
-# phase8_manipulation_primitives_enabled: true
-# phase8_run_timing: after_phase7
-   
+```yaml
+phase7_multi_object_batch_enabled: true
+phase8_manipulation_primitives_enabled: false
+phase8_run_timing: standalone
+```
+
+#### Run primitives only
+
+```yaml
+phase7_multi_object_batch_enabled: false
+phase8_manipulation_primitives_enabled: true
+phase8_run_timing: standalone
+```
+
+#### Run primitives after pick-place
+
+```yaml
+phase7_multi_object_batch_enabled: true
+phase8_manipulation_primitives_enabled: true
+phase8_run_timing: after_phase7
+```
 
 The runner will automatically evict stale module caches, synchronize drive targets to prevent startup jumps, build randomized object trials on the table surface, execute adaptive grasping primitives, and report aggregate success metrics to the console.
 
 ---
 
-## ⚙️ Configuration Overview
+## ⚙️ Configuration
 
 All operational parameters are cleanly separated into YAML files inside the `config/` directory:
 
