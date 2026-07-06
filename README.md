@@ -1,4 +1,4 @@
-# 🤖 UR5e Adaptive Grasping for Soft & Fragile Objects
+## 🤖 UR5e Adaptive Grasping for Soft & Fragile Objects
 
 A robotic manipulation framework designed to execute delicate, compliant, and force-regulated grasping behaviors on deformable, soft, or fragile objects. Built for **Universal Robots UR5e** equipped with an **OnRobot 2FG7** parallel gripper within **NVIDIA Isaac Sim**.
 
@@ -97,8 +97,8 @@ The runner will automatically evict stale module caches, synchronize drive targe
 
 ## ⚙️ Configuration
 
-All operational parameters are cleanly separated into YAML files inside the `config/` directory:
+All operational parameters are separated into YAML files inside the `config/` directory. The scene and object related are the following:
 
-- **`environment.yaml`**: Configures simulation step rates, debug random seeds (`debug_seed: 7`), post-run holding times, and pre-flight validation toggles.
-- **`soft_objects.yaml`**: Defines material thresholds (e.g., max yield force, deformation tolerances, friction coefficients) used by the `StrategySelector` and `AdaptiveSafetyMonitor`.
+- **`environment.yaml`**: Configures simulation step rates, debug random seeds , post-run holding times, and pre-flight validation toggles.
+- **`soft_objects.yaml`**: Defines material thresholds (e.g., max yield force, deformation tolerances, friction coefficients) used by other segments.
 
